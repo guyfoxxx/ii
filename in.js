@@ -25,6 +25,7 @@ export default {
         const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
         const styles = await getStyleList(env);
         const offerBanner = await getOfferBanner(env);
+        const customPrompts = await getCustomPrompts(env);
         const role = isOwner(v.fromLike, env) ? "owner" : (isAdmin(v.fromLike, env) ? "admin" : "user");
 
         return jsonResponse({
@@ -35,6 +36,7 @@ export default {
           symbols,
           styles,
           offerBanner,
+          customPrompts,
           role,
           isStaff: role !== "user",
           wallet: (await getWallet(env)) || "",
@@ -58,6 +60,11 @@ export default {
         }
         if (typeof body.risk === "string") st.risk = body.risk;
         if (typeof body.newsEnabled === "boolean") st.newsEnabled = body.newsEnabled;
+        if (typeof body.customPromptId === "string") {
+          const prompts = await getCustomPrompts(env);
+          const id = body.customPromptId.trim();
+          st.customPromptId = prompts.find((p) => String(p?.id || "") === id) ? id : "";
+        }
 
         if (env.BOT_KV) await saveUser(v.userId, st, env);
 
@@ -74,14 +81,17 @@ export default {
         if (!isStaff(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
 
         if (url.pathname === "/api/admin/bootstrap") {
-          const [prompt, styles, commission, offerBanner, payments] = await Promise.all([
+          const [prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit] = await Promise.all([
             getAnalysisPrompt(env),
             getStyleList(env),
             getCommissionSettings(env),
             getOfferBanner(env),
             listPayments(env, 25),
+            getStylePromptMap(env),
+            getCustomPrompts(env),
+            getFreeDailyLimit(env),
           ]);
-          return jsonResponse({ ok: true, prompt, styles, commission, offerBanner, payments });
+          return jsonResponse({ ok: true, prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit });
         }
 
         if (url.pathname === "/api/admin/prompt") {
@@ -98,12 +108,33 @@ export default {
           const style = String(body.style || "").trim();
           let next = list.slice();
           if (action === "add" && style) {
-            if (!next.includes(style)) next.push(style);
+            if (ALLOWED_STYLE_LIST.includes(style) && !next.includes(style)) next.push(style);
           } else if (action === "remove" && style) {
             next = next.filter((s) => s !== style);
           }
           if (env.BOT_KV) await setStyleList(env, next);
           return jsonResponse({ ok: true, styles: await getStyleList(env) });
+        }
+
+        if (url.pathname === "/api/admin/style-prompts") {
+          const map = await getStylePromptMap(env);
+          if (typeof body.stylePrompts === "object" && body.stylePrompts) {
+            await setStylePromptMap(env, body.stylePrompts);
+          }
+          return jsonResponse({ ok: true, stylePrompts: await getStylePromptMap(env) });
+        }
+
+        if (url.pathname === "/api/admin/custom-prompts") {
+          if (Array.isArray(body.customPrompts)) {
+            await setCustomPrompts(env, body.customPrompts);
+          }
+          return jsonResponse({ ok: true, customPrompts: await getCustomPrompts(env) });
+        }
+
+        if (url.pathname === "/api/admin/free-limit") {
+          const limit = toInt(body.limit, 3);
+          await setFreeDailyLimit(env, limit);
+          return jsonResponse({ ok: true, freeDailyLimit: await getFreeDailyLimit(env) });
         }
 
         if (url.pathname === "/api/admin/offer") {
@@ -150,6 +181,14 @@ export default {
               paymentCount: u.stats?.totalPayments || 0,
               paymentTotal: u.stats?.totalPaymentAmount || 0,
               lastTxHash: lastTx?.txHash || "",
+              referralBy: u.referral?.referredBy || "",
+              referralInvites: u.referral?.successfulInvites || 0,
+              subscriptionActive: !!u.subscription?.active,
+              subscriptionType: u.subscription?.type || "free",
+              subscriptionExpiresAt: u.subscription?.expiresAt || "",
+              dailyLimit: dailyLimit(env, u),
+              dailyUsed: u.dailyUsed || 0,
+              customPromptId: u.customPromptId || "",
             };
           });
           return jsonResponse({ ok: true, users: report });
@@ -208,6 +247,33 @@ export default {
           await saveUser(userId, st, env);
           await storePayment(env, payment);
           return jsonResponse({ ok: true, payment, subscription: st.subscription });
+        }
+
+        if (url.pathname === "/api/admin/subscription/activate") {
+          const username = String(body.username || "").trim();
+          const userId = await getUserIdByUsername(env, username);
+          if (!userId) return jsonResponse({ ok: false, error: "user_not_found" }, 404);
+          const st = await ensureUser(userId, env);
+          const days = toInt(body.days, 30);
+          const premiumLimit = toInt(body.dailyLimit, toInt(env.PREMIUM_DAILY_LIMIT, 50));
+          st.subscription.active = true;
+          st.subscription.type = "manual";
+          st.subscription.dailyLimit = premiumLimit;
+          st.subscription.expiresAt = futureISO(days);
+          await saveUser(userId, st, env);
+          return jsonResponse({ ok: true, subscription: st.subscription });
+        }
+
+        if (url.pathname === "/api/admin/custom-prompts/send") {
+          const username = String(body.username || "").trim();
+          const promptId = String(body.promptId || "").trim();
+          const userId = await getUserIdByUsername(env, username);
+          if (!userId) return jsonResponse({ ok: false, error: "user_not_found" }, 404);
+          const prompts = await getCustomPrompts(env);
+          const match = prompts.find((p) => String(p?.id || "") === promptId);
+          if (!match) return jsonResponse({ ok: false, error: "prompt_not_found" }, 404);
+          await tgSendMessage(env, userId, `📌 پرامپت اختصاصی فعال شد:\n${match.title || match.id}\n\n${match.text || ""}`, mainMenuKeyboard(env));
+          return jsonResponse({ ok: true });
         }
 
         if (url.pathname === "/api/admin/payments/check") {
@@ -345,8 +411,9 @@ const BTN = {
   SETTINGS: "⚙️ تنظیمات",
   PROFILE: "👤 پروفایل",
   SUPPORT: "🆘 پشتیبانی",
+  SUPPORT_TICKET: "✉️ ارسال تیکت",
+  SUPPORT_FAQ: "❓ سوالات آماده",
   EDUCATION: "📚 آموزش",
-  LEVELING: "🧪 تعیین سطح",
   BACK: "⬅️ برگشت",
   HOME: "🏠 منوی اصلی",
   MINIAPP: "🧩 مینی‌اپ",
@@ -703,15 +770,63 @@ function styleKey(style) {
 }
 async function getStylePrompt(env, style) {
   if (!env.BOT_KV) return "";
-  const v = await env.BOT_KV.get(`settings:style_prompt:${styleKey(style)}`);
-  return (v || "").toString();
+  const map = await getStylePromptMap(env);
+  const key = styleKey(style);
+  return (map?.[key] || "").toString();
 }
 async function setStylePrompt(env, style, prompt) {
   if (!env.BOT_KV) return;
-  await env.BOT_KV.put(`settings:style_prompt:${styleKey(style)}`, String(prompt || ""));
+  const map = await getStylePromptMap(env);
+  map[styleKey(style)] = String(prompt || "");
+  await setStylePromptMap(env, map);
 }
 
-const DEFAULT_STYLE_LIST = ["اسکالپ", "سوئینگ", "اسمارت‌مانی", "پرایس اکشن", "ICT", "ATR"];
+async function getStylePromptMap(env) {
+  if (!env.BOT_KV) return {};
+  const raw = await env.BOT_KV.get("settings:style_prompts_json");
+  try {
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function setStylePromptMap(env, map) {
+  if (!env.BOT_KV) return;
+  const payload = map && typeof map === "object" ? map : {};
+  await env.BOT_KV.put("settings:style_prompts_json", JSON.stringify(payload));
+}
+
+async function getCustomPrompts(env) {
+  if (!env.BOT_KV) return [];
+  const raw = await env.BOT_KV.get("settings:custom_prompts");
+  try {
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function setCustomPrompts(env, prompts) {
+  if (!env.BOT_KV) return;
+  const clean = Array.isArray(prompts) ? prompts : [];
+  await env.BOT_KV.put("settings:custom_prompts", JSON.stringify(clean));
+}
+
+async function getFreeDailyLimit(env) {
+  if (!env.BOT_KV) return 3;
+  const raw = await env.BOT_KV.get("settings:free_daily_limit");
+  return toInt(raw, 3);
+}
+
+async function setFreeDailyLimit(env, limit) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put("settings:free_daily_limit", String(limit));
+}
+const ALLOWED_STYLE_LIST = ["پرایس اکشن", "ICT", "ATR"];
+const DEFAULT_STYLE_LIST = ALLOWED_STYLE_LIST.slice();
 
 async function getStyleList(env) {
   if (!env.BOT_KV) return DEFAULT_STYLE_LIST.slice();
@@ -719,7 +834,8 @@ async function getStyleList(env) {
   if (!raw) return DEFAULT_STYLE_LIST.slice();
   try {
     const list = JSON.parse(raw);
-    return Array.isArray(list) && list.length ? list : DEFAULT_STYLE_LIST.slice();
+    const filtered = Array.isArray(list) ? list.filter((s) => ALLOWED_STYLE_LIST.includes(s)) : [];
+    return filtered.length ? filtered : DEFAULT_STYLE_LIST.slice();
   } catch {
     return DEFAULT_STYLE_LIST.slice();
   }
@@ -729,7 +845,7 @@ async function setStyleList(env, styles) {
   if (!env.BOT_KV) return;
   const clean = (Array.isArray(styles) ? styles : [])
     .map((s) => String(s || "").trim())
-    .filter(Boolean);
+    .filter((s) => ALLOWED_STYLE_LIST.includes(s));
   await env.BOT_KV.put("settings:style_list", JSON.stringify(clean));
 }
 
@@ -868,7 +984,7 @@ function kb(rows) {
 function mainMenuKeyboard(env) {
   const url = getMiniappUrl(env);
   const miniRow = url ? [{ text: BTN.MINIAPP, web_app: { url } }] : [BTN.MINIAPP];
-  return kb([[BTN.SIGNAL, BTN.SETTINGS], [BTN.WALLET, BTN.PROFILE], [BTN.SUPPORT, BTN.EDUCATION], [BTN.LEVELING], miniRow, [BTN.HOME]]);
+  return kb([[BTN.SIGNAL, BTN.SETTINGS], [BTN.WALLET, BTN.PROFILE], [BTN.SUPPORT, BTN.EDUCATION], miniRow, [BTN.HOME]]);
 }
 
 function signalMenuKeyboard() {
@@ -994,13 +1110,14 @@ function defaultUser(userId) {
 
     // preferences
     timeframe: "H4",
-    style: "اسمارت‌مانی",
+    style: "پرایس اکشن",
     risk: "متوسط",
     newsEnabled: true,
 
     // usage quota
     dailyDate: kyivDateString(),
     dailyUsed: 0,
+    freeDailyLimit: 3,
 
     // onboarding/profile
     profile: {
@@ -1018,7 +1135,7 @@ function defaultUser(userId) {
 
     // referral / points / subscription
     referral: {
-      codes: [],            // 5 codes
+      codes: [],            // 1 code
       referredBy: "",       // inviter userId
       referredByCode: "",   // which code
       successfulInvites: 0,
@@ -1051,6 +1168,7 @@ function defaultUser(userId) {
       totalPayments: 0,
       totalPaymentAmount: 0,
     },
+    customPromptId: "",
   };
 }
 
@@ -1062,6 +1180,7 @@ function patchUser(st, userId) {
   merged.subscription = { ...d.subscription, ...(st?.subscription || {}) };
   merged.wallet = { ...d.wallet, ...(st?.wallet || {}) };
   merged.stats = { ...d.stats, ...(st?.stats || {}) };
+  merged.customPromptId = typeof merged.customPromptId === "string" ? merged.customPromptId : "";
 
   merged.timeframe = merged.timeframe || d.timeframe;
   merged.style = merged.style || d.style;
@@ -1070,6 +1189,7 @@ function patchUser(st, userId) {
 
   merged.dailyDate = merged.dailyDate || d.dailyDate;
   merged.dailyUsed = Number.isFinite(Number(merged.dailyUsed)) ? Number(merged.dailyUsed) : d.dailyUsed;
+  merged.freeDailyLimit = Number.isFinite(Number(merged.freeDailyLimit)) ? Number(merged.freeDailyLimit) : d.freeDailyLimit;
 
   merged.state = merged.state || "idle";
   merged.selectedSymbol = merged.selectedSymbol || "";
@@ -1102,18 +1222,23 @@ async function ensureUser(userId, env, from) {
     st.dailyUsed = 0;
   }
 
-  if (!Array.isArray(st.referral.codes) || st.referral.codes.length < 5) {
+  if (!Array.isArray(st.referral.codes) || st.referral.codes.length < 1) {
     st.referral.codes = (st.referral.codes || []).filter(Boolean);
-    while (st.referral.codes.length < 5) st.referral.codes.push(randomCode(10));
+    while (st.referral.codes.length < 1) st.referral.codes.push(randomCode(10));
   }
+
+  const freeLimit = await getFreeDailyLimit(env);
+  st.freeDailyLimit = freeLimit;
 
   if (env.BOT_KV) await saveUser(userId, st, env);
   return st;
 }
 
 function dailyLimit(env, st) {
-  const base = 3;
-  return toInt(st?.subscription?.dailyLimit, base) || base;
+  if (st?.subscription?.active) {
+    return toInt(st?.subscription?.dailyLimit, 3) || 3;
+  }
+  return toInt(st?.freeDailyLimit || st?.subscription?.dailyLimit || 0, 0) || 3;
 }
 
 function canAnalyzeToday(st, from, env) {
@@ -1297,14 +1422,14 @@ async function runVisionProviders(imageUrl, visionPrompt, env, orderOverride) {
   const deadline = Date.now() + totalBudget;
 
   let lastErr = null;
-  let cached = null;
+  let cached = /** @type {any} */ (null);
 
   for (const p of chain) {
     const remaining = deadline - Date.now();
     if (remaining <= 500) break;
 
     try {
-      if ((p === "cf" || p === "gemini" || p === "hf") && cached?.tooLarge) continue;
+      if ((p === "cf" || p === "gemini" || p === "hf") && cached && cached.tooLarge) continue;
 
       const out = await Promise.race([
         visionProvider(p, imageUrl, visionPrompt, env, () => cached, (c) => (cached = c)),
@@ -1826,6 +1951,8 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
   const tf = st.timeframe || "H4";
   const baseRaw = await getAnalysisPrompt(env);
   const sp = await getStylePrompt(env, st.style);
+  const customPrompts = await getCustomPrompts(env);
+  const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
   const base = baseRaw.replaceAll("{TIMEFRAME}", tf);
 
   const userExtra = (isStaff({ username: st.profile?.username }, env) && userPrompt?.trim())
@@ -1836,6 +1963,7 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
     `${base}\n\n` +
     (sp ? `STYLE_PROMPT:\n${sp}\n\n` : ``) +
     (getStyleGuide(st.style) ? `STYLE_GUIDE:\n${getStyleGuide(st.style)}\n\n` : ``) +
+    (customPrompt?.text ? `CUSTOM_PROMPT:\n${customPrompt.text}\n\n` : ``) +
     `ASSET: ${symbol}\n` +
     `USER SETTINGS: Style=${st.style}, Risk=${st.risk}\n\n` +
     `MARKET_DATA:\n${marketBlock}\n\n` +
@@ -1852,10 +1980,13 @@ async function buildVisionPrompt(st, env) {
   const tf = st.timeframe || "H4";
   const baseRaw = await getAnalysisPrompt(env);
   const sp = await getStylePrompt(env, st.style);
+  const customPrompts = await getCustomPrompts(env);
+  const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
   const base = baseRaw.replaceAll("{TIMEFRAME}", tf);
   return (
     `${base}\n\n` +
     (sp ? `STYLE_PROMPT:\n${sp}\n\n` : ``) +
+    (customPrompt?.text ? `CUSTOM_PROMPT:\n${customPrompt.text}\n\n` : ``) +
     `TASK: این تصویر چارت را تحلیل کن. دقیقاً خروجی ۱ تا ۵ بده و سطح‌ها را مشخص کن.\n` +
     `RULES: فقط فارسی، لحن افشاگر، خیال‌بافی نکن.\n`
   );
@@ -2132,14 +2263,19 @@ async function handleUpdate(update, env) {
     }
 
     if (text === "/education" || text === BTN.EDUCATION) {
-      return tgSendMessage(env, chatId, "📚 آموزش و مفاهیم بازار\n\nبه‌زودی محتوای آموزشی اضافه می‌شود.\nفعلاً برای تعیین سطح روی «🧪 تعیین سطح» بزن.", mainMenuKeyboard(env));
+      return tgSendMessage(env, chatId, "📚 آموزش و مفاهیم بازار\n\nبه‌زودی محتوای آموزشی اضافه می‌شود.", mainMenuKeyboard(env));
     }
 
     if (text === "/support" || text === BTN.SUPPORT) {
       const handle = env.SUPPORT_HANDLE || "@support";
       const wallet = await getWallet(env);
       const walletLine = wallet ? `\n\n💳 آدرس ولت جهت پرداخت:\n${wallet}` : "";
-      return tgSendMessage(env, chatId, `🆘 پشتیبانی\n\nپیام بده به: ${handle}${walletLine}`, mainMenuKeyboard(env));
+      return tgSendMessage(
+        env,
+        chatId,
+        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.\n\nپیام مستقیم: ${handle}${walletLine}`,
+        kb([[BTN.SUPPORT_FAQ, BTN.SUPPORT_TICKET], [BTN.HOME]])
+      );
     }
 
     if (text === "/miniapp" || text === BTN.MINIAPP) {
@@ -2155,14 +2291,12 @@ async function handleUpdate(update, env) {
       return sendUsersList(env, chatId);
     }
 
-    if (text === BTN.LEVELING || text === "/level") {
-      if (!st.profile?.name || !st.profile?.phone) {
-        await tgSendMessage(env, chatId, "برای تعیین سطح، ابتدا پروفایل را کامل کن ✅", mainMenuKeyboard(env));
-        await startOnboarding(env, chatId, from, st);
-        return;
-      }
-      await startLeveling(env, chatId, from, st);
-      return;
+    if (text === BTN.SUPPORT_FAQ || text === "/faq") {
+      st.state = "support_faq";
+      await saveUser(userId, st, env);
+      const faq = getSupportFaq();
+      const list = faq.map((f, i) => `${i + 1}) ${f.q}`).join("\n");
+      return tgSendMessage(env, chatId, `❓ سوالات آماده\n\n${list}\n\nعدد سوال را ارسال کن تا پاسخ را ببینی.`, kb([[BTN.BACK, BTN.HOME]]));
     }
 
     if (text === BTN.HOME) {
@@ -2269,7 +2403,7 @@ async function handleUpdate(update, env) {
     if (text === BTN.SET_STYLE) {
       st.state = "set_style";
       await saveUser(userId, st, env);
-      return tgSendMessage(env, chatId, "🎯 سبک:", optionsKeyboard(["اسکالپ","سوئینگ","اسمارت‌مانی","پرایس اکشن","ICT","ATR"]));
+      return tgSendMessage(env, chatId, "🎯 سبک:", optionsKeyboard(ALLOWED_STYLE_LIST));
     }
     if (text === BTN.SET_RISK) {
       st.state = "set_risk";
@@ -2282,10 +2416,52 @@ async function handleUpdate(update, env) {
       return tgSendMessage(env, chatId, "📰 خبر:", optionsKeyboard(["روشن ✅","خاموش ❌"]));
     }
 
+    if (text === BTN.SUPPORT_FAQ) {
+      st.state = "support_faq";
+      await saveUser(userId, st, env);
+      const faq = getSupportFaq();
+      const list = faq.map((f, i) => `${i + 1}) ${f.q}`).join("\n");
+      return tgSendMessage(env, chatId, `❓ سوالات آماده\n\n${list}\n\nعدد سوال را ارسال کن تا پاسخ را ببینی.`, kb([[BTN.BACK, BTN.HOME]]));
+    }
+
+    if (text === BTN.SUPPORT_TICKET) {
+      st.state = "support_ticket";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "✉️ متن تیکت را بنویس (حداکثر ۳۰۰ کاراکتر):", kb([[BTN.BACK, BTN.HOME]]));
+    }
+
     if (st.state === "set_tf") { st.timeframe = text; st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ تایم‌فریم: ${st.timeframe}`, mainMenuKeyboard(env)); }
-    if (st.state === "set_style") { st.style = text; st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ سبک: ${st.style}`, mainMenuKeyboard(env)); }
+    if (st.state === "set_style") {
+      st.style = ALLOWED_STYLE_LIST.includes(text) ? text : st.style;
+      st.state = "idle";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, `✅ سبک: ${st.style}`, mainMenuKeyboard(env));
+    }
     if (st.state === "set_risk") { st.risk = text; st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ ریسک: ${st.risk}`, mainMenuKeyboard(env)); }
     if (st.state === "set_news") { st.newsEnabled = text.includes("روشن"); st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ خبر: ${st.newsEnabled ? "روشن ✅" : "خاموش ❌"}`, mainMenuKeyboard(env)); }
+    if (st.state === "support_faq") {
+      const idx = Number(text.trim());
+      const faq = getSupportFaq();
+      const item = Number.isFinite(idx) ? faq[idx - 1] : null;
+      st.state = "idle";
+      await saveUser(userId, st, env);
+      if (!item) return tgSendMessage(env, chatId, "عدد معتبر نیست. دوباره تلاش کن.", kb([[BTN.SUPPORT_FAQ, BTN.HOME]]));
+      return tgSendMessage(env, chatId, `✅ پاسخ:\n${item.a}`, kb([[BTN.SUPPORT_FAQ, BTN.HOME]]));
+    }
+    if (st.state === "support_ticket") {
+      const textClean = String(text || "").trim();
+      if (!textClean || textClean.length < 4) {
+        return tgSendMessage(env, chatId, "متن تیکت کوتاه است. لطفاً توضیح بیشتری بده.", kb([[BTN.BACK, BTN.HOME]]));
+      }
+      st.state = "idle";
+      await saveUser(userId, st, env);
+      const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+      if (supportChatId) {
+        await tgSendMessage(env, supportChatId, `📩 تیکت جدید\nکاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}\nشماره: ${st.profile?.phone || "-"}\nمتن:\n${textClean}`);
+        return tgSendMessage(env, chatId, "✅ تیکت شما ارسال شد. پاسخ از طریق پشتیبانی ارسال می‌شود.", mainMenuKeyboard(env));
+      }
+      return tgSendMessage(env, chatId, "⚠️ پشتیبانی در دسترس نیست. لطفاً بعداً تلاش کن.", mainMenuKeyboard(env));
+    }
 
     if (isSymbol(text)) {
       if (!st.profile?.name || !st.profile?.phone) {
@@ -2482,6 +2658,15 @@ function isSymbol(t) {
 }
 
 /* ========================== TEXTS ========================== */
+function getSupportFaq() {
+  return [
+    { q: "چطور سهمیه روزانه شارژ می‌شود؟", a: "سهمیه هر روز (Kyiv) صفر می‌شود و مجدداً قابل استفاده است." },
+    { q: "چرا تحلیل ناموفق شد؟", a: "اتصال دیتا یا مدل ممکن است موقتاً قطع باشد. چند دقیقه بعد دوباره تلاش کن." },
+    { q: "چطور اشتراک فعال کنم؟", a: "پرداخت را انجام بده و هش تراکنش را برای ادمین ارسال کن تا تأیید و فعال شود." },
+    { q: "چطور رفرال کار می‌کند؟", a: "هر دعوت موفق با شماره جدید ۳ امتیاز دارد. هر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه." },
+  ];
+}
+
 async function sendSettingsSummary(env, chatId, st, from) {
   const quota = isStaff(from, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
   const wallet = await getWallet(env);
@@ -2489,6 +2674,7 @@ async function sendSettingsSummary(env, chatId, st, from) {
     `⚙️ تنظیمات:\n\n` +
     `⏱ تایم‌فریم: ${st.timeframe}\n` +
     `🎯 سبک: ${st.style}\n` +
+    `🧩 پرامپت اختصاصی: ${st.customPromptId || "پیش‌فرض"}\n` +
     `⚠️ ریسک: ${st.risk}\n` +
     `📰 خبر: ${st.newsEnabled ? "روشن ✅" : "خاموش ❌"}\n\n` +
     `سهمیه امروز: ${quota}\n` +
@@ -2505,12 +2691,10 @@ function profileText(st, from, env) {
   const inv = st.referral?.successfulInvites || 0;
 
   const botUser = env.BOT_USERNAME ? String(env.BOT_USERNAME).replace(/^@/, "") : "";
-  const links = (st.referral?.codes || []).slice(0, 5).map((c, i) => {
-    const deep = botUser ? `https://t.me/${botUser}?start=ref_${c}` : `ref_${c}`;
-    return `${i+1}) ${deep}`;
-  }).join("\n");
+  const code = (st.referral?.codes || [])[0] || "";
+  const deep = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "-";
 
-  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Kyiv): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک‌های رفرال (۵ عدد):\n${links}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
+  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Kyiv): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
 }
 
 /* ========================== FLOWS ========================== */
@@ -2519,13 +2703,29 @@ function profileText(st, from, env) {
 QuickChart renders Chart.js configs as images via https://quickchart.io/chart .
 Financial (candlestick/OHLC) charts are supported via chartjs-chart-financial plugin.
 */
-function buildQuickChartCandlestickUrl(candles, symbol, tf) {
+function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
   const items = (candles || []).slice(-60).map((c) => ({
     x: new Date(c.t || c.time || c.ts || c.timestamp || Date.now()).toISOString(),
     o: Number(c.o),
     h: Number(c.h),
     l: Number(c.l),
     c: Number(c.c),
+  }));
+
+  const annotations = (levels || []).slice(0, 6).map((lvl, idx) => ({
+    type: "line",
+    scaleID: "y",
+    value: lvl,
+    borderColor: "rgba(109,94,246,0.65)",
+    borderWidth: 2,
+    borderDash: [4, 4],
+    label: {
+      enabled: true,
+      content: `Zone ${idx + 1}: ${lvl}`,
+      backgroundColor: "rgba(0,0,0,0.6)",
+      color: "#fff",
+      position: "end",
+    },
   }));
 
   // Basic Chart.js + chartjs-chart-financial config
@@ -2536,11 +2736,19 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf) {
         {
           label: `${symbol} ${tf}`,
           data: items,
+          color: {
+            up: "#2FE3A5",
+            down: "#FF4D4D",
+            unchanged: "#888",
+          },
         },
       ],
     },
     options: {
-      plugins: { legend: { display: false } },
+      plugins: {
+        legend: { display: false },
+        annotation: { annotations },
+      },
       scales: {
         x: { ticks: { maxRotation: 0, autoSkip: true } },
       },
@@ -2573,7 +2781,8 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
           // اگر دیتا نداریم، عکس ارسال نکن
           await tgSendMessage(env, chatId, "⚠️ برای این نماد در این تایم‌فریم دیتای کافی پیدا نشد؛ چارت ارسال نشد.", kb([[BTN.HOME]]));
         } else {
-          const chartUrl = buildQuickChartCandlestickUrl(candles, symbol, st.timeframe || "H4");
+          const levels = extractLevels(result);
+          const chartUrl = buildQuickChartCandlestickUrl(candles, symbol, st.timeframe || "H4", levels);
           await tgSendPhoto(env, chatId, chartUrl, `📈 چارت ${symbol} (${st.timeframe || "H4"})`, kb([[BTN.HOME]]));
         }
       } catch (e) {
@@ -3064,6 +3273,7 @@ const MINI_APP_HTML = `<!doctype html>
     }
     .admin-card{ display:none; }
     .admin-card.show{ display:block; }
+    .owner-hide.hidden{ display:none; }
     .admin-grid{ display:grid; gap: 10px; }
     .admin-row{ display:flex; gap:8px; flex-wrap:wrap; }
     .admin-row .control{ flex:1; min-width: 140px; }
@@ -3134,6 +3344,10 @@ const MINI_APP_HTML = `<!doctype html>
               <select id="style" class="control"></select>
             </div>
             <div class="field">
+              <div class="label">پرامپت اختصاصی</div>
+              <select id="customPrompt" class="control"></select>
+            </div>
+            <div class="field">
               <div class="label">ریسک</div>
               <select id="risk" class="control">
                 <option value="کم">کم</option>
@@ -3167,7 +3381,7 @@ const MINI_APP_HTML = `<!doctype html>
 
       <div class="card admin-card" id="adminCard">
         <div class="card-h">
-          <strong>پنل ادمین/اونر</strong>
+          <strong id="adminTitle">پنل ادمین</strong>
           <span>مدیریت پرامپت، سبک‌ها، پرداخت و کمیسیون</span>
         </div>
         <div class="card-b admin-grid">
@@ -3176,6 +3390,14 @@ const MINI_APP_HTML = `<!doctype html>
             <textarea id="adminPrompt" class="control" placeholder="پرامپت اصلی تحلیل..."></textarea>
             <div class="actions">
               <button id="savePrompt" class="btn primary">ذخیره پرامپت</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">پرامپت سبک‌ها (JSON)</div>
+            <textarea id="stylePromptJson" class="control" placeholder='{"پرایس_اکشن":"...","ict":"...","atr":"..."}'></textarea>
+            <div class="actions">
+              <button id="saveStylePrompts" class="btn">ذخیره JSON سبک‌ها</button>
             </div>
           </div>
 
@@ -3207,21 +3429,44 @@ const MINI_APP_HTML = `<!doctype html>
           </div>
 
           <div class="field">
+            <div class="label">سهمیه رایگان روزانه</div>
+            <div class="admin-row">
+              <input id="freeDailyLimit" class="control" placeholder="مثلاً 3" />
+              <button id="saveFreeLimit" class="btn">ذخیره سهمیه</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">پرامپت‌های اختصاصی (JSON)</div>
+            <textarea id="customPromptsJson" class="control" placeholder='[{"id":"p1","title":"VIP","text":"..."}]'></textarea>
+            <div class="actions">
+              <button id="saveCustomPrompts" class="btn">ذخیره پرامپت‌های اختصاصی</button>
+            </div>
+            <div class="admin-row">
+              <input id="customPromptUser" class="control" placeholder="یوزرنیم کاربر" />
+              <input id="customPromptId" class="control" placeholder="شناسه پرامپت" />
+              <button id="sendCustomPrompt" class="btn ghost">ارسال به کاربر</button>
+            </div>
+          </div>
+
+          <div class="field">
             <div class="label">تأیید پرداخت و فعال‌سازی اشتراک</div>
             <div class="admin-row">
               <input id="payUsername" class="control" placeholder="یوزرنیم خریدار" />
               <input id="payAmount" class="control" placeholder="مبلغ" />
               <input id="payDays" class="control" placeholder="روزهای اشتراک" />
+              <input id="payDailyLimit" class="control" placeholder="سهمیه روزانه اشتراک" />
             </div>
             <div class="admin-row">
               <input id="payTx" class="control" placeholder="هش تراکنش" />
               <button id="approvePayment" class="btn primary">تأیید و فعال‌سازی</button>
               <button id="checkPayment" class="btn ghost">چک بلاک‌چین</button>
+              <button id="activateSubscription" class="btn">فعال‌سازی دستی</button>
             </div>
             <div class="mini-list" id="paymentList">—</div>
           </div>
 
-          <div class="field">
+          <div class="field owner-hide" id="reportBlock">
             <div class="label">گزارش کاربران</div>
             <div class="actions">
               <button id="loadUsers" class="btn">دریافت گزارش</button>
@@ -3258,6 +3503,8 @@ const welcome = document.getElementById("welcome");
 const offerText = document.getElementById("offerText");
 const offerTag = document.getElementById("offerTag");
 const adminCard = document.getElementById("adminCard");
+const adminTitle = document.getElementById("adminTitle");
+const reportBlock = document.getElementById("reportBlock");
 
 function el(id){ return document.getElementById(id); }
 function val(id){ return el(id).value; }
@@ -3308,6 +3555,24 @@ function fillStyles(list){
     sel.appendChild(opt);
   }
   if (cur && styles.includes(cur)) sel.value = cur;
+}
+
+function fillCustomPrompts(list){
+  const prompts = Array.isArray(list) ? list.slice() : [];
+  const sel = el("customPrompt");
+  const cur = sel.value;
+  sel.innerHTML = "";
+  const defaultOpt = document.createElement("option");
+  defaultOpt.value = "";
+  defaultOpt.textContent = "پیش‌فرض";
+  sel.appendChild(defaultOpt);
+  for (const p of prompts) {
+    const opt = document.createElement("option");
+    opt.value = String(p?.id || "");
+    opt.textContent = p?.title ? String(p.title) : String(p?.id || "");
+    sel.appendChild(opt);
+  }
+  if (cur) sel.value = cur;
 }
 
 function filterSymbols(q){
@@ -3392,8 +3657,12 @@ function renderUsers(list){
   if (!Array.isArray(list) || !list.length) { target.textContent = "—"; return; }
   target.textContent = list.map((u) => {
     const user = u.username ? \`@\${u.username.replace(/^@/, "")}\` : u.userId;
-    return \`• \${user} | تلفن: \${u.phone || "—"} | مدت: \${u.usageDays} روز | تحلیل: \${u.totalAnalyses} | پرداخت: \${u.paymentCount} | TX: \${u.lastTxHash || "—"}\`;
+    return \`• \${user} | تلفن: \${u.phone || "—"} | مدت: \${u.usageDays} روز | تحلیل موفق: \${u.totalAnalyses} | آخرین تحلیل: \${u.lastAnalysisAt || "—"} | پرداخت: \${u.paymentCount} (\${u.paymentTotal || 0}) | اشتراک: \${u.subscriptionType || "free"} | انقضا: \${u.subscriptionExpiresAt || "—"} | سهمیه: \${u.dailyUsed}/\${u.dailyLimit} | رفرال: \${u.referralInvites} | TX: \${u.lastTxHash || "—"} | پرامپت: \${u.customPromptId || "—"}\`;
   }).join("\\n");
+}
+
+function safeJsonParse(text, fallback) {
+  try { return JSON.parse(text); } catch { return fallback; }
 }
 
 async function boot(){
@@ -3417,6 +3686,7 @@ async function boot(){
   fillSymbols(json.symbols || []);
   const styleList = json.styles || [];
   fillStyles(styleList);
+  fillCustomPrompts(json.customPrompts || []);
   if (json.state?.timeframe) setTf(json.state.timeframe);
   if (json.state?.style && styleList.includes(json.state.style)) {
     setVal("style", json.state.style);
@@ -3424,6 +3694,7 @@ async function boot(){
     setVal("style", styleList[0]);
   }
   if (json.state?.risk) setVal("risk", json.state.risk);
+  if (typeof json.state?.customPromptId === "string") setVal("customPrompt", json.state.customPromptId);
   setVal("newsEnabled", String(!!json.state?.newsEnabled));
 
   if (json.symbols?.length) setVal("symbol", json.symbols[0]);
@@ -3438,6 +3709,8 @@ async function boot(){
   IS_STAFF = !!json.isStaff;
   if (IS_STAFF && adminCard) {
     adminCard.classList.add("show");
+    if (adminTitle) adminTitle.textContent = json.role === "owner" ? "پنل اونر" : "پنل ادمین";
+    if (json.role === "owner" && reportBlock) reportBlock.classList.add("hidden");
     await loadAdminBootstrap();
   }
 }
@@ -3446,6 +3719,9 @@ async function loadAdminBootstrap(){
   const { json } = await adminApi("/api/admin/bootstrap", {});
   if (!json?.ok) return;
   if (el("adminPrompt")) el("adminPrompt").value = json.prompt || "";
+  if (el("stylePromptJson")) el("stylePromptJson").value = JSON.stringify(json.stylePrompts || {}, null, 2);
+  if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(json.customPrompts || [], null, 2);
+  if (el("freeDailyLimit")) el("freeDailyLimit").value = String(json.freeDailyLimit ?? "");
   renderStyleList(json.styles || []);
   renderCommissionList(json.commission || {});
   renderPayments(json.payments || []);
@@ -3472,6 +3748,7 @@ el("save").addEventListener("click", async () => {
     style: val("style"),
     risk: val("risk"),
     newsEnabled: val("newsEnabled") === "true",
+    customPromptId: val("customPrompt") || "",
   };
 
   const {status, json} = await api("/api/settings", payload);
@@ -3516,6 +3793,13 @@ el("savePrompt")?.addEventListener("click", async () => {
   if (json?.ok) showToast("ذخیره شد ✅", "پرامپت بروزرسانی شد", "ADM", false);
 });
 
+el("saveStylePrompts")?.addEventListener("click", async () => {
+  const raw = el("stylePromptJson")?.value || "{}";
+  const stylePrompts = safeJsonParse(raw, {});
+  const { json } = await adminApi("/api/admin/style-prompts", { stylePrompts });
+  if (json?.ok) showToast("ذخیره شد ✅", "JSON سبک‌ها بروزرسانی شد", "ADM", false);
+});
+
 el("addStyle")?.addEventListener("click", async () => {
   const style = el("newStyle")?.value || "";
   const { json } = await adminApi("/api/admin/styles", { action: "add", style });
@@ -3547,6 +3831,29 @@ el("saveUserCommission")?.addEventListener("click", async () => {
   if (json?.ok) renderCommissionList(json.commission || {});
 });
 
+el("saveFreeLimit")?.addEventListener("click", async () => {
+  const limit = Number(el("freeDailyLimit")?.value || 3);
+  const { json } = await adminApi("/api/admin/free-limit", { limit });
+  if (json?.ok) showToast("ذخیره شد ✅", "سهمیه رایگان بروزرسانی شد", "ADM", false);
+});
+
+el("saveCustomPrompts")?.addEventListener("click", async () => {
+  const raw = el("customPromptsJson")?.value || "[]";
+  const customPrompts = safeJsonParse(raw, []);
+  const { json } = await adminApi("/api/admin/custom-prompts", { customPrompts });
+  if (json?.ok) {
+    showToast("ذخیره شد ✅", "پرامپت‌های اختصاصی بروزرسانی شد", "ADM", false);
+    fillCustomPrompts(json.customPrompts || []);
+  }
+});
+
+el("sendCustomPrompt")?.addEventListener("click", async () => {
+  const username = el("customPromptUser")?.value || "";
+  const promptId = el("customPromptId")?.value || "";
+  const { json } = await adminApi("/api/admin/custom-prompts/send", { username, promptId });
+  if (json?.ok) showToast("ارسال شد ✅", "پرامپت برای کاربر ارسال شد", "ADM", false);
+});
+
 el("approvePayment")?.addEventListener("click", async () => {
   const payload = {
     username: el("payUsername")?.value || "",
@@ -3571,6 +3878,16 @@ el("checkPayment")?.addEventListener("click", async () => {
   };
   const { json } = await adminApi("/api/admin/payments/check", payload);
   if (json?.ok) showToast("نتیجه بلاک‌چین", JSON.stringify(json.result || {}), "CHAIN", false);
+});
+
+el("activateSubscription")?.addEventListener("click", async () => {
+  const payload = {
+    username: el("payUsername")?.value || "",
+    days: Number(el("payDays")?.value || 30),
+    dailyLimit: Number(el("payDailyLimit")?.value || 50),
+  };
+  const { json } = await adminApi("/api/admin/subscription/activate", payload);
+  if (json?.ok) showToast("اشتراک فعال شد ✅", "فعال‌سازی دستی انجام شد", "ADM", false);
 });
 
 el("loadUsers")?.addEventListener("click", async () => {
