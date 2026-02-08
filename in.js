@@ -410,6 +410,7 @@ const BTN = {
   SIGNAL: "📈 سیگنال‌ها",
   SETTINGS: "⚙️ تنظیمات",
   PROFILE: "👤 پروفایل",
+  INVITE: "🤝 دعوت",
   SUPPORT: "🆘 پشتیبانی",
   SUPPORT_TICKET: "✉️ ارسال تیکت",
   SUPPORT_FAQ: "❓ سوالات آماده",
@@ -984,7 +985,7 @@ function kb(rows) {
 function mainMenuKeyboard(env) {
   const url = getMiniappUrl(env);
   const miniRow = url ? [{ text: BTN.MINIAPP, web_app: { url } }] : [BTN.MINIAPP];
-  return kb([[BTN.SIGNAL, BTN.SETTINGS], [BTN.WALLET, BTN.PROFILE], [BTN.SUPPORT, BTN.EDUCATION], miniRow, [BTN.HOME]]);
+  return kb([[BTN.SIGNAL, BTN.SETTINGS], [BTN.WALLET, BTN.PROFILE], [BTN.INVITE, BTN.SUPPORT], [BTN.EDUCATION], miniRow, [BTN.HOME]]);
 }
 
 function signalMenuKeyboard() {
@@ -2262,6 +2263,16 @@ async function handleUpdate(update, env) {
       return tgSendMessage(env, chatId, profileText(st, from, env), mainMenuKeyboard(env));
     }
 
+    if (text === "/invite" || text === BTN.INVITE) {
+      const { link, share } = inviteShareText(st, env);
+      if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
+      const txt =
+        `🤝 دعوت دوستان\n\n` +
+        `🔗 لینک رفرال اختصاصی:\n${link}\n\n` +
+        (share ? `برای اشتراک‌گذاری سریع:\n${share}\n` : "");
+      return tgSendMessage(env, chatId, txt, mainMenuKeyboard(env));
+    }
+
     if (text === "/education" || text === BTN.EDUCATION) {
       return tgSendMessage(env, chatId, "📚 آموزش و مفاهیم بازار\n\nبه‌زودی محتوای آموزشی اضافه می‌شود.", mainMenuKeyboard(env));
     }
@@ -2695,6 +2706,14 @@ function profileText(st, from, env) {
   const deep = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "-";
 
   return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Kyiv): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
+}
+
+function inviteShareText(st, env) {
+  const botUser = env.BOT_USERNAME ? String(env.BOT_USERNAME).replace(/^@/, "") : "";
+  const code = (st.referral?.codes || [])[0] || "";
+  const link = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "";
+  const share = link ? `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent("با لینک من عضو شو و اشتراک هدیه بگیر ✅")}` : "";
+  return { link, share };
 }
 
 /* ========================== FLOWS ========================== */
