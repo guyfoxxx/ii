@@ -23,6 +23,9 @@ export default {
         const st = await ensureUser(v.userId, env);
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
         const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
+        const styles = await getStyleList(env);
+        const offerBanner = await getOfferBanner(env);
+        const role = isOwner(v.fromLike, env) ? "owner" : (isAdmin(v.fromLike, env) ? "admin" : "user");
 
         return jsonResponse({
           ok: true,
@@ -30,6 +33,10 @@ export default {
           state: st,
           quota,
           symbols,
+          styles,
+          offerBanner,
+          role,
+          isStaff: role !== "user",
           wallet: (await getWallet(env)) || "",
         });
       }
@@ -45,7 +52,10 @@ export default {
 
         // users can tweak only their preferences (admin-only prompt/wallet enforced elsewhere)
         if (typeof body.timeframe === "string") st.timeframe = body.timeframe;
-        if (typeof body.style === "string") st.style = body.style;
+        if (typeof body.style === "string") {
+          const styles = await getStyleList(env);
+          if (styles.includes(body.style)) st.style = body.style;
+        }
         if (typeof body.risk === "string") st.risk = body.risk;
         if (typeof body.newsEnabled === "boolean") st.newsEnabled = body.newsEnabled;
 
@@ -53,6 +63,162 @@ export default {
 
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
         return jsonResponse({ ok: true, state: st, quota });
+      }
+
+      if (url.pathname.startsWith("/api/admin/") && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+        if (!isStaff(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+
+        if (url.pathname === "/api/admin/bootstrap") {
+          const [prompt, styles, commission, offerBanner, payments] = await Promise.all([
+            getAnalysisPrompt(env),
+            getStyleList(env),
+            getCommissionSettings(env),
+            getOfferBanner(env),
+            listPayments(env, 25),
+          ]);
+          return jsonResponse({ ok: true, prompt, styles, commission, offerBanner, payments });
+        }
+
+        if (url.pathname === "/api/admin/prompt") {
+          if (typeof body.prompt === "string" && env.BOT_KV) {
+            await env.BOT_KV.put("settings:analysis_prompt", body.prompt.trim());
+          }
+          const prompt = await getAnalysisPrompt(env);
+          return jsonResponse({ ok: true, prompt });
+        }
+
+        if (url.pathname === "/api/admin/styles") {
+          const list = await getStyleList(env);
+          const action = String(body.action || "");
+          const style = String(body.style || "").trim();
+          let next = list.slice();
+          if (action === "add" && style) {
+            if (!next.includes(style)) next.push(style);
+          } else if (action === "remove" && style) {
+            next = next.filter((s) => s !== style);
+          }
+          if (env.BOT_KV) await setStyleList(env, next);
+          return jsonResponse({ ok: true, styles: await getStyleList(env) });
+        }
+
+        if (url.pathname === "/api/admin/offer") {
+          if (typeof body.offerBanner === "string" && env.BOT_KV) {
+            await setOfferBanner(env, body.offerBanner);
+          }
+          return jsonResponse({ ok: true, offerBanner: await getOfferBanner(env) });
+        }
+
+        if (url.pathname === "/api/admin/commissions") {
+          const settings = await getCommissionSettings(env);
+          const action = String(body.action || "");
+          if (action === "setGlobal" && Number.isFinite(Number(body.percent))) {
+            settings.globalPercent = Number(body.percent);
+          }
+          if (action === "setOverride") {
+            const handle = normHandle(body.username);
+            const pct = Number(body.percent);
+            if (handle && Number.isFinite(pct)) settings.overrides[handle] = pct;
+          }
+          if (action === "removeOverride") {
+            const handle = normHandle(body.username);
+            if (handle) delete settings.overrides[handle];
+          }
+          await setCommissionSettings(env, settings);
+          return jsonResponse({ ok: true, commission: await getCommissionSettings(env) });
+        }
+
+        if (url.pathname === "/api/admin/users") {
+          const users = await listUsers(env, Number(body.limit || 100));
+          const now = Date.now();
+          const report = users.map((u) => {
+            const createdAt = u.createdAt || "";
+            const usageDays = createdAt ? Math.max(1, Math.ceil((now - Date.parse(createdAt)) / (24 * 3600 * 1000))) : 0;
+            const lastTx = Array.isArray(u.wallet?.transactions) ? u.wallet.transactions[u.wallet.transactions.length - 1] : null;
+            return {
+              userId: u.userId,
+              username: u.profile?.username || "",
+              phone: u.profile?.phone || "",
+              createdAt,
+              usageDays,
+              totalAnalyses: u.stats?.successfulAnalyses || 0,
+              lastAnalysisAt: u.stats?.lastAnalysisAt || "",
+              paymentCount: u.stats?.totalPayments || 0,
+              paymentTotal: u.stats?.totalPaymentAmount || 0,
+              lastTxHash: lastTx?.txHash || "",
+            };
+          });
+          return jsonResponse({ ok: true, users: report });
+        }
+
+        if (url.pathname === "/api/admin/payments/list") {
+          return jsonResponse({ ok: true, payments: await listPayments(env, 100) });
+        }
+
+        if (url.pathname === "/api/admin/payments/approve") {
+          const username = String(body.username || "").trim();
+          const userId = await getUserIdByUsername(env, username);
+          if (!userId) return jsonResponse({ ok: false, error: "user_not_found" }, 404);
+
+          const st = await ensureUser(userId, env);
+          const amount = Number(body.amount || 0);
+          const days = toInt(body.days, 30);
+          const txHash = String(body.txHash || "").trim();
+          const premiumLimit = toInt(env.PREMIUM_DAILY_LIMIT, 50);
+          const now = new Date().toISOString();
+          const payment = {
+            id: `pay_${Date.now()}_${userId}`,
+            userId,
+            username,
+            amount,
+            txHash,
+            status: "approved",
+            createdAt: now,
+            approvedAt: now,
+            approvedBy: normHandle(v.fromLike?.username),
+          };
+
+          st.subscription.active = true;
+          st.subscription.type = "premium";
+          st.subscription.dailyLimit = premiumLimit;
+          st.subscription.expiresAt = futureISO(days);
+          st.stats.totalPayments = (st.stats.totalPayments || 0) + 1;
+          st.stats.totalPaymentAmount = (st.stats.totalPaymentAmount || 0) + amount;
+          st.wallet.transactions = Array.isArray(st.wallet.transactions) ? st.wallet.transactions : [];
+          if (txHash) {
+            st.wallet.transactions.push({ txHash, amount, createdAt: now });
+            st.wallet.transactions = st.wallet.transactions.slice(-10);
+          }
+
+          if (st.referral?.referredBy) {
+            const inviter = await ensureUser(String(st.referral.referredBy), env);
+            const commission = await getCommissionSettings(env);
+            const pct = resolveCommissionPercent(inviter.profile?.username, commission);
+            const reward = pct > 0 ? Math.round((amount * pct) * 100) / 100 : 0;
+            inviter.referral.commissionTotal = (inviter.referral.commissionTotal || 0) + reward;
+            inviter.referral.commissionBalance = (inviter.referral.commissionBalance || 0) + reward;
+            await saveUser(inviter.userId, inviter, env);
+            payment.commission = { inviterId: inviter.userId, percent: pct, amount: reward };
+          }
+
+          await saveUser(userId, st, env);
+          await storePayment(env, payment);
+          return jsonResponse({ ok: true, payment, subscription: st.subscription });
+        }
+
+        if (url.pathname === "/api/admin/payments/check") {
+          const payload = {
+            txHash: String(body.txHash || "").trim(),
+            address: String(body.address || "").trim(),
+            amount: Number(body.amount || 0),
+          };
+          const result = await verifyBlockchainPayment(payload, env);
+          return jsonResponse({ ok: true, result });
+        }
       }
 
       if (url.pathname === "/api/analyze" && request.method === "POST") {
@@ -76,15 +242,15 @@ export default {
           return jsonResponse({ ok: false, error: `quota_exceeded_${quota}` }, 429);
         }
 
-        if (env.BOT_KV) {
-          consumeDaily(st, v.fromLike, env);
-          await saveUser(v.userId, st, env);
-        }
-
         const userPrompt = typeof body.userPrompt === "string" ? body.userPrompt : "";
 
         try {
           const result = await runSignalTextFlowReturnText(env, v.fromLike, st, symbol, userPrompt);
+          if (env.BOT_KV) {
+            consumeDaily(st, v.fromLike, env);
+            recordAnalysisSuccess(st);
+            await saveUser(v.userId, st, env);
+          }
           const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
           return jsonResponse({ ok: true, result, state: st, quota });
         } catch (e) {
@@ -300,6 +466,50 @@ function randomCode(len = 10) {
   return out;
 }
 
+const MARKET_CACHE = new Map();
+const ANALYSIS_CACHE = new Map();
+
+function cacheGet(map, key) {
+  const hit = map.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt && hit.expiresAt <= Date.now()) {
+    map.delete(key);
+    return null;
+  }
+  return hit.value;
+}
+
+function cacheSet(map, key, value, ttlMs, maxSize = 500) {
+  map.set(key, { value, expiresAt: Date.now() + ttlMs });
+  if (map.size > maxSize) {
+    const [first] = map.keys();
+    if (first) map.delete(first);
+  }
+}
+
+async function r2GetJson(bucket, key) {
+  if (!bucket) return null;
+  const obj = await bucket.get(key);
+  if (!obj) return null;
+  try { return await obj.json(); } catch { return null; }
+}
+
+async function r2PutJson(bucket, key, value, ttlMs) {
+  if (!bucket) return;
+  const body = JSON.stringify({ value, expiresAt: Date.now() + ttlMs });
+  await bucket.put(key, body, {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: { ttlMs: String(ttlMs || "") },
+  });
+}
+
+async function getCachedR2Value(bucket, key) {
+  const payload = await r2GetJson(bucket, key);
+  if (!payload) return null;
+  if (payload.expiresAt && payload.expiresAt <= Date.now()) return null;
+  return payload.value;
+}
+
 /* ========================== PROMPTS (ADMIN/OWNER ONLY) ========================== */
 const DEFAULT_ANALYSIS_PROMPT = `SYSTEM OVERRIDE: ACTIVATE INSTITUTIONAL MODE
 
@@ -501,6 +711,149 @@ async function setStylePrompt(env, style, prompt) {
   await env.BOT_KV.put(`settings:style_prompt:${styleKey(style)}`, String(prompt || ""));
 }
 
+const DEFAULT_STYLE_LIST = ["اسکالپ", "سوئینگ", "اسمارت‌مانی", "پرایس اکشن", "ICT", "ATR"];
+
+async function getStyleList(env) {
+  if (!env.BOT_KV) return DEFAULT_STYLE_LIST.slice();
+  const raw = await env.BOT_KV.get("settings:style_list");
+  if (!raw) return DEFAULT_STYLE_LIST.slice();
+  try {
+    const list = JSON.parse(raw);
+    return Array.isArray(list) && list.length ? list : DEFAULT_STYLE_LIST.slice();
+  } catch {
+    return DEFAULT_STYLE_LIST.slice();
+  }
+}
+
+async function setStyleList(env, styles) {
+  if (!env.BOT_KV) return;
+  const clean = (Array.isArray(styles) ? styles : [])
+    .map((s) => String(s || "").trim())
+    .filter(Boolean);
+  await env.BOT_KV.put("settings:style_list", JSON.stringify(clean));
+}
+
+async function getOfferBanner(env) {
+  if (!env.BOT_KV) return (env.SPECIAL_OFFER_TEXT || "").toString().trim();
+  const raw = await env.BOT_KV.get("settings:offer_banner");
+  return (raw || env.SPECIAL_OFFER_TEXT || "").toString().trim();
+}
+
+async function setOfferBanner(env, text) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
+}
+
+async function getCommissionSettings(env) {
+  if (!env.BOT_KV) return { globalPercent: 0, overrides: {} };
+  const g = await env.BOT_KV.get("settings:commission:globalPercent");
+  const o = await env.BOT_KV.get("settings:commission:overrides");
+  let overrides = {};
+  try { overrides = o ? JSON.parse(o) : {}; } catch { overrides = {}; }
+  return {
+    globalPercent: toInt(g, 0),
+    overrides: overrides && typeof overrides === "object" ? overrides : {},
+  };
+}
+
+async function setCommissionSettings(env, settings) {
+  if (!env.BOT_KV) return;
+  if (typeof settings.globalPercent === "number") {
+    await env.BOT_KV.put("settings:commission:globalPercent", String(settings.globalPercent));
+  }
+  if (settings.overrides) {
+    await env.BOT_KV.put("settings:commission:overrides", JSON.stringify(settings.overrides || {}));
+  }
+}
+
+function resolveCommissionPercent(username, settings) {
+  const handle = normHandle(username);
+  if (!handle) return settings.globalPercent || 0;
+  const raw = settings.overrides?.[handle];
+  const override = Number(raw);
+  if (Number.isFinite(override)) return override;
+  return settings.globalPercent || 0;
+}
+
+async function updateUserIndexes(env, st) {
+  if (!env.BOT_KV) return;
+  const id = String(st.userId);
+
+  const raw = await env.BOT_KV.get("users:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  if (!list.includes(id)) list.push(id);
+  await env.BOT_KV.put("users:index", JSON.stringify(list.slice(-2000)));
+
+  const handle = normHandle(st.profile?.username);
+  if (handle) {
+    await env.BOT_KV.put(`users:by_username:${handle}`, id);
+  }
+}
+
+async function getUserIdByUsername(env, username) {
+  if (!env.BOT_KV) return "";
+  const handle = normHandle(username);
+  if (!handle) return "";
+  return (await env.BOT_KV.get(`users:by_username:${handle}`)) || "";
+}
+
+async function listUsers(env, limit = 100) {
+  if (!env.BOT_KV) return [];
+  const raw = await env.BOT_KV.get("users:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) return [];
+  const ids = list.slice(-limit);
+  const users = [];
+  for (const id of ids) {
+    const u = await getUser(id, env);
+    if (u) users.push(u);
+  }
+  return users;
+}
+
+async function storePayment(env, payment) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put(`payment:${payment.id}`, JSON.stringify(payment));
+
+  const raw = await env.BOT_KV.get("payments:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  if (!list.includes(payment.id)) list.push(payment.id);
+  await env.BOT_KV.put("payments:index", JSON.stringify(list.slice(-500)));
+}
+
+async function listPayments(env, limit = 50) {
+  if (!env.BOT_KV) return [];
+  const raw = await env.BOT_KV.get("payments:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) return [];
+  const ids = list.slice(-limit);
+  const out = [];
+  for (const id of ids) {
+    const rawPay = await env.BOT_KV.get(`payment:${id}`);
+    if (rawPay) {
+      try { out.push(JSON.parse(rawPay)); } catch {}
+    }
+  }
+  return out.sort((a, b) => (b?.createdAt || "").localeCompare(a?.createdAt || ""));
+}
+
+async function verifyBlockchainPayment(payload, env) {
+  const endpoint = (env.BLOCKCHAIN_CHECK_URL || "").toString().trim();
+  if (!endpoint) return { ok: false, reason: "check_url_missing" };
+  const r = await fetchWithTimeout(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }, Number(env.BLOCKCHAIN_CHECK_TIMEOUT_MS || 8000));
+  const j = await r.json().catch(() => null);
+  return j || { ok: false, reason: "bad_response" };
+}
 
 /* ========================== KEYBOARDS ========================== */
 function kb(rows) {
@@ -627,6 +980,7 @@ async function saveUser(userId, st, env) {
 
   if (!env.BOT_KV) return;
   await env.BOT_KV.put(`u:${userId}`, JSON.stringify(st));
+  await updateUserIndexes(env, st);
 }
 
 function defaultUser(userId) {
@@ -669,23 +1023,34 @@ function defaultUser(userId) {
       referredByCode: "",   // which code
       successfulInvites: 0,
       points: 0,
+      commissionTotal: 0,
+      commissionBalance: 0,
     },
     subscription: {
       active: false,
       type: "free", // free/premium/gift
       expiresAt: "",
-      dailyLimit: 50, // per requirement
+      dailyLimit: 3,
     },
 
     // wallet (local balance placeholder)
     wallet: {
       balance: 0,
+      transactions: [],
     },
 
     // provider overrides
     textOrder: "",
     visionOrder: "",
     polishOrder: "",
+
+    stats: {
+      totalAnalyses: 0,
+      successfulAnalyses: 0,
+      lastAnalysisAt: "",
+      totalPayments: 0,
+      totalPaymentAmount: 0,
+    },
   };
 }
 
@@ -696,6 +1061,7 @@ function patchUser(st, userId) {
   merged.referral = { ...d.referral, ...(st?.referral || {}) };
   merged.subscription = { ...d.subscription, ...(st?.subscription || {}) };
   merged.wallet = { ...d.wallet, ...(st?.wallet || {}) };
+  merged.stats = { ...d.stats, ...(st?.stats || {}) };
 
   merged.timeframe = merged.timeframe || d.timeframe;
   merged.style = merged.style || d.style;
@@ -746,7 +1112,7 @@ async function ensureUser(userId, env, from) {
 }
 
 function dailyLimit(env, st) {
-  const base = 50;
+  const base = 3;
   return toInt(st?.subscription?.dailyLimit, base) || base;
 }
 
@@ -765,6 +1131,13 @@ function consumeDaily(st, from, env) {
     st.dailyUsed = 0;
   }
   st.dailyUsed = (st.dailyUsed || 0) + 1;
+}
+
+function recordAnalysisSuccess(st) {
+  st.stats = st.stats || {};
+  st.stats.totalAnalyses = (st.stats.totalAnalyses || 0) + 1;
+  st.stats.successfulAnalyses = (st.stats.successfulAnalyses || 0) + 1;
+  st.stats.lastAnalysisAt = new Date().toISOString();
 }
 
 /* ========================== TELEGRAM API ========================== */
@@ -1359,20 +1732,46 @@ async function fetchYahooChartCandles(symbol, timeframe, limit, timeoutMs) {
   throw lastErr || new Error("yahoo_no_data");
 }
 
+function marketCacheKey(symbol, timeframe) {
+  return `market:${String(symbol).toUpperCase()}:${String(timeframe).toUpperCase()}`;
+}
+
+async function getMarketCache(env, key) {
+  const mem = cacheGet(MARKET_CACHE, key);
+  if (mem) return mem;
+  const r2 = await getCachedR2Value(env.MARKET_R2, key);
+  if (r2) cacheSet(MARKET_CACHE, key, r2, Number(env.MARKET_CACHE_TTL_MS || 120000));
+  return r2;
+}
+
+async function setMarketCache(env, key, value) {
+  const ttlMs = Number(env.MARKET_CACHE_TTL_MS || 120000);
+  cacheSet(MARKET_CACHE, key, value, ttlMs);
+  await r2PutJson(env.MARKET_R2, key, value, ttlMs);
+}
+
 async function getMarketCandlesWithFallback(env, symbol, timeframe) {
   const timeoutMs = Number(env.MARKET_DATA_TIMEOUT_MS || 7000);
   const limit = Number(env.MARKET_DATA_CANDLES_LIMIT || 120);
+  const cacheKey = marketCacheKey(symbol, timeframe);
+  const cached = await getMarketCache(env, cacheKey);
+  if (cached) return cached;
 
   const chain = parseOrder(env.MARKET_DATA_PROVIDER_ORDER, ["binance","twelvedata","alphavantage","finnhub","yahoo"]);
   let lastErr = null;
 
   for (const p of chain) {
     try {
-      if (p === "binance") return await fetchBinanceCandles(symbol, timeframe, limit, timeoutMs);
-      if (p === "twelvedata") return await fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env);
-      if (p === "alphavantage") return await fetchAlphaVantageFxIntraday(symbol, timeframe, limit, timeoutMs, env);
-      if (p === "finnhub") return await fetchFinnhubForexCandles(symbol, timeframe, limit, timeoutMs, env);
-      if (p === "yahoo") return await fetchYahooChartCandles(symbol, timeframe, limit, timeoutMs);
+      let candles = null;
+      if (p === "binance") candles = await fetchBinanceCandles(symbol, timeframe, limit, timeoutMs);
+      if (p === "twelvedata") candles = await fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env);
+      if (p === "alphavantage") candles = await fetchAlphaVantageFxIntraday(symbol, timeframe, limit, timeoutMs, env);
+      if (p === "finnhub") candles = await fetchFinnhubForexCandles(symbol, timeframe, limit, timeoutMs, env);
+      if (p === "yahoo") candles = await fetchYahooChartCandles(symbol, timeframe, limit, timeoutMs);
+      if (candles) {
+        await setMarketCache(env, cacheKey, candles);
+        return candles;
+      }
     } catch (e) {
       lastErr = e;
       console.error("market provider failed:", p, e?.message || e);
@@ -1915,12 +2314,12 @@ async function handleUpdate(update, env) {
       st.state = "idle";
       st.selectedSymbol = "";
 
-      if (env.BOT_KV) {
+      const ok = await runSignalTextFlow(env, chatId, from, st, symbol, "");
+      if (ok && env.BOT_KV) {
         consumeDaily(st, from, env);
+        recordAnalysisSuccess(st);
         await saveUser(userId, st, env);
       }
-
-      await runSignalTextFlow(env, chatId, from, st, symbol, "");
       return;
     }
 
@@ -2193,20 +2592,52 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
     for (const part of chunkText(result, 3500)) {
       await tgSendMessage(env, chatId, part, mainMenuKeyboard(env));
     }
+    return true;
   } catch (e) {
     console.error("runSignalTextFlow error:", e);
     t.stop = true;
     await tgSendMessage(env, chatId, "⚠️ فعلاً امکان انجام این عملیات نیست. لطفاً بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
+    return false;
   }
 }
 
-async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {let candles = [];
-        try {
-          candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4");
-        } catch (e) {
-          console.error("market provider failed (all)", e?.message || e);
-          candles = [];
-        }
+function analysisCacheKey(symbol, st) {
+  const tf = st.timeframe || "H4";
+  const style = st.style || "";
+  const risk = st.risk || "";
+  const news = st.newsEnabled ? "1" : "0";
+  return `analysis:${String(symbol).toUpperCase()}:${tf}:${style}:${risk}:${news}`;
+}
+
+async function getAnalysisCache(env, key) {
+  const mem = cacheGet(ANALYSIS_CACHE, key);
+  if (mem) return mem;
+  const r2 = await getCachedR2Value(env.MARKET_R2, key);
+  if (r2) cacheSet(ANALYSIS_CACHE, key, r2, Number(env.ANALYSIS_CACHE_TTL_MS || 120000));
+  return r2;
+}
+
+async function setAnalysisCache(env, key, value) {
+  const ttlMs = Number(env.ANALYSIS_CACHE_TTL_MS || 120000);
+  cacheSet(ANALYSIS_CACHE, key, value, ttlMs);
+  await r2PutJson(env.MARKET_R2, key, value, ttlMs);
+}
+
+async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
+  const useCache = !userPrompt && !isStaff(from, env);
+  const cacheKey = useCache ? analysisCacheKey(symbol, st) : "";
+  if (useCache) {
+    const cached = await getAnalysisCache(env, cacheKey);
+    if (cached) return cached;
+  }
+
+  let candles = [];
+  try {
+    candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4");
+  } catch (e) {
+    console.error("market provider failed (all)", e?.message || e);
+    candles = [];
+  }
   const snap = computeSnapshot(candles);
   const ohlc = candlesToCompactCSV(candles, 80);
 
@@ -2222,6 +2653,7 @@ async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {l
   const prompt = await buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env);
   const draft = await runTextProviders(prompt, env, st.textOrder);
   const polished = await runPolishProviders(draft, env, st.polishOrder);
+  if (useCache && polished) await setAnalysisCache(env, cacheKey, polished);
   return polished;
 }
 
@@ -2240,11 +2672,6 @@ async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
     const filePath = await tgGetFilePath(env, fileId);
     if (!filePath) throw new Error("no_file_path");
     const imageUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`;
-
-    if (env.BOT_KV) {
-      consumeDaily(st, from, env);
-      await saveUser(userId, st, env);
-    }
 
     const vPrompt = await buildVisionPrompt(st, env);
     const visionRaw = await runVisionProviders(imageUrl, vPrompt, env, st.visionOrder);
@@ -2272,6 +2699,11 @@ async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
 
     for (const part of chunkText(polished, 3500)) {
       await tgSendMessage(env, chatId, part, mainMenuKeyboard(env));
+    }
+    if (env.BOT_KV) {
+      consumeDaily(st, from, env);
+      recordAnalysisSuccess(st);
+      await saveUser(userId, st, env);
     }
   } catch (e) {
     console.error("handleVisionFlow error:", e);
@@ -2611,6 +3043,32 @@ const MINI_APP_HTML = `<!doctype html>
     }
     @keyframes spin{ to { transform: rotate(360deg); } }
     .muted{ color: var(--muted); }
+    .offer{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap: 12px;
+      padding: 16px;
+      border-radius: 20px;
+      background: linear-gradient(135deg, rgba(109,94,246,.24), rgba(0,209,255,.12));
+      border: 1px solid rgba(109,94,246,.35);
+    }
+    .offer h3{ margin:0; font-size: 15px; }
+    .offer p{ margin:6px 0 0; font-size: 12px; color: var(--muted); }
+    .offer .tag{
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      border: 1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.08);
+    }
+    .admin-card{ display:none; }
+    .admin-card.show{ display:block; }
+    .admin-grid{ display:grid; gap: 10px; }
+    .admin-row{ display:flex; gap:8px; flex-wrap:wrap; }
+    .admin-row .control{ flex:1; min-width: 140px; }
+    textarea.control{ min-height: 120px; resize: vertical; }
+    .mini-list{ font-size: 12px; color: var(--muted); white-space: pre-wrap; }
   </style>
 </head>
 <body>
@@ -2627,6 +3085,15 @@ const MINI_APP_HTML = `<!doctype html>
     </div>
 
     <div class="grid">
+      <div class="card">
+        <div class="card-b offer" id="offerCard">
+          <div>
+            <h3>🎁 پیشنهاد ویژه</h3>
+            <p id="offerText">فعال‌سازی اشتراک ویژه با تخفیف محدود.</p>
+          </div>
+          <div class="tag" id="offerTag">Special</div>
+        </div>
+      </div>
       <div class="card">
         <div class="card-h">
           <strong>تحلیل سریع</strong>
@@ -2664,14 +3131,7 @@ const MINI_APP_HTML = `<!doctype html>
             </div>
             <div class="field">
               <div class="label">سبک</div>
-              <select id="style" class="control">
-                <option value="اسکالپ">اسکالپ</option>
-                <option value="سوئینگ">سوئینگ</option>
-                <option value="اسمارت‌مانی" selected>اسمارت‌مانی</option>
-                <option value="پرایس اکشن">پرایس اکشن</option>
-                <option value="ICT">ICT</option>
-                <option value="ATR">ATR</option>
-              </select>
+              <select id="style" class="control"></select>
             </div>
             <div class="field">
               <div class="label">ریسک</div>
@@ -2704,6 +3164,72 @@ const MINI_APP_HTML = `<!doctype html>
 
         <div class="out" id="out">آماده…</div>
       </div>
+
+      <div class="card admin-card" id="adminCard">
+        <div class="card-h">
+          <strong>پنل ادمین/اونر</strong>
+          <span>مدیریت پرامپت، سبک‌ها، پرداخت و کمیسیون</span>
+        </div>
+        <div class="card-b admin-grid">
+          <div class="field">
+            <div class="label">پرامپت اصلی تحلیل</div>
+            <textarea id="adminPrompt" class="control" placeholder="پرامپت اصلی تحلیل..."></textarea>
+            <div class="actions">
+              <button id="savePrompt" class="btn primary">ذخیره پرامپت</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">مدیریت سبک‌ها</div>
+            <div class="admin-row">
+              <input id="newStyle" class="control" placeholder="سبک جدید" />
+              <button id="addStyle" class="btn">افزودن سبک</button>
+            </div>
+            <div class="admin-row">
+              <input id="removeStyleName" class="control" placeholder="نام سبک برای حذف" />
+              <button id="removeStyle" class="btn ghost">حذف سبک</button>
+            </div>
+            <div class="mini-list" id="styleList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">کمیسیون دعوت</div>
+            <div class="admin-row">
+              <input id="globalCommission" class="control" placeholder="درصد کمیسیون کلی (مثلاً 5)" />
+              <button id="saveGlobalCommission" class="btn">ذخیره کلی</button>
+            </div>
+            <div class="admin-row">
+              <input id="commissionUser" class="control" placeholder="یوزرنیم خاص (@user)" />
+              <input id="commissionPercent" class="control" placeholder="درصد برای کاربر خاص" />
+              <button id="saveUserCommission" class="btn">ذخیره کاربر</button>
+            </div>
+            <div class="mini-list" id="commissionList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">تأیید پرداخت و فعال‌سازی اشتراک</div>
+            <div class="admin-row">
+              <input id="payUsername" class="control" placeholder="یوزرنیم خریدار" />
+              <input id="payAmount" class="control" placeholder="مبلغ" />
+              <input id="payDays" class="control" placeholder="روزهای اشتراک" />
+            </div>
+            <div class="admin-row">
+              <input id="payTx" class="control" placeholder="هش تراکنش" />
+              <button id="approvePayment" class="btn primary">تأیید و فعال‌سازی</button>
+              <button id="checkPayment" class="btn ghost">چک بلاک‌چین</button>
+            </div>
+            <div class="mini-list" id="paymentList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">گزارش کاربران</div>
+            <div class="actions">
+              <button id="loadUsers" class="btn">دریافت گزارش</button>
+            </div>
+            <div class="mini-list" id="usersReport">—</div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -2729,6 +3255,9 @@ const meta = document.getElementById("meta");
 const sub = document.getElementById("sub");
 const pillTxt = document.getElementById("pillTxt");
 const welcome = document.getElementById("welcome");
+const offerText = document.getElementById("offerText");
+const offerTag = document.getElementById("offerTag");
+const adminCard = document.getElementById("adminCard");
 
 function el(id){ return document.getElementById(id); }
 function val(id){ return el(id).value; }
@@ -2741,6 +3270,8 @@ const toastB = el("toastB");
 const spin = el("spin");
 
 let ALL_SYMBOLS = [];
+let INIT_DATA = "";
+let IS_STAFF = false;
 
 function showToast(title, subline = "", badge = "", loading = false){
   toastT.textContent = title || "";
@@ -2763,6 +3294,20 @@ function fillSymbols(list){
     sel.appendChild(opt);
   }
   if (cur && ALL_SYMBOLS.includes(cur)) sel.value = cur;
+}
+
+function fillStyles(list){
+  const styles = Array.isArray(list) ? list.slice() : [];
+  const sel = el("style");
+  const cur = sel.value;
+  sel.innerHTML = "";
+  for (const s of styles) {
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    sel.appendChild(opt);
+  }
+  if (cur && styles.includes(cur)) sel.value = cur;
 }
 
 function filterSymbols(q){
@@ -2797,6 +3342,11 @@ async function api(path, body){
   return { status: r.status, json: j };
 }
 
+async function adminApi(path, body){
+  if (!IS_STAFF) return { status: 403, json: { ok: false, error: "forbidden" } };
+  return api(path, { initData: INIT_DATA, ...body });
+}
+
 function prettyErr(j, status){
   const e = j?.error || "نامشخص";
   if (status === 429 && String(e).startsWith("quota_exceeded")) return "سهمیه امروز تمام شد.";
@@ -2810,12 +3360,49 @@ function updateMeta(state, quota){
   sub.textContent = \`ID: \${state?.userId || "-"} | امروز(Kyiv): \${state?.dailyDate || "-"}\`;
 }
 
+function renderStyleList(styles){
+  const target = el("styleList");
+  if (!target) return;
+  target.textContent = Array.isArray(styles) && styles.length ? styles.join(" • ") : "—";
+}
+
+function renderCommissionList(commission){
+  const target = el("commissionList");
+  if (!target) return;
+  const global = commission?.globalPercent ?? 0;
+  const overrides = commission?.overrides || {};
+  const lines = [\`کلی: \${global}%\`];
+  for (const [k, v] of Object.entries(overrides)) lines.push(\`\${k}: \${v}%\`);
+  target.textContent = lines.join("\\n");
+}
+
+function renderPayments(list){
+  const target = el("paymentList");
+  if (!target) return;
+  if (!Array.isArray(list) || !list.length) { target.textContent = "—"; return; }
+  target.textContent = list.slice(0, 8).map((p) => {
+    const who = p.username || p.userId;
+    return \`• \${who} | \${p.amount} | \${p.status} | \${p.txHash || "—"}\`;
+  }).join("\\n");
+}
+
+function renderUsers(list){
+  const target = el("usersReport");
+  if (!target) return;
+  if (!Array.isArray(list) || !list.length) { target.textContent = "—"; return; }
+  target.textContent = list.map((u) => {
+    const user = u.username ? \`@\${u.username.replace(/^@/, "")}\` : u.userId;
+    return \`• \${user} | تلفن: \${u.phone || "—"} | مدت: \${u.usageDays} روز | تحلیل: \${u.totalAnalyses} | پرداخت: \${u.paymentCount} | TX: \${u.lastTxHash || "—"}\`;
+  }).join("\\n");
+}
+
 async function boot(){
   out.textContent = "⏳ در حال آماده‌سازی…";
   pillTxt.textContent = "Connecting…";
   showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
 
   const initData = tg?.initData || "";
+  INIT_DATA = initData;
   const {status, json} = await api("/api/user", { initData });
 
   if (!json?.ok) {
@@ -2828,17 +3415,41 @@ async function boot(){
 
   welcome.textContent = json.welcome || "";
   fillSymbols(json.symbols || []);
+  const styleList = json.styles || [];
+  fillStyles(styleList);
   if (json.state?.timeframe) setTf(json.state.timeframe);
-  if (json.state?.style) setVal("style", json.state.style);
+  if (json.state?.style && styleList.includes(json.state.style)) {
+    setVal("style", json.state.style);
+  } else if (styleList.length) {
+    setVal("style", styleList[0]);
+  }
   if (json.state?.risk) setVal("risk", json.state.risk);
   setVal("newsEnabled", String(!!json.state?.newsEnabled));
 
   if (json.symbols?.length) setVal("symbol", json.symbols[0]);
+  if (offerText) offerText.textContent = json.offerBanner || "فعال‌سازی اشتراک ویژه با تخفیف محدود.";
+  if (offerTag) offerTag.textContent = json.role === "owner" ? "Owner" : "Special";
 
   updateMeta(json.state, json.quota);
   out.textContent = "آماده ✅";
   pillTxt.textContent = "Online";
   hideToast();
+
+  IS_STAFF = !!json.isStaff;
+  if (IS_STAFF && adminCard) {
+    adminCard.classList.add("show");
+    await loadAdminBootstrap();
+  }
+}
+
+async function loadAdminBootstrap(){
+  const { json } = await adminApi("/api/admin/bootstrap", {});
+  if (!json?.ok) return;
+  if (el("adminPrompt")) el("adminPrompt").value = json.prompt || "";
+  renderStyleList(json.styles || []);
+  renderCommissionList(json.commission || {});
+  renderPayments(json.payments || []);
+  if (offerText && json.offerBanner) offerText.textContent = json.offerBanner;
 }
 
 el("q").addEventListener("input", (e) => filterSymbols(e.target.value));
@@ -2898,5 +3509,73 @@ el("analyze").addEventListener("click", async () => {
 });
 
 el("close").addEventListener("click", () => tg?.close());
+
+el("savePrompt")?.addEventListener("click", async () => {
+  const prompt = el("adminPrompt")?.value || "";
+  const { json } = await adminApi("/api/admin/prompt", { prompt });
+  if (json?.ok) showToast("ذخیره شد ✅", "پرامپت بروزرسانی شد", "ADM", false);
+});
+
+el("addStyle")?.addEventListener("click", async () => {
+  const style = el("newStyle")?.value || "";
+  const { json } = await adminApi("/api/admin/styles", { action: "add", style });
+  if (json?.ok) {
+    renderStyleList(json.styles || []);
+    fillStyles(json.styles || []);
+  }
+});
+
+el("removeStyle")?.addEventListener("click", async () => {
+  const style = el("removeStyleName")?.value || "";
+  const { json } = await adminApi("/api/admin/styles", { action: "remove", style });
+  if (json?.ok) {
+    renderStyleList(json.styles || []);
+    fillStyles(json.styles || []);
+  }
+});
+
+el("saveGlobalCommission")?.addEventListener("click", async () => {
+  const percent = Number(el("globalCommission")?.value || 0);
+  const { json } = await adminApi("/api/admin/commissions", { action: "setGlobal", percent });
+  if (json?.ok) renderCommissionList(json.commission || {});
+});
+
+el("saveUserCommission")?.addEventListener("click", async () => {
+  const username = el("commissionUser")?.value || "";
+  const percent = Number(el("commissionPercent")?.value || 0);
+  const { json } = await adminApi("/api/admin/commissions", { action: "setOverride", username, percent });
+  if (json?.ok) renderCommissionList(json.commission || {});
+});
+
+el("approvePayment")?.addEventListener("click", async () => {
+  const payload = {
+    username: el("payUsername")?.value || "",
+    amount: Number(el("payAmount")?.value || 0),
+    days: Number(el("payDays")?.value || 30),
+    txHash: el("payTx")?.value || "",
+  };
+  const { json } = await adminApi("/api/admin/payments/approve", payload);
+  if (json?.ok) {
+    showToast("پرداخت تایید شد ✅", "اشتراک فعال شد", "PAY", false);
+    renderPayments([json.payment].filter(Boolean));
+  } else {
+    showToast("خطا", "تایید پرداخت ناموفق بود", "PAY", false);
+  }
+});
+
+el("checkPayment")?.addEventListener("click", async () => {
+  const payload = {
+    txHash: el("payTx")?.value || "",
+    amount: Number(el("payAmount")?.value || 0),
+    address: "",
+  };
+  const { json } = await adminApi("/api/admin/payments/check", payload);
+  if (json?.ok) showToast("نتیجه بلاک‌چین", JSON.stringify(json.result || {}), "CHAIN", false);
+});
+
+el("loadUsers")?.addEventListener("click", async () => {
+  const { json } = await adminApi("/api/admin/users", { limit: 120 });
+  if (json?.ok) renderUsers(json.users || []);
+});
 
 boot();`;
