@@ -436,7 +436,7 @@ const BTN = {
 };
 
 const TYPING_INTERVAL_MS = 4000;
-const TIMEOUT_TEXT_MS = 11000;
+const TIMEOUT_TEXT_MS = 16000;
 const TIMEOUT_VISION_MS = 12000;
 const TIMEOUT_POLISH_MS = 9000;
 
@@ -983,9 +983,7 @@ function kb(rows) {
 }
 
 function mainMenuKeyboard(env) {
-  const url = getMiniappUrl(env);
-  const miniRow = url ? [{ text: BTN.MINIAPP, web_app: { url } }] : [BTN.MINIAPP];
-  return kb([[BTN.SIGNAL, BTN.SETTINGS], [BTN.WALLET, BTN.PROFILE], [BTN.INVITE, BTN.SUPPORT], [BTN.EDUCATION], miniRow, [BTN.HOME]]);
+  return kb([[BTN.SIGNAL, BTN.SETTINGS], [BTN.WALLET, BTN.PROFILE], [BTN.INVITE, BTN.SUPPORT], [BTN.EDUCATION], [BTN.HOME]]);
 }
 
 function signalMenuKeyboard() {
@@ -2851,6 +2849,20 @@ async function setAnalysisCache(env, key, value) {
   await r2PutJson(env.MARKET_R2, key, value, ttlMs);
 }
 
+function buildMarketBlock(candles, maxRows) {
+  const snap = computeSnapshot(candles);
+  const ohlc = candlesToCompactCSV(candles, maxRows);
+  return (
+    `lastPrice=${snap?.lastPrice}\n` +
+    `changePct=${snap?.changePct}%\n` +
+    `trend=${snap?.trend}\n` +
+    `range50_hi=${snap?.range50?.hi} range50_lo=${snap?.range50?.lo}\n` +
+    `sma20=${snap?.sma20} sma50=${snap?.sma50}\n` +
+    `lastTs=${snap?.lastTs}\n\n` +
+    `OHLC_CSV(t,o,h,l,c):\n${ohlc}`
+  );
+}
+
 async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
   const useCache = !userPrompt && !isStaff(from, env);
   const cacheKey = useCache ? analysisCacheKey(symbol, st) : "";
@@ -2866,20 +2878,17 @@ async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
     console.error("market provider failed (all)", e?.message || e);
     candles = [];
   }
-  const snap = computeSnapshot(candles);
-  const ohlc = candlesToCompactCSV(candles, 80);
-
-  const marketBlock =
-    `lastPrice=${snap?.lastPrice}\n` +
-    `changePct=${snap?.changePct}%\n` +
-    `trend=${snap?.trend}\n` +
-    `range50_hi=${snap?.range50?.hi} range50_lo=${snap?.range50?.lo}\n` +
-    `sma20=${snap?.sma20} sma50=${snap?.sma50}\n` +
-    `lastTs=${snap?.lastTs}\n\n` +
-    `OHLC_CSV(t,o,h,l,c):\n${ohlc}`;
-
+  const marketBlock = buildMarketBlock(candles, 80);
   const prompt = await buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env);
-  const draft = await runTextProviders(prompt, env, st.textOrder);
+  let draft = "";
+  try {
+    draft = await runTextProviders(prompt, env, st.textOrder);
+  } catch (e) {
+    console.error("text providers failed (retry compact):", e?.message || e);
+    const compactBlock = buildMarketBlock(candles, 40);
+    const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env);
+    draft = await runTextProviders(compactPrompt, env, st.textOrder);
+  }
   const polished = await runPolishProviders(draft, env, st.polishOrder);
   if (useCache && polished) await setAnalysisCache(env, cacheKey, polished);
   return polished;
