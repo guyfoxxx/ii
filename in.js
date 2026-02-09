@@ -2859,13 +2859,20 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
           console.error("market provider failed (all)", e?.message || e);
           candles = [];
         }
-        if (!Array.isArray(candles) || candles.length < 5) {
-          // اگر دیتا نداریم، عکس ارسال نکن
-          await tgSendMessage(env, chatId, "⚠️ برای این نماد در این تایم‌فریم دیتای کافی پیدا نشد؛ چارت ارسال نشد.", kb([[BTN.HOME]]));
+        if (!Array.isArray(candles) || candles.length < 2) {
+          const cacheKey = marketCacheKey(symbol, st.timeframe || "H4");
+          const cached = await getMarketCache(env, cacheKey);
+          if (Array.isArray(cached) && cached.length >= 2) candles = cached;
+        }
+        if (!Array.isArray(candles) || candles.length < 2) {
+          await tgSendMessage(env, chatId, "⚠️ برای این نماد دیتای کافی پیدا نشد؛ چارت ارسال نشد.", kb([[BTN.HOME]]));
         } else {
           const levels = extractLevels(result);
           const chartUrl = buildQuickChartCandlestickUrl(candles, symbol, st.timeframe || "H4", levels);
-          await tgSendPhoto(env, chatId, chartUrl, `📈 چارت ${symbol} (${st.timeframe || "H4"})`, kb([[BTN.HOME]]));
+          const caption = candles.length < 5
+            ? `📈 چارت ${symbol} (${st.timeframe || "H4"}) — داده محدود`
+            : `📈 چارت ${symbol} (${st.timeframe || "H4"})`;
+          await tgSendPhoto(env, chatId, chartUrl, caption, kb([[BTN.HOME]]));
         }
       } catch (e) {
         console.error("quickchart error:", e);
