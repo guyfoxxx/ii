@@ -578,12 +578,6 @@ async function getCachedR2Value(bucket, key) {
   return payload.value;
 }
 
-async function getCachedR2ValueAllowStale(bucket, key) {
-  const payload = await r2GetJson(bucket, key);
-  if (!payload) return null;
-  return payload.value;
-}
-
 /* ========================== PROMPTS (ADMIN/OWNER ONLY) ========================== */
 const DEFAULT_ANALYSIS_PROMPT = `SYSTEM OVERRIDE: ACTIVATE INSTITUTIONAL MODE
 
@@ -1427,14 +1421,14 @@ async function runVisionProviders(imageUrl, visionPrompt, env, orderOverride) {
   const deadline = Date.now() + totalBudget;
 
   let lastErr = null;
-  let cached = null;
+  let cached = /** @type {any} */ (null);
 
   for (const p of chain) {
     const remaining = deadline - Date.now();
     if (remaining <= 500) break;
 
     try {
-      if ((p === "cf" || p === "gemini" || p === "hf") && cached?.tooLarge) continue;
+      if ((p === "cf" || p === "gemini" || p === "hf") && cached && cached.tooLarge) continue;
 
       const out = await Promise.race([
         visionProvider(p, imageUrl, visionPrompt, env, () => cached, (c) => (cached = c)),
@@ -1760,7 +1754,7 @@ async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) 
   const base = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${encodeURIComponent(env.TWELVEDATA_API_KEY)}`;
   const sources = [];
   if (kind === "crypto") sources.push("binance");
-  if (kind === "forex" || kind === "metals") sources.push("fx");
+  if (kind === "forex" || kind === "metal") sources.push("fx");
   const urls = [base, ...sources.map((s) => `${base}&source=${encodeURIComponent(s)}`)];
 
   let lastErr = null;
@@ -1935,14 +1929,6 @@ async function getMarketCache(env, key) {
   const mem = cacheGet(MARKET_CACHE, key);
   if (mem) return mem;
   const r2 = await getCachedR2Value(env.MARKET_R2, key);
-  if (r2) cacheSet(MARKET_CACHE, key, r2, Number(env.MARKET_CACHE_TTL_MS || 120000));
-  return r2;
-}
-
-async function getMarketCacheStale(env, key) {
-  const mem = cacheGet(MARKET_CACHE, key);
-  if (mem) return mem;
-  const r2 = await getCachedR2ValueAllowStale(env.MARKET_R2, key);
   if (r2) cacheSet(MARKET_CACHE, key, r2, Number(env.MARKET_CACHE_TTL_MS || 120000));
   return r2;
 }
@@ -2873,25 +2859,20 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
           console.error("market provider failed (all)", e?.message || e);
           candles = [];
         }
-        if (!Array.isArray(candles) || candles.length === 0) {
+        if (!Array.isArray(candles) || candles.length < 2) {
           const cacheKey = marketCacheKey(symbol, st.timeframe || "H4");
-          candles = await getMarketCacheStale(env, cacheKey);
+          const cached = await getMarketCache(env, cacheKey);
+          if (Array.isArray(cached) && cached.length >= 2) candles = cached;
         }
-        if (!Array.isArray(candles) || candles.length === 0) {
-          // اگر دیتا نداریم، عکس ارسال نکن
-          await tgSendMessage(env, chatId, "⚠️ برای این نماد در این تایم‌فریم دیتای کافی پیدا نشد؛ چارت ارسال نشد.", kb([[BTN.HOME]]));
+        if (!Array.isArray(candles) || candles.length < 2) {
+          await tgSendMessage(env, chatId, "⚠️ برای این نماد دیتای کافی پیدا نشد؛ چارت ارسال نشد.", kb([[BTN.HOME]]));
         } else {
           const levels = extractLevels(result);
           const chartUrl = buildQuickChartCandlestickUrl(candles, symbol, st.timeframe || "H4", levels);
-          try {
-            await tgSendPhoto(env, chatId, chartUrl, `📈 چارت ${symbol} (${st.timeframe || "H4"})`, kb([[BTN.HOME]]));
-          } catch (e) {
-            console.error("chart send error:", e);
-            if (String(env.RENDER_ZONES || "") !== "1") {
-              const svg = buildZonesSvgFromAnalysis(result, symbol, st.timeframe || "H4");
-              await tgSendSvgDocument(env, chatId, svg, "zones.svg", `🖼️ نقشه زون‌ها: ${symbol} (${st.timeframe || "H4"})`);
-            }
-          }
+          const caption = candles.length < 5
+            ? `📈 چارت ${symbol} (${st.timeframe || "H4"}) — داده محدود`
+            : `📈 چارت ${symbol} (${st.timeframe || "H4"})`;
+          await tgSendPhoto(env, chatId, chartUrl, caption, kb([[BTN.HOME]]));
         }
       } catch (e) {
         console.error("quickchart error:", e);
@@ -3148,7 +3129,7 @@ async function verifyTelegramInitData(initData, botToken) {
   if (now - authDate > 60 * 60) return { ok: false, reason: "initData_expired" };
 
   const pairs = [];
-  for (const [k, v] of params.entries()) pairs.push([k, v]);
+  params.forEach((v, k) => pairs.push([k, v]));
   pairs.sort((a, b) => a[0].localeCompare(b[0]));
   const dataCheckString = pairs.map(([k, v]) => `${k}=${v}`).join("\n");
 
@@ -3688,7 +3669,7 @@ function fillCustomPrompts(list){
   for (const p of prompts) {
     const opt = document.createElement("option");
     opt.value = String(p?.id || "");
-    opt.textContent = p?.title ? `${p.title}` : String(p?.id || "");
+    opt.textContent = p?.title ? String(p.title) : String(p?.id || "");
     sel.appendChild(opt);
   }
   if (cur) sel.value = cur;
