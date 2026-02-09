@@ -2992,16 +2992,28 @@ function inviteShareText(st, env) {
 QuickChart renders Chart.js configs as images via https://quickchart.io/chart .
 Financial (candlestick/OHLC) charts are supported via chartjs-chart-financial plugin.
 */
-function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
-  const items = (candles || []).slice(-60).map((c) => ({
-    x: new Date(c.t || c.time || c.ts || c.timestamp || Date.now()).toISOString(),
-    o: Number(c.o),
-    h: Number(c.h),
-    l: Number(c.l),
-    c: Number(c.c),
-  }));
+function buildQuickChartCandlestickItems(candles) {
+  return (candles || [])
+    .slice(-60)
+    .map((c) => ({
+      x: new Date(c.t || c.time || c.ts || c.timestamp || Date.now()).toISOString(),
+      o: Number(c.o),
+      h: Number(c.h),
+      l: Number(c.l),
+      c: Number(c.c),
+    }))
+    .filter((c) => [c.o, c.h, c.l, c.c].every(Number.isFinite));
+}
 
-  const annotations = (levels || []).slice(0, 6).map((lvl, idx) => ({
+function buildQuickChartCandlestickConfig(candles, symbol, tf, levels = []) {
+  const items = buildQuickChartCandlestickItems(candles);
+  if (items.length < 2) throw new Error("quickchart_insufficient_data");
+
+  const annotations = (levels || [])
+    .map((lvl) => Number(lvl))
+    .filter(Number.isFinite)
+    .slice(0, 6)
+    .map((lvl, idx) => ({
     type: "line",
     scaleID: "y",
     value: lvl,
@@ -3018,7 +3030,7 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
   }));
 
   // Basic Chart.js + chartjs-chart-financial config
-  const cfg = {
+  return {
     type: "candlestick",
     data: {
       datasets: [
@@ -3043,7 +3055,10 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
       },
     },
   };
+}
 
+function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
+  const cfg = buildQuickChartCandlestickConfig(candles, symbol, tf, levels);
   const encoded = encodeURIComponent(JSON.stringify(cfg));
   // width/height params supported by /chart endpoint
   return `https://quickchart.io/chart?w=900&h=450&devicePixelRatio=2&c=${encoded}`;
@@ -3077,7 +3092,8 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
             if (Array.isArray(stale) && stale.length >= 2) candles = stale;
           }
         }
-        if (!Array.isArray(candles) || candles.length < 2) {
+        const chartItems = buildQuickChartCandlestickItems(candles);
+        if (!Array.isArray(candles) || candles.length < 2 || chartItems.length < 2) {
           // اگر دیتا نداریم، عکس ارسال نکن
           await tgSendMessage(env, chatId, "⚠️ برای این نماد در این تایم‌فریم دیتای کافی پیدا نشد؛ چارت ارسال نشد.", kb([[BTN.HOME]]));
         } else {
@@ -3248,8 +3264,20 @@ async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
 
 
 async function renderQuickChartPng(env, candles, symbol, tf, levels = []) {
-  const chartUrl = buildQuickChartCandlestickUrl(candles, symbol, tf, levels);
-  const r = await fetch(chartUrl, { cf: { cacheTtl: 60, cacheEverything: true } });
+  const cfg = buildQuickChartCandlestickConfig(candles, symbol, tf, levels);
+  const payload = {
+    width: 900,
+    height: 450,
+    devicePixelRatio: 2,
+    format: "png",
+    chart: cfg,
+  };
+  const r = await fetch("https://quickchart.io/chart", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    cf: { cacheTtl: 60, cacheEverything: true },
+  });
   if (!r.ok) throw new Error(`quickchart_fetch_failed_${r.status}`);
   return await r.arrayBuffer();
 }
