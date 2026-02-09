@@ -72,6 +72,29 @@ export default {
         return jsonResponse({ ok: true, state: st, quota });
       }
 
+      if (url.pathname === "/api/support/ticket" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
+        const st = await ensureUser(v.userId, env);
+        const text = String(body.text || "").trim();
+        if (!text || text.length < 4) return jsonResponse({ ok: false, error: "ticket_too_short" }, 400);
+        if (text.length > 300) return jsonResponse({ ok: false, error: "ticket_too_long" }, 400);
+
+        const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+        if (!supportChatId) return jsonResponse({ ok: false, error: "support_unavailable" }, 503);
+
+        await tgSendMessage(
+          env,
+          supportChatId,
+          `📩 تیکت جدید (Mini App)\nکاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}\nشماره: ${st.profile?.phone || "-"}\nمتن:\n${text}`
+        );
+        return jsonResponse({ ok: true });
+      }
+
       if (url.pathname.startsWith("/api/admin/") && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
@@ -1401,10 +1424,19 @@ async function tgSendPhotoUpload(env, chatId, photoBytes, filename = "chart.png"
 }
 
 async function tgSendPhotoSmart(env, chatId, photoUrl, caption, replyMarkup) {
-  const j = await tgSendPhoto(env, chatId, photoUrl, caption, replyMarkup);
-  if (j?.ok) return j;
-
+  let j = null;
   try {
+    const preferUpload = String(env.TG_PHOTO_UPLOAD_FIRST || "") === "1" || String(photoUrl || "").includes("quickchart.io/chart");
+    if (preferUpload) {
+      const r = await fetch(photoUrl);
+      if (!r.ok) return await tgSendPhoto(env, chatId, photoUrl, caption, replyMarkup);
+      const buf = await r.arrayBuffer();
+      const uploadRes = await tgSendPhotoUpload(env, chatId, buf, "chart.png", caption, replyMarkup);
+      if (uploadRes?.ok) return uploadRes;
+    }
+    j = await tgSendPhoto(env, chatId, photoUrl, caption, replyMarkup);
+    if (j?.ok) return j;
+
     const r = await fetch(photoUrl);
     if (!r.ok) return j;
     const buf = await r.arrayBuffer();
@@ -1782,6 +1814,23 @@ function assetKind(symbol) {
   return "unknown";
 }
 
+function providerSupportsSymbol(provider, symbol, env) {
+  const kind = assetKind(symbol);
+  if (provider === "binance") return kind === "crypto";
+  if (provider === "twelvedata") return !!env.TWELVEDATA_API_KEY && ["crypto", "forex", "metal"].includes(kind);
+  if (provider === "alphavantage") return !!env.ALPHAVANTAGE_API_KEY && ["forex", "metal"].includes(kind);
+  if (provider === "finnhub") return !!env.FINNHUB_API_KEY && kind === "forex";
+  if (provider === "yahoo") return true;
+  return true;
+}
+
+function resolveMarketProviderChain(env, symbol) {
+  const desired = parseOrder(env.MARKET_DATA_PROVIDER_ORDER, ["binance","twelvedata","alphavantage","finnhub","yahoo"]);
+  const filtered = desired.filter((p) => providerSupportsSymbol(p, symbol, env));
+  if (filtered.length) return filtered;
+  return ["yahoo"];
+}
+
 function mapTimeframeToBinance(tf) {
   const m = { M15: "15m", H1: "1h", H4: "4h", D1: "1d" };
   return m[tf] || "4h";
@@ -2076,7 +2125,7 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
   const cached = await getMarketCache(env, cacheKey);
   if (cached) return cached;
 
-  const chain = parseOrder(env.MARKET_DATA_PROVIDER_ORDER, ["binance","twelvedata","alphavantage","finnhub","yahoo"]);
+  const chain = resolveMarketProviderChain(env, symbol);
   let lastErr = null;
 
   for (const p of chain) {
@@ -3652,6 +3701,23 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
       </div>
 
+      <div class="card" id="supportCard">
+        <div class="card-h">
+          <strong>پشتیبانی</strong>
+          <span>ارسال تیکت</span>
+        </div>
+        <div class="card-b">
+          <div class="field">
+            <div class="label">متن تیکت</div>
+            <textarea id="supportTicketText" class="control" placeholder="مشکل یا درخواست خود را بنویسید..." maxlength="300"></textarea>
+          </div>
+          <div class="actions">
+            <button id="sendSupportTicket" class="btn">✉️ ارسال تیکت</button>
+          </div>
+          <div class="muted" style="font-size:12px; line-height:1.6;">پاسخ از طریق پشتیبانی تلگرام ارسال می‌شود.</div>
+        </div>
+      </div>
+
       <div class="card admin-card" id="adminCard">
         <div class="card-h">
           <strong id="adminTitle">پنل ادمین</strong>
@@ -4068,6 +4134,30 @@ el("analyze").addEventListener("click", async () => {
   }
   updateMeta(json.state, json.quota);
   showToast("آماده ✅", "خروجی دریافت شد", "OK", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("sendSupportTicket")?.addEventListener("click", async () => {
+  const text = (el("supportTicketText")?.value || "").trim();
+  if (!text || text.length < 4) {
+    showToast("خطا", "متن تیکت خیلی کوتاه است.", "SUP", false);
+    return;
+  }
+  if (text.length > 300) {
+    showToast("خطا", "حداکثر ۳۰۰ کاراکتر مجاز است.", "SUP", false);
+    return;
+  }
+  showToast("در حال ارسال…", "تیکت در حال ثبت است", "SUP", true);
+  const { status, json } = await api("/api/support/ticket", { initData: INIT_DATA, text });
+  if (!json?.ok) {
+    const msg = json?.error === "support_unavailable"
+      ? "پشتیبانی در دسترس نیست."
+      : "ارسال تیکت ناموفق بود.";
+    showToast("خطا", msg, "SUP", false);
+    return;
+  }
+  if (el("supportTicketText")) el("supportTicketText").value = "";
+  showToast("ارسال شد ✅", "تیکت شما ثبت شد", "SUP", false);
   setTimeout(hideToast, 1200);
 });
 
