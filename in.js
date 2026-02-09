@@ -287,7 +287,37 @@ export default {
         }
       }
 
-      if (url.pathname === "/api/analyze" && request.method === "POST") {
+      
+      if (url.pathname === "/api/chart" && request.method === "GET") {
+        const q = url.searchParams;
+        const symbol = String(q.get("symbol") || "").trim();
+        const tf = String(q.get("tf") || "H4").trim() || "H4";
+        const levelsParam = String(q.get("levels") || "").trim();
+        if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
+
+        const levels = (levelsParam ? levelsParam.split(",") : [])
+          .map((s) => Number(String(s).trim()))
+          .filter((n) => Number.isFinite(n))
+          .slice(0, 6);
+
+        try {
+          const candles = await getMarketCandlesWithFallback(env, symbol, tf);
+          const buf = await renderQuickChartPng(env, candles, symbol, tf, levels);
+          return new Response(buf, {
+            status: 200,
+            headers: {
+              "Content-Type": "image/png",
+              "Cache-Control": "public, max-age=60",
+              "Access-Control-Allow-Origin": "*",
+            },
+          });
+        } catch (e) {
+          console.error("api/chart error:", e?.message || e);
+          return jsonResponse({ ok: false, error: "chart_error" }, 500);
+        }
+      }
+
+if (url.pathname === "/api/analyze" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
@@ -318,7 +348,19 @@ export default {
             await saveUser(v.userId, st, env);
           }
           const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
-          return jsonResponse({ ok: true, result, state: st, quota });
+          let chartUrl = "";
+          let levels = [];
+          try {
+            if (String(env.QUICKCHART || "") !== "0") {
+              const tf = st.timeframe || "H4";
+              levels = extractLevels(result);
+              const origin = new URL(request.url).origin;
+              chartUrl = `${origin}/api/chart?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&levels=${encodeURIComponent(levels.join(","))}`;
+            }
+          } catch (e) {
+            console.error("chartUrl build error:", e?.message || e);
+          }
+          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels });
         } catch (e) {
           console.error("api/analyze error:", e);
           return jsonResponse({ ok: false, error: "server_error" }, 500);
@@ -578,35 +620,56 @@ async function getCachedR2Value(bucket, key) {
   return payload.value;
 }
 
+async function getCachedR2ValueAllowStale(bucket, key) {
+  const payload = await r2GetJson(bucket, key);
+  if (!payload) return null;
+  return payload.value;
+}
+
 /* ========================== PROMPTS (ADMIN/OWNER ONLY) ========================== */
-const DEFAULT_ANALYSIS_PROMPT = `SYSTEM OVERRIDE: ACTIVATE INSTITUTIONAL MODE
+const DEFAULT_ANALYSIS_PROMPT = `SYSTEM OVERRIDE: تحلیل‌گر بازار چندسبکی (STYLE-AWARE)
 
-ROLE: You are an elite “Liquidity Hunter Algorithm” tracking Smart Money.
-INPUT CONTEXT: {TIMEFRAME} Timeframe Chart.
+متغیرها:
+- STYLE_MODE: {STYLE}
+- RISK_PROFILE: {RISK}
+- NEWS_MODE: {NEWS}
+- TIMEFRAME: {TIMEFRAME}
 
-MINDSET
-Retail traders predict. Whales react.
-Focus on Liquidity Pools (Targets) and Imbalances (Magnets).
-Crucial: Determine what happens AT the target level (Reversal vs. Continuation).
+قوانین سخت:
+1) خروجی فقط فارسی باشد و فقط شامل بخش‌های ۱ تا ۵ با همین تیترها.
+2) فقط از داده‌های MARKET_DATA استفاده کن؛ اگر داده کافی نیست، شفاف بگو و حدس نزن.
+3) سطح‌های قیمتی را با عدد و برچسب X / Y / Z ارائه کن (اگر عدد از داده مشخص نیست: «نامشخص از داده»).
+4) شرط کندلی را واضح بنویس (Close بالا/پایین، Wick Sweep، شکست با بدنه، پولبک).
+5) هیچ توصیه قطعی «حتماً بخر/بفروش» نده؛ سناریومحور و مشروط بنویس.
 
-ANALYSIS PROTOCOL
-LIQUIDITY MAPPING: Where are the Stop Losses? (The Target).
-MANIPULATION DETECTOR: Identify recent traps/fake-outs.
-INSTITUTIONAL FOOTPRINT: Locate Order Blocks/FVGs (The Defense Wall).
-THE KILL ZONE: Predict the next move to the liquidity pool.
-REACTION LOGIC (THE MOST IMPORTANT PART): Analyze the specific target level. What specifically needs to happen for a “Reversal” (Sweep) vs a “Collapse” (Breakout)?
+سوئیچ سبک (بر اساس STYLE_MODE):
+A) اگر STYLE_MODE = "پرایس اکشن"
+- تمرکز: ساختار (HH/HL یا LH/LL)، حمایت/مقاومت، شکست و پولبک، عرضه/تقاضا، الگوهای کندلی.
+- از اصطلاحات ICT فقط در صورت نیاز و با توضیح کوتاه استفاده کن.
 
-OUTPUT FORMAT (STRICTLY PERSIAN - فارسی)
-Use a sharp, revealing, and “whistle-blower” tone.
+B) اگر STYLE_MODE = "ICT"
+- تمرکز: Liquidity (استاپ‌ها)، Sweep/Grab، Order Block، FVG، Breaker/Structure Shift.
+- هدف نقدینگی و واکنش در برخورد را مشخص کن.
 
+C) اگر STYLE_MODE = "ATR"
+- تمرکز: نوسان و مدیریت ریسک با ATR.
+- اگر ATR عددی در داده نبود، استاپ/اهداف را نسبی بنویس (مثلاً ۱×ATR) و بگو «ATR عددی در داده نیست».
+
+سوئیچ ریسک (بر اساس RISK_PROFILE):
+- کم‌ریسک: فقط با تایید قوی (Close + Retest)، SL محافظه‌کار، TP پله‌ای.
+- متوسط: تایید استاندارد، SL پشت ناحیه، TP دو مرحله‌ای.
+- پرریسک: ورود تهاجمی‌تر فقط اگر سناریو واضح است؛ حتماً هشدار «ریسک بالا».
+
+NEWS_MODE:
+- اگر {NEWS} = "on": تاثیر خبر/رویداد را کوتاه داخل سناریوها اضافه کن.
+- اگر {NEWS} = "off": از خبر حرف نزن.
+
+OUTPUT FORMAT (STRICT):
 ۱. نقشه پول‌های پارک‌شده (شکارگاه نهنگ‌ها):
 ۲. تله‌های قیمتی اخیر (فریب بازار):
-۳. ردپای ورود پول هوشمند (دیوار بتنی):
-۴. سناریوی بی‌رحمانه بعدی (مسیر احتمالی):
-۵. استراتژی لحظه برخورد (ماشه نهایی):
-
-سناریوی بازگشت (Reversal):
-سناریوی سقوط/صعود (Continuation):`;
+۳. ردپای ورود پول هوشمند / ساختار (طبق STYLE_MODE):
+۴. سناریوی بعدی (مسیر احتمالی + شروط فعال‌سازی):
+۵. استراتژی لحظه برخورد (ماشه نهایی + Entry/SL/TP مشروط با X/Y/Z):`;
 
 /* ========================== STYLE PROMPTS (DEFAULTS) ==========================
  * Users choose st.style (Persian labels) and we inject a style-specific guide
@@ -1293,6 +1356,65 @@ async function tgSendPhoto(env, chatId, photoUrl, caption, replyMarkup) {
     reply_markup: replyMarkup,
   });
 }
+
+async function tgSendPhotoUpload(env, chatId, photoBytes, filename = "chart.png", caption, replyMarkup) {
+  const boundary = "----tgform" + Math.random().toString(16).slice(2);
+  const CRLF = "\r\n";
+
+  const parts = [];
+  const push = (s) => parts.push(typeof s === "string" ? new TextEncoder().encode(s) : s);
+
+  push(`--${boundary}${CRLF}`);
+  push(`Content-Disposition: form-data; name="chat_id"${CRLF}${CRLF}`);
+  push(String(chatId) + CRLF);
+
+  if (caption) {
+    push(`--${boundary}${CRLF}`);
+    push(`Content-Disposition: form-data; name="caption"${CRLF}${CRLF}`);
+    push(String(caption).slice(0, 900) + CRLF);
+  }
+
+  if (replyMarkup) {
+    push(`--${boundary}${CRLF}`);
+    push(`Content-Disposition: form-data; name="reply_markup"${CRLF}${CRLF}`);
+    push(JSON.stringify(replyMarkup) + CRLF);
+  }
+
+  push(`--${boundary}${CRLF}`);
+  push(`Content-Disposition: form-data; name="photo"; filename="${filename}"${CRLF}`);
+  push(`Content-Type: image/png${CRLF}${CRLF}`);
+  push(new Uint8Array(photoBytes));
+  push(CRLF);
+
+  push(`--${boundary}--${CRLF}`);
+
+  const body = concatU8(parts);
+  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+    body,
+  });
+  const j = await r.json().catch(() => null);
+  if (!j || !j.ok) console.error("Telegram sendPhoto(upload) error:", j);
+  return j;
+}
+
+async function tgSendPhotoSmart(env, chatId, photoUrl, caption, replyMarkup) {
+  const j = await tgSendPhoto(env, chatId, photoUrl, caption, replyMarkup);
+  if (j?.ok) return j;
+
+  try {
+    const r = await fetch(photoUrl);
+    if (!r.ok) return j;
+    const buf = await r.arrayBuffer();
+    return await tgSendPhotoUpload(env, chatId, buf, "chart.png", caption, replyMarkup);
+  } catch (e) {
+    console.error("tgSendPhotoSmart fallback failed:", e?.message || e);
+    return j;
+  }
+}
+
 async function tgSendChatAction(env, chatId, action) {
   return tgApi(env, "sendChatAction", { chat_id: chatId, action });
 }
@@ -1933,6 +2055,14 @@ async function getMarketCache(env, key) {
   return r2;
 }
 
+async function getMarketCacheStale(env, key) {
+  const mem = cacheGet(MARKET_CACHE, key);
+  if (mem) return mem;
+  const r2 = await getCachedR2ValueAllowStale(env.MARKET_R2, key);
+  if (r2) cacheSet(MARKET_CACHE, key, r2, Number(env.MARKET_CACHE_TTL_MS || 120000));
+  return r2;
+}
+
 async function setMarketCache(env, key, value) {
   const ttlMs = Number(env.MARKET_CACHE_TTL_MS || 120000);
   cacheSet(MARKET_CACHE, key, value, ttlMs);
@@ -2017,7 +2147,11 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
   const sp = await getStylePrompt(env, st.style);
   const customPrompts = await getCustomPrompts(env);
   const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
-  const base = baseRaw.replaceAll("{TIMEFRAME}", tf);
+  const base = baseRaw
+    .replaceAll("{TIMEFRAME}", tf)
+    .replaceAll("{STYLE}", st.style || "")
+    .replaceAll("{RISK}", st.risk || "")
+    .replaceAll("{NEWS}", st.newsEnabled ? "on" : "off");
 
   const userExtra = (isStaff({ username: st.profile?.username }, env) && userPrompt?.trim())
     ? userPrompt.trim()
@@ -2046,7 +2180,11 @@ async function buildVisionPrompt(st, env) {
   const sp = await getStylePrompt(env, st.style);
   const customPrompts = await getCustomPrompts(env);
   const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
-  const base = baseRaw.replaceAll("{TIMEFRAME}", tf);
+  const base = baseRaw
+    .replaceAll("{TIMEFRAME}", tf)
+    .replaceAll("{STYLE}", st.style || "")
+    .replaceAll("{RISK}", st.risk || "")
+    .replaceAll("{NEWS}", st.newsEnabled ? "on" : "off");
   return (
     `${base}\n\n` +
     (sp ? `STYLE_PROMPT:\n${sp}\n\n` : ``) +
@@ -2852,7 +2990,8 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
 
     // 📸 QuickChart candlestick image
     if (String(env.QUICKCHART || "1") !== "0") {
-      try {let candles = [];
+      try {
+        let candles = [];
         try {
           candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4");
         } catch (e) {
@@ -2861,19 +3000,34 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
         }
         if (!Array.isArray(candles) || candles.length < 2) {
           const cacheKey = marketCacheKey(symbol, st.timeframe || "H4");
+          // اول از کش معمولی استفاده کن؛ اگر نبود از نسخهٔ Stale
           const cached = await getMarketCache(env, cacheKey);
           if (Array.isArray(cached) && cached.length >= 2) candles = cached;
+          if (!Array.isArray(candles) || candles.length < 2) {
+            const stale = await getMarketCacheStale(env, cacheKey);
+            if (Array.isArray(stale) && stale.length >= 2) candles = stale;
+          }
         }
         if (!Array.isArray(candles) || candles.length < 2) {
-          await tgSendMessage(env, chatId, "⚠️ برای این نماد دیتای کافی پیدا نشد؛ چارت ارسال نشد.", kb([[BTN.HOME]]));
+          // اگر دیتا نداریم، عکس ارسال نکن
+          await tgSendMessage(env, chatId, "⚠️ برای این نماد در این تایم‌فریم دیتای کافی پیدا نشد؛ چارت ارسال نشد.", kb([[BTN.HOME]]));
         } else {
           const levels = extractLevels(result);
           const chartUrl = buildQuickChartCandlestickUrl(candles, symbol, st.timeframe || "H4", levels);
           const caption = candles.length < 5
             ? `📈 چارت ${symbol} (${st.timeframe || "H4"}) — داده محدود`
             : `📈 چارت ${symbol} (${st.timeframe || "H4"})`;
-          await tgSendPhoto(env, chatId, chartUrl, caption, kb([[BTN.HOME]]));
-        }
+          const pj = await tgSendPhotoSmart(env, chatId, chartUrl, caption, kb([[BTN.HOME]]));
+          if (!pj || !pj.ok) {
+            console.error("chart send failed:", pj);
+            if (String(env.RENDER_ZONES || "") === "1") {
+              const svg = buildZonesSvgFromAnalysis(result, symbol, st.timeframe || "H4");
+              await tgSendSvgDocument(env, chatId, svg, "zones.svg", `🖼️ نقشه زون‌ها: ${symbol} (${st.timeframe || "H4"})`);
+            } else {
+              await tgSendMessage(env, chatId, "⚠️ ارسال چارت ناموفق بود.", kb([[BTN.HOME]]));
+            }
+          }
+}
       } catch (e) {
         console.error("quickchart error:", e);
       }
@@ -3022,6 +3176,15 @@ async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
 }
 
 /* ========================== ZONES RENDER (SVG) ========================== */
+
+
+async function renderQuickChartPng(env, candles, symbol, tf, levels = []) {
+  const chartUrl = buildQuickChartCandlestickUrl(candles, symbol, tf, levels);
+  const r = await fetch(chartUrl, { cf: { cacheTtl: 60, cacheEverything: true } });
+  if (!r.ok) throw new Error(`quickchart_fetch_failed_${r.status}`);
+  return await r.arrayBuffer();
+}
+
 function extractLevels(text) {
   const nums = (String(text || "").match(/\b\d{1,6}(?:\.\d{1,6})?\b/g) || [])
     .map(Number)
@@ -3477,6 +3640,16 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
 
         <div class="out" id="out">آماده…</div>
+
+        <div class="card" id="chartCard" style="display:none; margin-top:12px;">
+          <div class="card-h">
+            <strong>چارت</strong>
+            <span class="muted" id="chartMeta">QuickChart</span>
+          </div>
+          <div class="card-b">
+            <img id="chartImg" alt="chart" style="width:100%; border-radius:16px; display:block;" />
+          </div>
+        </div>
       </div>
 
       <div class="card admin-card" id="adminCard">
@@ -3880,6 +4053,19 @@ el("analyze").addEventListener("click", async () => {
   }
 
   out.textContent = json.result || "⚠️ بدون خروجی";
+  // Render chart if available
+  const chartCard = el("chartCard");
+  const chartImg = el("chartImg");
+  if (chartCard && chartImg) {
+    const u = json.chartUrl || "";
+    if (u) {
+      chartImg.src = u;
+      chartCard.style.display = "block";
+    } else {
+      chartImg.removeAttribute("src");
+      chartCard.style.display = "none";
+    }
+  }
   updateMeta(json.state, json.quota);
   showToast("آماده ✅", "خروجی دریافت شد", "OK", false);
   setTimeout(hideToast, 1200);
