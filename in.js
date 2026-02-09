@@ -1374,7 +1374,7 @@ function extractImageFileId(msg, env) {
 
 /* ========================== PROVIDER CHAINS ========================== */
 async function runTextProviders(prompt, env, orderOverride) {
-  const chain = parseOrder(orderOverride || env.TEXT_PROVIDER_ORDER, ["cf","openai","gemini"]);
+  const chain = parseOrder(orderOverride || env.TEXT_PROVIDER_ORDER, ["cf","openai","openrouter","deepseek","gemini"]);
   let lastErr = null;
   for (const p of chain) {
     try {
@@ -1467,6 +1467,42 @@ async function textProvider(name, prompt, env) {
       },
       body: JSON.stringify({
         model: env.OPENAI_MODEL || "gpt-4o-mini",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.25,
+      }),
+    }, TIMEOUT_TEXT_MS);
+    const j = await r.json().catch(() => null);
+    return j?.choices?.[0]?.message?.content || "";
+  }
+
+  if (name === "openrouter") {
+    if (!env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY_missing");
+    const r = await fetchWithTimeout("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: env.OPENROUTER_MODEL || "openai/gpt-4o-mini",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.25,
+      }),
+    }, TIMEOUT_TEXT_MS);
+    const j = await r.json().catch(() => null);
+    return j?.choices?.[0]?.message?.content || "";
+  }
+
+  if (name === "deepseek") {
+    if (!env.DEEPSEEK_API_KEY) throw new Error("DEEPSEEK_API_KEY_missing");
+    const r = await fetchWithTimeout("https://api.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.DEEPSEEK_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: env.DEEPSEEK_MODEL || "deepseek-chat",
         messages: [{ role: "user", content: prompt }],
         temperature: 0.25,
       }),
