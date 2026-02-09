@@ -1421,14 +1421,14 @@ async function runVisionProviders(imageUrl, visionPrompt, env, orderOverride) {
   const deadline = Date.now() + totalBudget;
 
   let lastErr = null;
-  let cached = null;
+  let cached = /** @type {any} */ (null);
 
   for (const p of chain) {
     const remaining = deadline - Date.now();
     if (remaining <= 500) break;
 
     try {
-      if ((p === "cf" || p === "gemini" || p === "hf") && cached?.tooLarge) continue;
+      if ((p === "cf" || p === "gemini" || p === "hf") && cached && cached.tooLarge) continue;
 
       const out = await Promise.race([
         visionProvider(p, imageUrl, visionPrompt, env, () => cached, (c) => (cached = c)),
@@ -1756,7 +1756,7 @@ async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) 
   const base = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${encodeURIComponent(env.TWELVEDATA_API_KEY)}`;
   const sources = [];
   if (kind === "crypto") sources.push("binance");
-  if (kind === "forex" || kind === "metals") sources.push("fx");
+  if (kind === "forex" || kind === "metal") sources.push("fx");
   const urls = [base, ...sources.map((s) => `${base}&source=${encodeURIComponent(s)}`)];
 
   let lastErr = null;
@@ -3090,11 +3090,11 @@ function buildZonesSvgFromAnalysis(analysisText, symbol, timeframe) {
 
 function escapeXml(s) {
   return String(s || "")
-    .replaceAll("&","&amp;")
-    .replaceAll("<","&lt;")
-    .replaceAll(">","&gt;")
-    .replaceAll('"',"&quot;")
-    .replaceAll("'","&apos;");
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 /* ========================== MINI APP INLINE ASSETS ========================== */
@@ -3124,7 +3124,7 @@ async function verifyTelegramInitData(initData, botToken) {
   if (now - authDate > 60 * 60) return { ok: false, reason: "initData_expired" };
 
   const pairs = [];
-  for (const [k, v] of params.entries()) pairs.push([k, v]);
+  params.forEach((v, k) => { pairs.push([k, v]); });
   pairs.sort((a, b) => a[0].localeCompare(b[0]));
   const dataCheckString = pairs.map(([k, v]) => `${k}=${v}`).join("\n");
 
@@ -3664,7 +3664,7 @@ function fillCustomPrompts(list){
   for (const p of prompts) {
     const opt = document.createElement("option");
     opt.value = String(p?.id || "");
-    opt.textContent = p?.title ? `${p.title}` : String(p?.id || "");
+    opt.textContent = p?.title ? String(p.title) : String(p?.id || "");
     sel.appendChild(opt);
   }
   if (cur) sel.value = cur;
