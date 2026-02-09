@@ -1459,20 +1459,34 @@ async function textProvider(name, prompt, env) {
 
   if (name === "openai") {
     if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY_missing");
-    const r = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: env.OPENAI_MODEL || "gpt-4o-mini",
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.25,
-      }),
-    }, TIMEOUT_TEXT_MS);
-    const j = await r.json().catch(() => null);
-    return j?.choices?.[0]?.message?.content || "";
+    const models = [
+      (env.OPENAI_MODEL || "gpt-4o-mini").toString().trim(),
+      ...(env.OPENAI_MODEL_FALLBACKS || "").toString().split(",").map((m) => m.trim()).filter(Boolean),
+    ].filter(Boolean);
+    let lastErr = null;
+    for (const model of models) {
+      try {
+        const r = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.25,
+          }),
+        }, TIMEOUT_TEXT_MS);
+        if (!r.ok) throw new Error(`openai_http_${r.status}`);
+        const j = await r.json().catch(() => null);
+        const content = j?.choices?.[0]?.message?.content || "";
+        if (content) return content;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error("openai_all_models_failed");
   }
 
   if (name === "gemini") {
@@ -1680,18 +1694,31 @@ function downsampleCandles(candles, groupSize) {
 async function fetchBinanceCandles(symbol, timeframe, limit, timeoutMs) {
   if (!symbol.endsWith("USDT")) throw new Error("binance_not_crypto");
   const interval = mapTimeframeToBinance(timeframe);
-  const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
-  const r = await fetchWithTimeout(url, {}, timeoutMs);
-  if (!r.ok) throw new Error(`binance_http_${r.status}`);
-  const data = await r.json();
-  return data.map(k => ({
-    t: k[0],
-    o: Number(k[1]),
-    h: Number(k[2]),
-    l: Number(k[3]),
-    c: Number(k[4]),
-    v: Number(k[5]),
-  }));
+  const hosts = [
+    "https://api.binance.com",
+    "https://data-api.binance.vision",
+    "https://api1.binance.com",
+  ];
+  let lastErr = null;
+  for (const host of hosts) {
+    try {
+      const url = `${host}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
+      const r = await fetchWithTimeout(url, {}, timeoutMs);
+      if (!r.ok) throw new Error(`binance_http_${r.status}`);
+      const data = await r.json();
+      return data.map(k => ({
+        t: k[0],
+        o: Number(k[1]),
+        h: Number(k[2]),
+        l: Number(k[3]),
+        c: Number(k[4]),
+        v: Number(k[5]),
+      }));
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("binance_http_failed");
 }
 
 async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) {
@@ -1701,22 +1728,39 @@ async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) 
 
   const interval = mapTimeframeToTwelve(timeframe);
   const sym = mapForexSymbolForTwelve(symbol);
-  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${encodeURIComponent(env.TWELVEDATA_API_KEY)}`;
+  const base = "https://api.twelvedata.com/time_series";
+  const apiKey = encodeURIComponent(env.TWELVEDATA_API_KEY);
+  const urls = [
+    `${base}?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${apiKey}`,
+  ];
+  if (kind === "crypto") {
+    urls.push(`${base}?symbol=${encodeURIComponent(sym)}&exchange=binance&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${apiKey}`);
+  }
+  if (kind === "forex") {
+    urls.push(`${base}?symbol=${encodeURIComponent(sym)}&exchange=oanda&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${apiKey}`);
+  }
 
-  const r = await fetchWithTimeout(url, {}, timeoutMs);
-  if (!r.ok) throw new Error(`twelvedata_http_${r.status}`);
-  const j = await r.json();
-  if (j.status === "error") throw new Error(`twelvedata_err_${j.code || ""}`);
-
-  const values = Array.isArray(j.values) ? j.values : [];
-  return values.reverse().map(v => ({
-    t: Date.parse(v.datetime + "Z") || Date.now(),
-    o: Number(v.open),
-    h: Number(v.high),
-    l: Number(v.low),
-    c: Number(v.close),
-    v: v.volume ? Number(v.volume) : null,
-  }));
+  let lastErr = null;
+  for (const url of urls) {
+    try {
+      const r = await fetchWithTimeout(url, {}, timeoutMs);
+      if (!r.ok) throw new Error(`twelvedata_http_${r.status}`);
+      const j = await r.json();
+      if (j.status === "error") throw new Error(`twelvedata_err_${j.code || ""}`);
+      const values = Array.isArray(j.values) ? j.values : [];
+      return values.reverse().map(v => ({
+        t: Date.parse(v.datetime + "Z") || Date.now(),
+        o: Number(v.open),
+        h: Number(v.high),
+        l: Number(v.low),
+        c: Number(v.close),
+        v: v.volume ? Number(v.volume) : null,
+      }));
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("twelvedata_http_failed");
 }
 
 async function fetchAlphaVantageFxIntraday(symbol, timeframe, limit, timeoutMs, env) {
