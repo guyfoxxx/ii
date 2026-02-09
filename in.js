@@ -410,6 +410,7 @@ const BTN = {
   SIGNAL: "📈 سیگنال‌ها",
   SETTINGS: "⚙️ تنظیمات",
   PROFILE: "👤 پروفایل",
+  INVITE: "🤝 دعوت",
   SUPPORT: "🆘 پشتیبانی",
   SUPPORT_TICKET: "✉️ ارسال تیکت",
   SUPPORT_FAQ: "❓ سوالات آماده",
@@ -435,7 +436,7 @@ const BTN = {
 };
 
 const TYPING_INTERVAL_MS = 4000;
-const TIMEOUT_TEXT_MS = 11000;
+const TIMEOUT_TEXT_MS = 16000;
 const TIMEOUT_VISION_MS = 12000;
 const TIMEOUT_POLISH_MS = 9000;
 
@@ -982,9 +983,7 @@ function kb(rows) {
 }
 
 function mainMenuKeyboard(env) {
-  const url = getMiniappUrl(env);
-  const miniRow = url ? [{ text: BTN.MINIAPP, web_app: { url } }] : [BTN.MINIAPP];
-  return kb([[BTN.SIGNAL, BTN.SETTINGS], [BTN.WALLET, BTN.PROFILE], [BTN.SUPPORT, BTN.EDUCATION], miniRow, [BTN.HOME]]);
+  return kb([[BTN.SIGNAL, BTN.SETTINGS], [BTN.WALLET, BTN.PROFILE], [BTN.INVITE, BTN.SUPPORT], [BTN.EDUCATION], [BTN.HOME]]);
 }
 
 function signalMenuKeyboard() {
@@ -1375,7 +1374,7 @@ function extractImageFileId(msg, env) {
 
 /* ========================== PROVIDER CHAINS ========================== */
 async function runTextProviders(prompt, env, orderOverride) {
-  const chain = parseOrder(orderOverride || env.TEXT_PROVIDER_ORDER, ["cf","openai","gemini"]);
+  const chain = parseOrder(orderOverride || env.TEXT_PROVIDER_ORDER, ["cf","openai","gemini","openrouter","deepseek"]);
   let lastErr = null;
   for (const p of chain) {
     try {
@@ -1396,7 +1395,7 @@ async function runPolishProviders(draft, env, orderOverride) {
   const raw = (orderOverride || env.POLISH_PROVIDER_ORDER || "").toString().trim();
   if (!raw) return draft;
 
-  const chain = parseOrder(raw, ["openai","cf","gemini"]);
+  const chain = parseOrder(raw, ["openai","cf","gemini","openrouter","deepseek"]);
   const polishPrompt =
     `تو یک ویراستار سخت‌گیر فارسی هستی. متن زیر را فقط “سفت‌وسخت” کن:\n` +
     `- فقط فارسی\n- قالب شماره‌دار ۱ تا ۵ حفظ شود\n- لحن افشاگر/تیز\n- اضافه‌گویی حذف\n- خیال‌بافی نکن\n\n` +
@@ -1492,6 +1491,44 @@ async function textProvider(name, prompt, env) {
     );
     const j = await r.json().catch(() => null);
     return j?.candidates?.[0]?.content?.parts?.map(p => p.text).join("") || "";
+  }
+
+  if (name === "openrouter") {
+    if (!env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY_missing");
+    const r = await fetchWithTimeout("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": env.OPENROUTER_SITE || "",
+        "X-Title": env.OPENROUTER_APP || "MarketiQ",
+      },
+      body: JSON.stringify({
+        model: env.OPENROUTER_MODEL || "openai/gpt-4o-mini",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.25,
+      }),
+    }, TIMEOUT_TEXT_MS);
+    const j = await r.json().catch(() => null);
+    return j?.choices?.[0]?.message?.content || "";
+  }
+
+  if (name === "deepseek") {
+    if (!env.DEEPSEEK_API_KEY) throw new Error("DEEPSEEK_API_KEY_missing");
+    const r = await fetchWithTimeout("https://api.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.DEEPSEEK_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: env.DEEPSEEK_MODEL || "deepseek-chat",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.25,
+      }),
+    }, TIMEOUT_TEXT_MS);
+    const j = await r.json().catch(() => null);
+    return j?.choices?.[0]?.message?.content || "";
   }
 
   throw new Error(`unknown_text_provider:${name}`);
@@ -1681,18 +1718,32 @@ function downsampleCandles(candles, groupSize) {
 async function fetchBinanceCandles(symbol, timeframe, limit, timeoutMs) {
   if (!symbol.endsWith("USDT")) throw new Error("binance_not_crypto");
   const interval = mapTimeframeToBinance(timeframe);
-  const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
-  const r = await fetchWithTimeout(url, {}, timeoutMs);
-  if (!r.ok) throw new Error(`binance_http_${r.status}`);
-  const data = await r.json();
-  return data.map(k => ({
-    t: k[0],
-    o: Number(k[1]),
-    h: Number(k[2]),
-    l: Number(k[3]),
-    c: Number(k[4]),
-    v: Number(k[5]),
-  }));
+  const urls = [
+    `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`,
+    `https://data-api.binance.vision/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`,
+    `https://api.binance.us/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`,
+  ];
+  let lastErr = null;
+  for (const url of urls) {
+    try {
+      const r = await fetchWithTimeout(url, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+      }, timeoutMs);
+      if (!r.ok) throw new Error(`binance_http_${r.status}`);
+      const data = await r.json();
+      return data.map(k => ({
+        t: k[0],
+        o: Number(k[1]),
+        h: Number(k[2]),
+        l: Number(k[3]),
+        c: Number(k[4]),
+        v: Number(k[5]),
+      }));
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("binance_http_failed");
 }
 
 async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) {
@@ -1702,12 +1753,27 @@ async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) 
 
   const interval = mapTimeframeToTwelve(timeframe);
   const sym = mapForexSymbolForTwelve(symbol);
-  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${encodeURIComponent(env.TWELVEDATA_API_KEY)}`;
+  const base = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${encodeURIComponent(env.TWELVEDATA_API_KEY)}`;
+  const sources = [];
+  if (kind === "crypto") sources.push("binance");
+  if (kind === "forex" || kind === "metal") sources.push("fx");
+  const urls = [base, ...sources.map((s) => `${base}&source=${encodeURIComponent(s)}`)];
 
-  const r = await fetchWithTimeout(url, {}, timeoutMs);
-  if (!r.ok) throw new Error(`twelvedata_http_${r.status}`);
-  const j = await r.json();
-  if (j.status === "error") throw new Error(`twelvedata_err_${j.code || ""}`);
+  let lastErr = null;
+  let j = null;
+  for (const url of urls) {
+    try {
+      const r = await fetchWithTimeout(url, {}, timeoutMs);
+      if (!r.ok) throw new Error(`twelvedata_http_${r.status}`);
+      j = await r.json();
+      if (j.status === "error") throw new Error(`twelvedata_err_${j.code || ""}`);
+      break;
+    } catch (e) {
+      lastErr = e;
+      j = null;
+    }
+  }
+  if (!j) throw lastErr || new Error("twelvedata_http_failed");
 
   const values = Array.isArray(j.values) ? j.values : [];
   return values.reverse().map(v => ({
@@ -2262,6 +2328,16 @@ async function handleUpdate(update, env) {
       return tgSendMessage(env, chatId, profileText(st, from, env), mainMenuKeyboard(env));
     }
 
+    if (text === "/invite" || text === BTN.INVITE) {
+      const { link, share } = inviteShareText(st, env);
+      if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
+      const txt =
+        `🤝 دعوت دوستان\n\n` +
+        `🔗 لینک رفرال اختصاصی:\n${link}\n\n` +
+        (share ? `برای اشتراک‌گذاری سریع:\n${share}\n` : "");
+      return tgSendMessage(env, chatId, txt, mainMenuKeyboard(env));
+    }
+
     if (text === "/education" || text === BTN.EDUCATION) {
       return tgSendMessage(env, chatId, "📚 آموزش و مفاهیم بازار\n\nبه‌زودی محتوای آموزشی اضافه می‌شود.", mainMenuKeyboard(env));
     }
@@ -2697,6 +2773,14 @@ function profileText(st, from, env) {
   return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Kyiv): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
 }
 
+function inviteShareText(st, env) {
+  const botUser = env.BOT_USERNAME ? String(env.BOT_USERNAME).replace(/^@/, "") : "";
+  const code = (st.referral?.codes || [])[0] || "";
+  const link = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "";
+  const share = link ? `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent("با لینک من عضو شو و اشتراک هدیه بگیر ✅")}` : "";
+  return { link, share };
+}
+
 /* ========================== FLOWS ========================== */
 
 /* ========================== QUICKCHART IMAGE (CANDLESTICK) ==========================
@@ -2832,6 +2916,20 @@ async function setAnalysisCache(env, key, value) {
   await r2PutJson(env.MARKET_R2, key, value, ttlMs);
 }
 
+function buildMarketBlock(candles, maxRows) {
+  const snap = computeSnapshot(candles);
+  const ohlc = candlesToCompactCSV(candles, maxRows);
+  return (
+    `lastPrice=${snap?.lastPrice}\n` +
+    `changePct=${snap?.changePct}%\n` +
+    `trend=${snap?.trend}\n` +
+    `range50_hi=${snap?.range50?.hi} range50_lo=${snap?.range50?.lo}\n` +
+    `sma20=${snap?.sma20} sma50=${snap?.sma50}\n` +
+    `lastTs=${snap?.lastTs}\n\n` +
+    `OHLC_CSV(t,o,h,l,c):\n${ohlc}`
+  );
+}
+
 async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
   const useCache = !userPrompt && !isStaff(from, env);
   const cacheKey = useCache ? analysisCacheKey(symbol, st) : "";
@@ -2847,20 +2945,17 @@ async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
     console.error("market provider failed (all)", e?.message || e);
     candles = [];
   }
-  const snap = computeSnapshot(candles);
-  const ohlc = candlesToCompactCSV(candles, 80);
-
-  const marketBlock =
-    `lastPrice=${snap?.lastPrice}\n` +
-    `changePct=${snap?.changePct}%\n` +
-    `trend=${snap?.trend}\n` +
-    `range50_hi=${snap?.range50?.hi} range50_lo=${snap?.range50?.lo}\n` +
-    `sma20=${snap?.sma20} sma50=${snap?.sma50}\n` +
-    `lastTs=${snap?.lastTs}\n\n` +
-    `OHLC_CSV(t,o,h,l,c):\n${ohlc}`;
-
+  const marketBlock = buildMarketBlock(candles, 80);
   const prompt = await buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env);
-  const draft = await runTextProviders(prompt, env, st.textOrder);
+  let draft = "";
+  try {
+    draft = await runTextProviders(prompt, env, st.textOrder);
+  } catch (e) {
+    console.error("text providers failed (retry compact):", e?.message || e);
+    const compactBlock = buildMarketBlock(candles, 40);
+    const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env);
+    draft = await runTextProviders(compactPrompt, env, st.textOrder);
+  }
   const polished = await runPolishProviders(draft, env, st.polishOrder);
   if (useCache && polished) await setAnalysisCache(env, cacheKey, polished);
   return polished;
@@ -2995,11 +3090,11 @@ function buildZonesSvgFromAnalysis(analysisText, symbol, timeframe) {
 
 function escapeXml(s) {
   return String(s || "")
-    .replaceAll("&","&amp;")
-    .replaceAll("<","&lt;")
-    .replaceAll(">","&gt;")
-    .replaceAll('"',"&quot;")
-    .replaceAll("'","&apos;");
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 /* ========================== MINI APP INLINE ASSETS ========================== */
@@ -3029,7 +3124,7 @@ async function verifyTelegramInitData(initData, botToken) {
   if (now - authDate > 60 * 60) return { ok: false, reason: "initData_expired" };
 
   const pairs = [];
-  for (const [k, v] of params.entries()) pairs.push([k, v]);
+  params.forEach((v, k) => { pairs.push([k, v]); });
   pairs.sort((a, b) => a[0].localeCompare(b[0]));
   const dataCheckString = pairs.map(([k, v]) => `${k}=${v}`).join("\n");
 
