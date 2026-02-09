@@ -23,6 +23,10 @@ export default {
         const st = await ensureUser(v.userId, env);
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
         const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
+        const styles = await getStyleList(env);
+        const offerBanner = await getOfferBanner(env);
+        const customPrompts = await getCustomPrompts(env);
+        const role = isOwner(v.fromLike, env) ? "owner" : (isAdmin(v.fromLike, env) ? "admin" : "user");
 
         return jsonResponse({
           ok: true,
@@ -30,6 +34,11 @@ export default {
           state: st,
           quota,
           symbols,
+          styles,
+          offerBanner,
+          customPrompts,
+          role,
+          isStaff: role !== "user",
           wallet: (await getWallet(env)) || "",
         });
       }
@@ -45,14 +54,237 @@ export default {
 
         // users can tweak only their preferences (admin-only prompt/wallet enforced elsewhere)
         if (typeof body.timeframe === "string") st.timeframe = body.timeframe;
-        if (typeof body.style === "string") st.style = body.style;
+        if (typeof body.style === "string") {
+          const styles = await getStyleList(env);
+          if (styles.includes(body.style)) st.style = body.style;
+        }
         if (typeof body.risk === "string") st.risk = body.risk;
         if (typeof body.newsEnabled === "boolean") st.newsEnabled = body.newsEnabled;
+        if (typeof body.customPromptId === "string") {
+          const prompts = await getCustomPrompts(env);
+          const id = body.customPromptId.trim();
+          st.customPromptId = prompts.find((p) => String(p?.id || "") === id) ? id : "";
+        }
 
         if (env.BOT_KV) await saveUser(v.userId, st, env);
 
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
         return jsonResponse({ ok: true, state: st, quota });
+      }
+
+      if (url.pathname.startsWith("/api/admin/") && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+        if (!isStaff(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+
+        if (url.pathname === "/api/admin/bootstrap") {
+          const [prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit] = await Promise.all([
+            getAnalysisPrompt(env),
+            getStyleList(env),
+            getCommissionSettings(env),
+            getOfferBanner(env),
+            listPayments(env, 25),
+            getStylePromptMap(env),
+            getCustomPrompts(env),
+            getFreeDailyLimit(env),
+          ]);
+          return jsonResponse({ ok: true, prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit });
+        }
+
+        if (url.pathname === "/api/admin/prompt") {
+          if (typeof body.prompt === "string" && env.BOT_KV) {
+            await env.BOT_KV.put("settings:analysis_prompt", body.prompt.trim());
+          }
+          const prompt = await getAnalysisPrompt(env);
+          return jsonResponse({ ok: true, prompt });
+        }
+
+        if (url.pathname === "/api/admin/styles") {
+          const list = await getStyleList(env);
+          const action = String(body.action || "");
+          const style = String(body.style || "").trim();
+          let next = list.slice();
+          if (action === "add" && style) {
+            if (ALLOWED_STYLE_LIST.includes(style) && !next.includes(style)) next.push(style);
+          } else if (action === "remove" && style) {
+            next = next.filter((s) => s !== style);
+          }
+          if (env.BOT_KV) await setStyleList(env, next);
+          return jsonResponse({ ok: true, styles: await getStyleList(env) });
+        }
+
+        if (url.pathname === "/api/admin/style-prompts") {
+          const map = await getStylePromptMap(env);
+          if (typeof body.stylePrompts === "object" && body.stylePrompts) {
+            await setStylePromptMap(env, body.stylePrompts);
+          }
+          return jsonResponse({ ok: true, stylePrompts: await getStylePromptMap(env) });
+        }
+
+        if (url.pathname === "/api/admin/custom-prompts") {
+          if (Array.isArray(body.customPrompts)) {
+            await setCustomPrompts(env, body.customPrompts);
+          }
+          return jsonResponse({ ok: true, customPrompts: await getCustomPrompts(env) });
+        }
+
+        if (url.pathname === "/api/admin/free-limit") {
+          const limit = toInt(body.limit, 3);
+          await setFreeDailyLimit(env, limit);
+          return jsonResponse({ ok: true, freeDailyLimit: await getFreeDailyLimit(env) });
+        }
+
+        if (url.pathname === "/api/admin/offer") {
+          if (typeof body.offerBanner === "string" && env.BOT_KV) {
+            await setOfferBanner(env, body.offerBanner);
+          }
+          return jsonResponse({ ok: true, offerBanner: await getOfferBanner(env) });
+        }
+
+        if (url.pathname === "/api/admin/commissions") {
+          const settings = await getCommissionSettings(env);
+          const action = String(body.action || "");
+          if (action === "setGlobal" && Number.isFinite(Number(body.percent))) {
+            settings.globalPercent = Number(body.percent);
+          }
+          if (action === "setOverride") {
+            const handle = normHandle(body.username);
+            const pct = Number(body.percent);
+            if (handle && Number.isFinite(pct)) settings.overrides[handle] = pct;
+          }
+          if (action === "removeOverride") {
+            const handle = normHandle(body.username);
+            if (handle) delete settings.overrides[handle];
+          }
+          await setCommissionSettings(env, settings);
+          return jsonResponse({ ok: true, commission: await getCommissionSettings(env) });
+        }
+
+        if (url.pathname === "/api/admin/users") {
+          const users = await listUsers(env, Number(body.limit || 100));
+          const now = Date.now();
+          const report = users.map((u) => {
+            const createdAt = u.createdAt || "";
+            const usageDays = createdAt ? Math.max(1, Math.ceil((now - Date.parse(createdAt)) / (24 * 3600 * 1000))) : 0;
+            const lastTx = Array.isArray(u.wallet?.transactions) ? u.wallet.transactions[u.wallet.transactions.length - 1] : null;
+            return {
+              userId: u.userId,
+              username: u.profile?.username || "",
+              phone: u.profile?.phone || "",
+              createdAt,
+              usageDays,
+              totalAnalyses: u.stats?.successfulAnalyses || 0,
+              lastAnalysisAt: u.stats?.lastAnalysisAt || "",
+              paymentCount: u.stats?.totalPayments || 0,
+              paymentTotal: u.stats?.totalPaymentAmount || 0,
+              lastTxHash: lastTx?.txHash || "",
+              referralBy: u.referral?.referredBy || "",
+              referralInvites: u.referral?.successfulInvites || 0,
+              subscriptionActive: !!u.subscription?.active,
+              subscriptionType: u.subscription?.type || "free",
+              subscriptionExpiresAt: u.subscription?.expiresAt || "",
+              dailyLimit: dailyLimit(env, u),
+              dailyUsed: u.dailyUsed || 0,
+              customPromptId: u.customPromptId || "",
+            };
+          });
+          return jsonResponse({ ok: true, users: report });
+        }
+
+        if (url.pathname === "/api/admin/payments/list") {
+          return jsonResponse({ ok: true, payments: await listPayments(env, 100) });
+        }
+
+        if (url.pathname === "/api/admin/payments/approve") {
+          const username = String(body.username || "").trim();
+          const userId = await getUserIdByUsername(env, username);
+          if (!userId) return jsonResponse({ ok: false, error: "user_not_found" }, 404);
+
+          const st = await ensureUser(userId, env);
+          const amount = Number(body.amount || 0);
+          const days = toInt(body.days, 30);
+          const txHash = String(body.txHash || "").trim();
+          const premiumLimit = toInt(env.PREMIUM_DAILY_LIMIT, 50);
+          const now = new Date().toISOString();
+          const payment = {
+            id: `pay_${Date.now()}_${userId}`,
+            userId,
+            username,
+            amount,
+            txHash,
+            status: "approved",
+            createdAt: now,
+            approvedAt: now,
+            approvedBy: normHandle(v.fromLike?.username),
+          };
+
+          st.subscription.active = true;
+          st.subscription.type = "premium";
+          st.subscription.dailyLimit = premiumLimit;
+          st.subscription.expiresAt = futureISO(days);
+          st.stats.totalPayments = (st.stats.totalPayments || 0) + 1;
+          st.stats.totalPaymentAmount = (st.stats.totalPaymentAmount || 0) + amount;
+          st.wallet.transactions = Array.isArray(st.wallet.transactions) ? st.wallet.transactions : [];
+          if (txHash) {
+            st.wallet.transactions.push({ txHash, amount, createdAt: now });
+            st.wallet.transactions = st.wallet.transactions.slice(-10);
+          }
+
+          if (st.referral?.referredBy) {
+            const inviter = await ensureUser(String(st.referral.referredBy), env);
+            const commission = await getCommissionSettings(env);
+            const pct = resolveCommissionPercent(inviter.profile?.username, commission);
+            const reward = pct > 0 ? Math.round((amount * pct) * 100) / 100 : 0;
+            inviter.referral.commissionTotal = (inviter.referral.commissionTotal || 0) + reward;
+            inviter.referral.commissionBalance = (inviter.referral.commissionBalance || 0) + reward;
+            await saveUser(inviter.userId, inviter, env);
+            payment.commission = { inviterId: inviter.userId, percent: pct, amount: reward };
+          }
+
+          await saveUser(userId, st, env);
+          await storePayment(env, payment);
+          return jsonResponse({ ok: true, payment, subscription: st.subscription });
+        }
+
+        if (url.pathname === "/api/admin/subscription/activate") {
+          const username = String(body.username || "").trim();
+          const userId = await getUserIdByUsername(env, username);
+          if (!userId) return jsonResponse({ ok: false, error: "user_not_found" }, 404);
+          const st = await ensureUser(userId, env);
+          const days = toInt(body.days, 30);
+          const premiumLimit = toInt(body.dailyLimit, toInt(env.PREMIUM_DAILY_LIMIT, 50));
+          st.subscription.active = true;
+          st.subscription.type = "manual";
+          st.subscription.dailyLimit = premiumLimit;
+          st.subscription.expiresAt = futureISO(days);
+          await saveUser(userId, st, env);
+          return jsonResponse({ ok: true, subscription: st.subscription });
+        }
+
+        if (url.pathname === "/api/admin/custom-prompts/send") {
+          const username = String(body.username || "").trim();
+          const promptId = String(body.promptId || "").trim();
+          const userId = await getUserIdByUsername(env, username);
+          if (!userId) return jsonResponse({ ok: false, error: "user_not_found" }, 404);
+          const prompts = await getCustomPrompts(env);
+          const match = prompts.find((p) => String(p?.id || "") === promptId);
+          if (!match) return jsonResponse({ ok: false, error: "prompt_not_found" }, 404);
+          await tgSendMessage(env, userId, `📌 پرامپت اختصاصی فعال شد:\n${match.title || match.id}\n\n${match.text || ""}`, mainMenuKeyboard(env));
+          return jsonResponse({ ok: true });
+        }
+
+        if (url.pathname === "/api/admin/payments/check") {
+          const payload = {
+            txHash: String(body.txHash || "").trim(),
+            address: String(body.address || "").trim(),
+            amount: Number(body.amount || 0),
+          };
+          const result = await verifyBlockchainPayment(payload, env);
+          return jsonResponse({ ok: true, result });
+        }
       }
 
       if (url.pathname === "/api/analyze" && request.method === "POST") {
@@ -76,15 +308,15 @@ export default {
           return jsonResponse({ ok: false, error: `quota_exceeded_${quota}` }, 429);
         }
 
-        if (env.BOT_KV) {
-          consumeDaily(st, v.fromLike, env);
-          await saveUser(v.userId, st, env);
-        }
-
         const userPrompt = typeof body.userPrompt === "string" ? body.userPrompt : "";
 
         try {
           const result = await runSignalTextFlowReturnText(env, v.fromLike, st, symbol, userPrompt);
+          if (env.BOT_KV) {
+            consumeDaily(st, v.fromLike, env);
+            recordAnalysisSuccess(st);
+            await saveUser(v.userId, st, env);
+          }
           const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
           return jsonResponse({ ok: true, result, state: st, quota });
         } catch (e) {
@@ -178,9 +410,11 @@ const BTN = {
   SIGNAL: "📈 سیگنال‌ها",
   SETTINGS: "⚙️ تنظیمات",
   PROFILE: "👤 پروفایل",
+  INVITE: "🤝 دعوت",
   SUPPORT: "🆘 پشتیبانی",
+  SUPPORT_TICKET: "✉️ ارسال تیکت",
+  SUPPORT_FAQ: "❓ سوالات آماده",
   EDUCATION: "📚 آموزش",
-  LEVELING: "🧪 تعیین سطح",
   BACK: "⬅️ برگشت",
   HOME: "🏠 منوی اصلی",
   MINIAPP: "🧩 مینی‌اپ",
@@ -202,7 +436,7 @@ const BTN = {
 };
 
 const TYPING_INTERVAL_MS = 4000;
-const TIMEOUT_TEXT_MS = 11000;
+const TIMEOUT_TEXT_MS = 16000;
 const TIMEOUT_VISION_MS = 12000;
 const TIMEOUT_POLISH_MS = 9000;
 
@@ -298,6 +532,50 @@ function randomCode(len = 10) {
   let out = "";
   for (let i = 0; i < len; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
   return out;
+}
+
+const MARKET_CACHE = new Map();
+const ANALYSIS_CACHE = new Map();
+
+function cacheGet(map, key) {
+  const hit = map.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt && hit.expiresAt <= Date.now()) {
+    map.delete(key);
+    return null;
+  }
+  return hit.value;
+}
+
+function cacheSet(map, key, value, ttlMs, maxSize = 500) {
+  map.set(key, { value, expiresAt: Date.now() + ttlMs });
+  if (map.size > maxSize) {
+    const [first] = map.keys();
+    if (first) map.delete(first);
+  }
+}
+
+async function r2GetJson(bucket, key) {
+  if (!bucket) return null;
+  const obj = await bucket.get(key);
+  if (!obj) return null;
+  try { return await obj.json(); } catch { return null; }
+}
+
+async function r2PutJson(bucket, key, value, ttlMs) {
+  if (!bucket) return;
+  const body = JSON.stringify({ value, expiresAt: Date.now() + ttlMs });
+  await bucket.put(key, body, {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: { ttlMs: String(ttlMs || "") },
+  });
+}
+
+async function getCachedR2Value(bucket, key) {
+  const payload = await r2GetJson(bucket, key);
+  if (!payload) return null;
+  if (payload.expiresAt && payload.expiresAt <= Date.now()) return null;
+  return payload.value;
 }
 
 /* ========================== PROMPTS (ADMIN/OWNER ONLY) ========================== */
@@ -493,14 +771,206 @@ function styleKey(style) {
 }
 async function getStylePrompt(env, style) {
   if (!env.BOT_KV) return "";
-  const v = await env.BOT_KV.get(`settings:style_prompt:${styleKey(style)}`);
-  return (v || "").toString();
+  const map = await getStylePromptMap(env);
+  const key = styleKey(style);
+  return (map?.[key] || "").toString();
 }
 async function setStylePrompt(env, style, prompt) {
   if (!env.BOT_KV) return;
-  await env.BOT_KV.put(`settings:style_prompt:${styleKey(style)}`, String(prompt || ""));
+  const map = await getStylePromptMap(env);
+  map[styleKey(style)] = String(prompt || "");
+  await setStylePromptMap(env, map);
 }
 
+async function getStylePromptMap(env) {
+  if (!env.BOT_KV) return {};
+  const raw = await env.BOT_KV.get("settings:style_prompts_json");
+  try {
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function setStylePromptMap(env, map) {
+  if (!env.BOT_KV) return;
+  const payload = map && typeof map === "object" ? map : {};
+  await env.BOT_KV.put("settings:style_prompts_json", JSON.stringify(payload));
+}
+
+async function getCustomPrompts(env) {
+  if (!env.BOT_KV) return [];
+  const raw = await env.BOT_KV.get("settings:custom_prompts");
+  try {
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function setCustomPrompts(env, prompts) {
+  if (!env.BOT_KV) return;
+  const clean = Array.isArray(prompts) ? prompts : [];
+  await env.BOT_KV.put("settings:custom_prompts", JSON.stringify(clean));
+}
+
+async function getFreeDailyLimit(env) {
+  if (!env.BOT_KV) return 3;
+  const raw = await env.BOT_KV.get("settings:free_daily_limit");
+  return toInt(raw, 3);
+}
+
+async function setFreeDailyLimit(env, limit) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put("settings:free_daily_limit", String(limit));
+}
+const ALLOWED_STYLE_LIST = ["پرایس اکشن", "ICT", "ATR"];
+const DEFAULT_STYLE_LIST = ALLOWED_STYLE_LIST.slice();
+
+async function getStyleList(env) {
+  if (!env.BOT_KV) return DEFAULT_STYLE_LIST.slice();
+  const raw = await env.BOT_KV.get("settings:style_list");
+  if (!raw) return DEFAULT_STYLE_LIST.slice();
+  try {
+    const list = JSON.parse(raw);
+    const filtered = Array.isArray(list) ? list.filter((s) => ALLOWED_STYLE_LIST.includes(s)) : [];
+    return filtered.length ? filtered : DEFAULT_STYLE_LIST.slice();
+  } catch {
+    return DEFAULT_STYLE_LIST.slice();
+  }
+}
+
+async function setStyleList(env, styles) {
+  if (!env.BOT_KV) return;
+  const clean = (Array.isArray(styles) ? styles : [])
+    .map((s) => String(s || "").trim())
+    .filter((s) => ALLOWED_STYLE_LIST.includes(s));
+  await env.BOT_KV.put("settings:style_list", JSON.stringify(clean));
+}
+
+async function getOfferBanner(env) {
+  if (!env.BOT_KV) return (env.SPECIAL_OFFER_TEXT || "").toString().trim();
+  const raw = await env.BOT_KV.get("settings:offer_banner");
+  return (raw || env.SPECIAL_OFFER_TEXT || "").toString().trim();
+}
+
+async function setOfferBanner(env, text) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
+}
+
+async function getCommissionSettings(env) {
+  if (!env.BOT_KV) return { globalPercent: 0, overrides: {} };
+  const g = await env.BOT_KV.get("settings:commission:globalPercent");
+  const o = await env.BOT_KV.get("settings:commission:overrides");
+  let overrides = {};
+  try { overrides = o ? JSON.parse(o) : {}; } catch { overrides = {}; }
+  return {
+    globalPercent: toInt(g, 0),
+    overrides: overrides && typeof overrides === "object" ? overrides : {},
+  };
+}
+
+async function setCommissionSettings(env, settings) {
+  if (!env.BOT_KV) return;
+  if (typeof settings.globalPercent === "number") {
+    await env.BOT_KV.put("settings:commission:globalPercent", String(settings.globalPercent));
+  }
+  if (settings.overrides) {
+    await env.BOT_KV.put("settings:commission:overrides", JSON.stringify(settings.overrides || {}));
+  }
+}
+
+function resolveCommissionPercent(username, settings) {
+  const handle = normHandle(username);
+  if (!handle) return settings.globalPercent || 0;
+  const raw = settings.overrides?.[handle];
+  const override = Number(raw);
+  if (Number.isFinite(override)) return override;
+  return settings.globalPercent || 0;
+}
+
+async function updateUserIndexes(env, st) {
+  if (!env.BOT_KV) return;
+  const id = String(st.userId);
+
+  const raw = await env.BOT_KV.get("users:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  if (!list.includes(id)) list.push(id);
+  await env.BOT_KV.put("users:index", JSON.stringify(list.slice(-2000)));
+
+  const handle = normHandle(st.profile?.username);
+  if (handle) {
+    await env.BOT_KV.put(`users:by_username:${handle}`, id);
+  }
+}
+
+async function getUserIdByUsername(env, username) {
+  if (!env.BOT_KV) return "";
+  const handle = normHandle(username);
+  if (!handle) return "";
+  return (await env.BOT_KV.get(`users:by_username:${handle}`)) || "";
+}
+
+async function listUsers(env, limit = 100) {
+  if (!env.BOT_KV) return [];
+  const raw = await env.BOT_KV.get("users:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) return [];
+  const ids = list.slice(-limit);
+  const users = [];
+  for (const id of ids) {
+    const u = await getUser(id, env);
+    if (u) users.push(u);
+  }
+  return users;
+}
+
+async function storePayment(env, payment) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put(`payment:${payment.id}`, JSON.stringify(payment));
+
+  const raw = await env.BOT_KV.get("payments:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  if (!list.includes(payment.id)) list.push(payment.id);
+  await env.BOT_KV.put("payments:index", JSON.stringify(list.slice(-500)));
+}
+
+async function listPayments(env, limit = 50) {
+  if (!env.BOT_KV) return [];
+  const raw = await env.BOT_KV.get("payments:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) return [];
+  const ids = list.slice(-limit);
+  const out = [];
+  for (const id of ids) {
+    const rawPay = await env.BOT_KV.get(`payment:${id}`);
+    if (rawPay) {
+      try { out.push(JSON.parse(rawPay)); } catch {}
+    }
+  }
+  return out.sort((a, b) => (b?.createdAt || "").localeCompare(a?.createdAt || ""));
+}
+
+async function verifyBlockchainPayment(payload, env) {
+  const endpoint = (env.BLOCKCHAIN_CHECK_URL || "").toString().trim();
+  if (!endpoint) return { ok: false, reason: "check_url_missing" };
+  const r = await fetchWithTimeout(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }, Number(env.BLOCKCHAIN_CHECK_TIMEOUT_MS || 8000));
+  const j = await r.json().catch(() => null);
+  return j || { ok: false, reason: "bad_response" };
+}
 
 /* ========================== KEYBOARDS ========================== */
 function kb(rows) {
@@ -513,9 +983,7 @@ function kb(rows) {
 }
 
 function mainMenuKeyboard(env) {
-  const url = getMiniappUrl(env);
-  const miniRow = url ? [{ text: BTN.MINIAPP, web_app: { url } }] : [BTN.MINIAPP];
-  return kb([[BTN.SIGNAL, BTN.SETTINGS], [BTN.WALLET, BTN.PROFILE], [BTN.SUPPORT, BTN.EDUCATION], [BTN.LEVELING], miniRow, [BTN.HOME]]);
+  return kb([[BTN.SIGNAL, BTN.SETTINGS], [BTN.WALLET, BTN.PROFILE], [BTN.INVITE, BTN.SUPPORT], [BTN.EDUCATION], [BTN.HOME]]);
 }
 
 function signalMenuKeyboard() {
@@ -627,6 +1095,7 @@ async function saveUser(userId, st, env) {
 
   if (!env.BOT_KV) return;
   await env.BOT_KV.put(`u:${userId}`, JSON.stringify(st));
+  await updateUserIndexes(env, st);
 }
 
 function defaultUser(userId) {
@@ -640,13 +1109,14 @@ function defaultUser(userId) {
 
     // preferences
     timeframe: "H4",
-    style: "اسمارت‌مانی",
+    style: "پرایس اکشن",
     risk: "متوسط",
     newsEnabled: true,
 
     // usage quota
     dailyDate: kyivDateString(),
     dailyUsed: 0,
+    freeDailyLimit: 3,
 
     // onboarding/profile
     profile: {
@@ -664,28 +1134,40 @@ function defaultUser(userId) {
 
     // referral / points / subscription
     referral: {
-      codes: [],            // 5 codes
+      codes: [],            // 1 code
       referredBy: "",       // inviter userId
       referredByCode: "",   // which code
       successfulInvites: 0,
       points: 0,
+      commissionTotal: 0,
+      commissionBalance: 0,
     },
     subscription: {
       active: false,
       type: "free", // free/premium/gift
       expiresAt: "",
-      dailyLimit: 50, // per requirement
+      dailyLimit: 3,
     },
 
     // wallet (local balance placeholder)
     wallet: {
       balance: 0,
+      transactions: [],
     },
 
     // provider overrides
     textOrder: "",
     visionOrder: "",
     polishOrder: "",
+
+    stats: {
+      totalAnalyses: 0,
+      successfulAnalyses: 0,
+      lastAnalysisAt: "",
+      totalPayments: 0,
+      totalPaymentAmount: 0,
+    },
+    customPromptId: "",
   };
 }
 
@@ -696,6 +1178,8 @@ function patchUser(st, userId) {
   merged.referral = { ...d.referral, ...(st?.referral || {}) };
   merged.subscription = { ...d.subscription, ...(st?.subscription || {}) };
   merged.wallet = { ...d.wallet, ...(st?.wallet || {}) };
+  merged.stats = { ...d.stats, ...(st?.stats || {}) };
+  merged.customPromptId = typeof merged.customPromptId === "string" ? merged.customPromptId : "";
 
   merged.timeframe = merged.timeframe || d.timeframe;
   merged.style = merged.style || d.style;
@@ -704,6 +1188,7 @@ function patchUser(st, userId) {
 
   merged.dailyDate = merged.dailyDate || d.dailyDate;
   merged.dailyUsed = Number.isFinite(Number(merged.dailyUsed)) ? Number(merged.dailyUsed) : d.dailyUsed;
+  merged.freeDailyLimit = Number.isFinite(Number(merged.freeDailyLimit)) ? Number(merged.freeDailyLimit) : d.freeDailyLimit;
 
   merged.state = merged.state || "idle";
   merged.selectedSymbol = merged.selectedSymbol || "";
@@ -736,18 +1221,23 @@ async function ensureUser(userId, env, from) {
     st.dailyUsed = 0;
   }
 
-  if (!Array.isArray(st.referral.codes) || st.referral.codes.length < 5) {
+  if (!Array.isArray(st.referral.codes) || st.referral.codes.length < 1) {
     st.referral.codes = (st.referral.codes || []).filter(Boolean);
-    while (st.referral.codes.length < 5) st.referral.codes.push(randomCode(10));
+    while (st.referral.codes.length < 1) st.referral.codes.push(randomCode(10));
   }
+
+  const freeLimit = await getFreeDailyLimit(env);
+  st.freeDailyLimit = freeLimit;
 
   if (env.BOT_KV) await saveUser(userId, st, env);
   return st;
 }
 
 function dailyLimit(env, st) {
-  const base = 50;
-  return toInt(st?.subscription?.dailyLimit, base) || base;
+  if (st?.subscription?.active) {
+    return toInt(st?.subscription?.dailyLimit, 3) || 3;
+  }
+  return toInt(st?.freeDailyLimit || st?.subscription?.dailyLimit || 0, 0) || 3;
 }
 
 function canAnalyzeToday(st, from, env) {
@@ -765,6 +1255,13 @@ function consumeDaily(st, from, env) {
     st.dailyUsed = 0;
   }
   st.dailyUsed = (st.dailyUsed || 0) + 1;
+}
+
+function recordAnalysisSuccess(st) {
+  st.stats = st.stats || {};
+  st.stats.totalAnalyses = (st.stats.totalAnalyses || 0) + 1;
+  st.stats.successfulAnalyses = (st.stats.successfulAnalyses || 0) + 1;
+  st.stats.lastAnalysisAt = new Date().toISOString();
 }
 
 /* ========================== TELEGRAM API ========================== */
@@ -1183,18 +1680,32 @@ function downsampleCandles(candles, groupSize) {
 async function fetchBinanceCandles(symbol, timeframe, limit, timeoutMs) {
   if (!symbol.endsWith("USDT")) throw new Error("binance_not_crypto");
   const interval = mapTimeframeToBinance(timeframe);
-  const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
-  const r = await fetchWithTimeout(url, {}, timeoutMs);
-  if (!r.ok) throw new Error(`binance_http_${r.status}`);
-  const data = await r.json();
-  return data.map(k => ({
-    t: k[0],
-    o: Number(k[1]),
-    h: Number(k[2]),
-    l: Number(k[3]),
-    c: Number(k[4]),
-    v: Number(k[5]),
-  }));
+  const urls = [
+    `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`,
+    `https://data-api.binance.vision/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`,
+    `https://api.binance.us/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`,
+  ];
+  let lastErr = null;
+  for (const url of urls) {
+    try {
+      const r = await fetchWithTimeout(url, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+      }, timeoutMs);
+      if (!r.ok) throw new Error(`binance_http_${r.status}`);
+      const data = await r.json();
+      return data.map(k => ({
+        t: k[0],
+        o: Number(k[1]),
+        h: Number(k[2]),
+        l: Number(k[3]),
+        c: Number(k[4]),
+        v: Number(k[5]),
+      }));
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("binance_http_failed");
 }
 
 async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) {
@@ -1204,12 +1715,27 @@ async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) 
 
   const interval = mapTimeframeToTwelve(timeframe);
   const sym = mapForexSymbolForTwelve(symbol);
-  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${encodeURIComponent(env.TWELVEDATA_API_KEY)}`;
+  const base = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${encodeURIComponent(env.TWELVEDATA_API_KEY)}`;
+  const sources = [];
+  if (kind === "crypto") sources.push("binance");
+  if (kind === "forex" || kind === "metals") sources.push("fx");
+  const urls = [base, ...sources.map((s) => `${base}&source=${encodeURIComponent(s)}`)];
 
-  const r = await fetchWithTimeout(url, {}, timeoutMs);
-  if (!r.ok) throw new Error(`twelvedata_http_${r.status}`);
-  const j = await r.json();
-  if (j.status === "error") throw new Error(`twelvedata_err_${j.code || ""}`);
+  let lastErr = null;
+  let j = null;
+  for (const url of urls) {
+    try {
+      const r = await fetchWithTimeout(url, {}, timeoutMs);
+      if (!r.ok) throw new Error(`twelvedata_http_${r.status}`);
+      j = await r.json();
+      if (j.status === "error") throw new Error(`twelvedata_err_${j.code || ""}`);
+      break;
+    } catch (e) {
+      lastErr = e;
+      j = null;
+    }
+  }
+  if (!j) throw lastErr || new Error("twelvedata_http_failed");
 
   const values = Array.isArray(j.values) ? j.values : [];
   return values.reverse().map(v => ({
@@ -1359,20 +1885,46 @@ async function fetchYahooChartCandles(symbol, timeframe, limit, timeoutMs) {
   throw lastErr || new Error("yahoo_no_data");
 }
 
+function marketCacheKey(symbol, timeframe) {
+  return `market:${String(symbol).toUpperCase()}:${String(timeframe).toUpperCase()}`;
+}
+
+async function getMarketCache(env, key) {
+  const mem = cacheGet(MARKET_CACHE, key);
+  if (mem) return mem;
+  const r2 = await getCachedR2Value(env.MARKET_R2, key);
+  if (r2) cacheSet(MARKET_CACHE, key, r2, Number(env.MARKET_CACHE_TTL_MS || 120000));
+  return r2;
+}
+
+async function setMarketCache(env, key, value) {
+  const ttlMs = Number(env.MARKET_CACHE_TTL_MS || 120000);
+  cacheSet(MARKET_CACHE, key, value, ttlMs);
+  await r2PutJson(env.MARKET_R2, key, value, ttlMs);
+}
+
 async function getMarketCandlesWithFallback(env, symbol, timeframe) {
   const timeoutMs = Number(env.MARKET_DATA_TIMEOUT_MS || 7000);
   const limit = Number(env.MARKET_DATA_CANDLES_LIMIT || 120);
+  const cacheKey = marketCacheKey(symbol, timeframe);
+  const cached = await getMarketCache(env, cacheKey);
+  if (cached) return cached;
 
   const chain = parseOrder(env.MARKET_DATA_PROVIDER_ORDER, ["binance","twelvedata","alphavantage","finnhub","yahoo"]);
   let lastErr = null;
 
   for (const p of chain) {
     try {
-      if (p === "binance") return await fetchBinanceCandles(symbol, timeframe, limit, timeoutMs);
-      if (p === "twelvedata") return await fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env);
-      if (p === "alphavantage") return await fetchAlphaVantageFxIntraday(symbol, timeframe, limit, timeoutMs, env);
-      if (p === "finnhub") return await fetchFinnhubForexCandles(symbol, timeframe, limit, timeoutMs, env);
-      if (p === "yahoo") return await fetchYahooChartCandles(symbol, timeframe, limit, timeoutMs);
+      let candles = null;
+      if (p === "binance") candles = await fetchBinanceCandles(symbol, timeframe, limit, timeoutMs);
+      if (p === "twelvedata") candles = await fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env);
+      if (p === "alphavantage") candles = await fetchAlphaVantageFxIntraday(symbol, timeframe, limit, timeoutMs, env);
+      if (p === "finnhub") candles = await fetchFinnhubForexCandles(symbol, timeframe, limit, timeoutMs, env);
+      if (p === "yahoo") candles = await fetchYahooChartCandles(symbol, timeframe, limit, timeoutMs);
+      if (candles) {
+        await setMarketCache(env, cacheKey, candles);
+        return candles;
+      }
     } catch (e) {
       lastErr = e;
       console.error("market provider failed:", p, e?.message || e);
@@ -1427,6 +1979,8 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
   const tf = st.timeframe || "H4";
   const baseRaw = await getAnalysisPrompt(env);
   const sp = await getStylePrompt(env, st.style);
+  const customPrompts = await getCustomPrompts(env);
+  const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
   const base = baseRaw.replaceAll("{TIMEFRAME}", tf);
 
   const userExtra = (isStaff({ username: st.profile?.username }, env) && userPrompt?.trim())
@@ -1437,6 +1991,7 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
     `${base}\n\n` +
     (sp ? `STYLE_PROMPT:\n${sp}\n\n` : ``) +
     (getStyleGuide(st.style) ? `STYLE_GUIDE:\n${getStyleGuide(st.style)}\n\n` : ``) +
+    (customPrompt?.text ? `CUSTOM_PROMPT:\n${customPrompt.text}\n\n` : ``) +
     `ASSET: ${symbol}\n` +
     `USER SETTINGS: Style=${st.style}, Risk=${st.risk}\n\n` +
     `MARKET_DATA:\n${marketBlock}\n\n` +
@@ -1453,10 +2008,13 @@ async function buildVisionPrompt(st, env) {
   const tf = st.timeframe || "H4";
   const baseRaw = await getAnalysisPrompt(env);
   const sp = await getStylePrompt(env, st.style);
+  const customPrompts = await getCustomPrompts(env);
+  const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
   const base = baseRaw.replaceAll("{TIMEFRAME}", tf);
   return (
     `${base}\n\n` +
     (sp ? `STYLE_PROMPT:\n${sp}\n\n` : ``) +
+    (customPrompt?.text ? `CUSTOM_PROMPT:\n${customPrompt.text}\n\n` : ``) +
     `TASK: این تصویر چارت را تحلیل کن. دقیقاً خروجی ۱ تا ۵ بده و سطح‌ها را مشخص کن.\n` +
     `RULES: فقط فارسی، لحن افشاگر، خیال‌بافی نکن.\n`
   );
@@ -1732,15 +2290,30 @@ async function handleUpdate(update, env) {
       return tgSendMessage(env, chatId, profileText(st, from, env), mainMenuKeyboard(env));
     }
 
+    if (text === "/invite" || text === BTN.INVITE) {
+      const { link, share } = inviteShareText(st, env);
+      if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
+      const txt =
+        `🤝 دعوت دوستان\n\n` +
+        `🔗 لینک رفرال اختصاصی:\n${link}\n\n` +
+        (share ? `برای اشتراک‌گذاری سریع:\n${share}\n` : "");
+      return tgSendMessage(env, chatId, txt, mainMenuKeyboard(env));
+    }
+
     if (text === "/education" || text === BTN.EDUCATION) {
-      return tgSendMessage(env, chatId, "📚 آموزش و مفاهیم بازار\n\nبه‌زودی محتوای آموزشی اضافه می‌شود.\nفعلاً برای تعیین سطح روی «🧪 تعیین سطح» بزن.", mainMenuKeyboard(env));
+      return tgSendMessage(env, chatId, "📚 آموزش و مفاهیم بازار\n\nبه‌زودی محتوای آموزشی اضافه می‌شود.", mainMenuKeyboard(env));
     }
 
     if (text === "/support" || text === BTN.SUPPORT) {
       const handle = env.SUPPORT_HANDLE || "@support";
       const wallet = await getWallet(env);
       const walletLine = wallet ? `\n\n💳 آدرس ولت جهت پرداخت:\n${wallet}` : "";
-      return tgSendMessage(env, chatId, `🆘 پشتیبانی\n\nپیام بده به: ${handle}${walletLine}`, mainMenuKeyboard(env));
+      return tgSendMessage(
+        env,
+        chatId,
+        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.\n\nپیام مستقیم: ${handle}${walletLine}`,
+        kb([[BTN.SUPPORT_FAQ, BTN.SUPPORT_TICKET], [BTN.HOME]])
+      );
     }
 
     if (text === "/miniapp" || text === BTN.MINIAPP) {
@@ -1756,14 +2329,12 @@ async function handleUpdate(update, env) {
       return sendUsersList(env, chatId);
     }
 
-    if (text === BTN.LEVELING || text === "/level") {
-      if (!st.profile?.name || !st.profile?.phone) {
-        await tgSendMessage(env, chatId, "برای تعیین سطح، ابتدا پروفایل را کامل کن ✅", mainMenuKeyboard(env));
-        await startOnboarding(env, chatId, from, st);
-        return;
-      }
-      await startLeveling(env, chatId, from, st);
-      return;
+    if (text === BTN.SUPPORT_FAQ || text === "/faq") {
+      st.state = "support_faq";
+      await saveUser(userId, st, env);
+      const faq = getSupportFaq();
+      const list = faq.map((f, i) => `${i + 1}) ${f.q}`).join("\n");
+      return tgSendMessage(env, chatId, `❓ سوالات آماده\n\n${list}\n\nعدد سوال را ارسال کن تا پاسخ را ببینی.`, kb([[BTN.BACK, BTN.HOME]]));
     }
 
     if (text === BTN.HOME) {
@@ -1870,7 +2441,7 @@ async function handleUpdate(update, env) {
     if (text === BTN.SET_STYLE) {
       st.state = "set_style";
       await saveUser(userId, st, env);
-      return tgSendMessage(env, chatId, "🎯 سبک:", optionsKeyboard(["اسکالپ","سوئینگ","اسمارت‌مانی","پرایس اکشن","ICT","ATR"]));
+      return tgSendMessage(env, chatId, "🎯 سبک:", optionsKeyboard(ALLOWED_STYLE_LIST));
     }
     if (text === BTN.SET_RISK) {
       st.state = "set_risk";
@@ -1883,10 +2454,52 @@ async function handleUpdate(update, env) {
       return tgSendMessage(env, chatId, "📰 خبر:", optionsKeyboard(["روشن ✅","خاموش ❌"]));
     }
 
+    if (text === BTN.SUPPORT_FAQ) {
+      st.state = "support_faq";
+      await saveUser(userId, st, env);
+      const faq = getSupportFaq();
+      const list = faq.map((f, i) => `${i + 1}) ${f.q}`).join("\n");
+      return tgSendMessage(env, chatId, `❓ سوالات آماده\n\n${list}\n\nعدد سوال را ارسال کن تا پاسخ را ببینی.`, kb([[BTN.BACK, BTN.HOME]]));
+    }
+
+    if (text === BTN.SUPPORT_TICKET) {
+      st.state = "support_ticket";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "✉️ متن تیکت را بنویس (حداکثر ۳۰۰ کاراکتر):", kb([[BTN.BACK, BTN.HOME]]));
+    }
+
     if (st.state === "set_tf") { st.timeframe = text; st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ تایم‌فریم: ${st.timeframe}`, mainMenuKeyboard(env)); }
-    if (st.state === "set_style") { st.style = text; st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ سبک: ${st.style}`, mainMenuKeyboard(env)); }
+    if (st.state === "set_style") {
+      st.style = ALLOWED_STYLE_LIST.includes(text) ? text : st.style;
+      st.state = "idle";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, `✅ سبک: ${st.style}`, mainMenuKeyboard(env));
+    }
     if (st.state === "set_risk") { st.risk = text; st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ ریسک: ${st.risk}`, mainMenuKeyboard(env)); }
     if (st.state === "set_news") { st.newsEnabled = text.includes("روشن"); st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ خبر: ${st.newsEnabled ? "روشن ✅" : "خاموش ❌"}`, mainMenuKeyboard(env)); }
+    if (st.state === "support_faq") {
+      const idx = Number(text.trim());
+      const faq = getSupportFaq();
+      const item = Number.isFinite(idx) ? faq[idx - 1] : null;
+      st.state = "idle";
+      await saveUser(userId, st, env);
+      if (!item) return tgSendMessage(env, chatId, "عدد معتبر نیست. دوباره تلاش کن.", kb([[BTN.SUPPORT_FAQ, BTN.HOME]]));
+      return tgSendMessage(env, chatId, `✅ پاسخ:\n${item.a}`, kb([[BTN.SUPPORT_FAQ, BTN.HOME]]));
+    }
+    if (st.state === "support_ticket") {
+      const textClean = String(text || "").trim();
+      if (!textClean || textClean.length < 4) {
+        return tgSendMessage(env, chatId, "متن تیکت کوتاه است. لطفاً توضیح بیشتری بده.", kb([[BTN.BACK, BTN.HOME]]));
+      }
+      st.state = "idle";
+      await saveUser(userId, st, env);
+      const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+      if (supportChatId) {
+        await tgSendMessage(env, supportChatId, `📩 تیکت جدید\nکاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}\nشماره: ${st.profile?.phone || "-"}\nمتن:\n${textClean}`);
+        return tgSendMessage(env, chatId, "✅ تیکت شما ارسال شد. پاسخ از طریق پشتیبانی ارسال می‌شود.", mainMenuKeyboard(env));
+      }
+      return tgSendMessage(env, chatId, "⚠️ پشتیبانی در دسترس نیست. لطفاً بعداً تلاش کن.", mainMenuKeyboard(env));
+    }
 
     if (isSymbol(text)) {
       if (!st.profile?.name || !st.profile?.phone) {
@@ -1915,12 +2528,12 @@ async function handleUpdate(update, env) {
       st.state = "idle";
       st.selectedSymbol = "";
 
-      if (env.BOT_KV) {
+      const ok = await runSignalTextFlow(env, chatId, from, st, symbol, "");
+      if (ok && env.BOT_KV) {
         consumeDaily(st, from, env);
+        recordAnalysisSuccess(st);
         await saveUser(userId, st, env);
       }
-
-      await runSignalTextFlow(env, chatId, from, st, symbol, "");
       return;
     }
 
@@ -2083,6 +2696,15 @@ function isSymbol(t) {
 }
 
 /* ========================== TEXTS ========================== */
+function getSupportFaq() {
+  return [
+    { q: "چطور سهمیه روزانه شارژ می‌شود؟", a: "سهمیه هر روز (Kyiv) صفر می‌شود و مجدداً قابل استفاده است." },
+    { q: "چرا تحلیل ناموفق شد؟", a: "اتصال دیتا یا مدل ممکن است موقتاً قطع باشد. چند دقیقه بعد دوباره تلاش کن." },
+    { q: "چطور اشتراک فعال کنم؟", a: "پرداخت را انجام بده و هش تراکنش را برای ادمین ارسال کن تا تأیید و فعال شود." },
+    { q: "چطور رفرال کار می‌کند؟", a: "هر دعوت موفق با شماره جدید ۳ امتیاز دارد. هر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه." },
+  ];
+}
+
 async function sendSettingsSummary(env, chatId, st, from) {
   const quota = isStaff(from, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
   const wallet = await getWallet(env);
@@ -2090,6 +2712,7 @@ async function sendSettingsSummary(env, chatId, st, from) {
     `⚙️ تنظیمات:\n\n` +
     `⏱ تایم‌فریم: ${st.timeframe}\n` +
     `🎯 سبک: ${st.style}\n` +
+    `🧩 پرامپت اختصاصی: ${st.customPromptId || "پیش‌فرض"}\n` +
     `⚠️ ریسک: ${st.risk}\n` +
     `📰 خبر: ${st.newsEnabled ? "روشن ✅" : "خاموش ❌"}\n\n` +
     `سهمیه امروز: ${quota}\n` +
@@ -2106,12 +2729,18 @@ function profileText(st, from, env) {
   const inv = st.referral?.successfulInvites || 0;
 
   const botUser = env.BOT_USERNAME ? String(env.BOT_USERNAME).replace(/^@/, "") : "";
-  const links = (st.referral?.codes || []).slice(0, 5).map((c, i) => {
-    const deep = botUser ? `https://t.me/${botUser}?start=ref_${c}` : `ref_${c}`;
-    return `${i+1}) ${deep}`;
-  }).join("\n");
+  const code = (st.referral?.codes || [])[0] || "";
+  const deep = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "-";
 
-  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Kyiv): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک‌های رفرال (۵ عدد):\n${links}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
+  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Kyiv): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
+}
+
+function inviteShareText(st, env) {
+  const botUser = env.BOT_USERNAME ? String(env.BOT_USERNAME).replace(/^@/, "") : "";
+  const code = (st.referral?.codes || [])[0] || "";
+  const link = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "";
+  const share = link ? `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent("با لینک من عضو شو و اشتراک هدیه بگیر ✅")}` : "";
+  return { link, share };
 }
 
 /* ========================== FLOWS ========================== */
@@ -2120,13 +2749,29 @@ function profileText(st, from, env) {
 QuickChart renders Chart.js configs as images via https://quickchart.io/chart .
 Financial (candlestick/OHLC) charts are supported via chartjs-chart-financial plugin.
 */
-function buildQuickChartCandlestickUrl(candles, symbol, tf) {
+function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
   const items = (candles || []).slice(-60).map((c) => ({
     x: new Date(c.t || c.time || c.ts || c.timestamp || Date.now()).toISOString(),
     o: Number(c.o),
     h: Number(c.h),
     l: Number(c.l),
     c: Number(c.c),
+  }));
+
+  const annotations = (levels || []).slice(0, 6).map((lvl, idx) => ({
+    type: "line",
+    scaleID: "y",
+    value: lvl,
+    borderColor: "rgba(109,94,246,0.65)",
+    borderWidth: 2,
+    borderDash: [4, 4],
+    label: {
+      enabled: true,
+      content: `Zone ${idx + 1}: ${lvl}`,
+      backgroundColor: "rgba(0,0,0,0.6)",
+      color: "#fff",
+      position: "end",
+    },
   }));
 
   // Basic Chart.js + chartjs-chart-financial config
@@ -2137,11 +2782,19 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf) {
         {
           label: `${symbol} ${tf}`,
           data: items,
+          color: {
+            up: "#2FE3A5",
+            down: "#FF4D4D",
+            unchanged: "#888",
+          },
         },
       ],
     },
     options: {
-      plugins: { legend: { display: false } },
+      plugins: {
+        legend: { display: false },
+        annotation: { annotations },
+      },
       scales: {
         x: { ticks: { maxRotation: 0, autoSkip: true } },
       },
@@ -2174,7 +2827,8 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
           // اگر دیتا نداریم، عکس ارسال نکن
           await tgSendMessage(env, chatId, "⚠️ برای این نماد در این تایم‌فریم دیتای کافی پیدا نشد؛ چارت ارسال نشد.", kb([[BTN.HOME]]));
         } else {
-          const chartUrl = buildQuickChartCandlestickUrl(candles, symbol, st.timeframe || "H4");
+          const levels = extractLevels(result);
+          const chartUrl = buildQuickChartCandlestickUrl(candles, symbol, st.timeframe || "H4", levels);
           await tgSendPhoto(env, chatId, chartUrl, `📈 چارت ${symbol} (${st.timeframe || "H4"})`, kb([[BTN.HOME]]));
         }
       } catch (e) {
@@ -2193,35 +2847,79 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
     for (const part of chunkText(result, 3500)) {
       await tgSendMessage(env, chatId, part, mainMenuKeyboard(env));
     }
+    return true;
   } catch (e) {
     console.error("runSignalTextFlow error:", e);
     t.stop = true;
     await tgSendMessage(env, chatId, "⚠️ فعلاً امکان انجام این عملیات نیست. لطفاً بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
+    return false;
   }
 }
 
-async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {let candles = [];
-        try {
-          candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4");
-        } catch (e) {
-          console.error("market provider failed (all)", e?.message || e);
-          candles = [];
-        }
-  const snap = computeSnapshot(candles);
-  const ohlc = candlesToCompactCSV(candles, 80);
+function analysisCacheKey(symbol, st) {
+  const tf = st.timeframe || "H4";
+  const style = st.style || "";
+  const risk = st.risk || "";
+  const news = st.newsEnabled ? "1" : "0";
+  return `analysis:${String(symbol).toUpperCase()}:${tf}:${style}:${risk}:${news}`;
+}
 
-  const marketBlock =
+async function getAnalysisCache(env, key) {
+  const mem = cacheGet(ANALYSIS_CACHE, key);
+  if (mem) return mem;
+  const r2 = await getCachedR2Value(env.MARKET_R2, key);
+  if (r2) cacheSet(ANALYSIS_CACHE, key, r2, Number(env.ANALYSIS_CACHE_TTL_MS || 120000));
+  return r2;
+}
+
+async function setAnalysisCache(env, key, value) {
+  const ttlMs = Number(env.ANALYSIS_CACHE_TTL_MS || 120000);
+  cacheSet(ANALYSIS_CACHE, key, value, ttlMs);
+  await r2PutJson(env.MARKET_R2, key, value, ttlMs);
+}
+
+function buildMarketBlock(candles, maxRows) {
+  const snap = computeSnapshot(candles);
+  const ohlc = candlesToCompactCSV(candles, maxRows);
+  return (
     `lastPrice=${snap?.lastPrice}\n` +
     `changePct=${snap?.changePct}%\n` +
     `trend=${snap?.trend}\n` +
     `range50_hi=${snap?.range50?.hi} range50_lo=${snap?.range50?.lo}\n` +
     `sma20=${snap?.sma20} sma50=${snap?.sma50}\n` +
     `lastTs=${snap?.lastTs}\n\n` +
-    `OHLC_CSV(t,o,h,l,c):\n${ohlc}`;
+    `OHLC_CSV(t,o,h,l,c):\n${ohlc}`
+  );
+}
 
+async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
+  const useCache = !userPrompt && !isStaff(from, env);
+  const cacheKey = useCache ? analysisCacheKey(symbol, st) : "";
+  if (useCache) {
+    const cached = await getAnalysisCache(env, cacheKey);
+    if (cached) return cached;
+  }
+
+  let candles = [];
+  try {
+    candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4");
+  } catch (e) {
+    console.error("market provider failed (all)", e?.message || e);
+    candles = [];
+  }
+  const marketBlock = buildMarketBlock(candles, 80);
   const prompt = await buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env);
-  const draft = await runTextProviders(prompt, env, st.textOrder);
+  let draft = "";
+  try {
+    draft = await runTextProviders(prompt, env, st.textOrder);
+  } catch (e) {
+    console.error("text providers failed (retry compact):", e?.message || e);
+    const compactBlock = buildMarketBlock(candles, 40);
+    const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env);
+    draft = await runTextProviders(compactPrompt, env, st.textOrder);
+  }
   const polished = await runPolishProviders(draft, env, st.polishOrder);
+  if (useCache && polished) await setAnalysisCache(env, cacheKey, polished);
   return polished;
 }
 
@@ -2240,11 +2938,6 @@ async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
     const filePath = await tgGetFilePath(env, fileId);
     if (!filePath) throw new Error("no_file_path");
     const imageUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`;
-
-    if (env.BOT_KV) {
-      consumeDaily(st, from, env);
-      await saveUser(userId, st, env);
-    }
 
     const vPrompt = await buildVisionPrompt(st, env);
     const visionRaw = await runVisionProviders(imageUrl, vPrompt, env, st.visionOrder);
@@ -2272,6 +2965,11 @@ async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
 
     for (const part of chunkText(polished, 3500)) {
       await tgSendMessage(env, chatId, part, mainMenuKeyboard(env));
+    }
+    if (env.BOT_KV) {
+      consumeDaily(st, from, env);
+      recordAnalysisSuccess(st);
+      await saveUser(userId, st, env);
     }
   } catch (e) {
     console.error("handleVisionFlow error:", e);
@@ -2611,6 +3309,33 @@ const MINI_APP_HTML = `<!doctype html>
     }
     @keyframes spin{ to { transform: rotate(360deg); } }
     .muted{ color: var(--muted); }
+    .offer{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap: 12px;
+      padding: 16px;
+      border-radius: 20px;
+      background: linear-gradient(135deg, rgba(109,94,246,.24), rgba(0,209,255,.12));
+      border: 1px solid rgba(109,94,246,.35);
+    }
+    .offer h3{ margin:0; font-size: 15px; }
+    .offer p{ margin:6px 0 0; font-size: 12px; color: var(--muted); }
+    .offer .tag{
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      border: 1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.08);
+    }
+    .admin-card{ display:none; }
+    .admin-card.show{ display:block; }
+    .owner-hide.hidden{ display:none; }
+    .admin-grid{ display:grid; gap: 10px; }
+    .admin-row{ display:flex; gap:8px; flex-wrap:wrap; }
+    .admin-row .control{ flex:1; min-width: 140px; }
+    textarea.control{ min-height: 120px; resize: vertical; }
+    .mini-list{ font-size: 12px; color: var(--muted); white-space: pre-wrap; }
   </style>
 </head>
 <body>
@@ -2627,6 +3352,15 @@ const MINI_APP_HTML = `<!doctype html>
     </div>
 
     <div class="grid">
+      <div class="card">
+        <div class="card-b offer" id="offerCard">
+          <div>
+            <h3>🎁 پیشنهاد ویژه</h3>
+            <p id="offerText">فعال‌سازی اشتراک ویژه با تخفیف محدود.</p>
+          </div>
+          <div class="tag" id="offerTag">Special</div>
+        </div>
+      </div>
       <div class="card">
         <div class="card-h">
           <strong>تحلیل سریع</strong>
@@ -2664,14 +3398,11 @@ const MINI_APP_HTML = `<!doctype html>
             </div>
             <div class="field">
               <div class="label">سبک</div>
-              <select id="style" class="control">
-                <option value="اسکالپ">اسکالپ</option>
-                <option value="سوئینگ">سوئینگ</option>
-                <option value="اسمارت‌مانی" selected>اسمارت‌مانی</option>
-                <option value="پرایس اکشن">پرایس اکشن</option>
-                <option value="ICT">ICT</option>
-                <option value="ATR">ATR</option>
-              </select>
+              <select id="style" class="control"></select>
+            </div>
+            <div class="field">
+              <div class="label">پرامپت اختصاصی</div>
+              <select id="customPrompt" class="control"></select>
             </div>
             <div class="field">
               <div class="label">ریسک</div>
@@ -2704,6 +3435,103 @@ const MINI_APP_HTML = `<!doctype html>
 
         <div class="out" id="out">آماده…</div>
       </div>
+
+      <div class="card admin-card" id="adminCard">
+        <div class="card-h">
+          <strong id="adminTitle">پنل ادمین</strong>
+          <span>مدیریت پرامپت، سبک‌ها، پرداخت و کمیسیون</span>
+        </div>
+        <div class="card-b admin-grid">
+          <div class="field">
+            <div class="label">پرامپت اصلی تحلیل</div>
+            <textarea id="adminPrompt" class="control" placeholder="پرامپت اصلی تحلیل..."></textarea>
+            <div class="actions">
+              <button id="savePrompt" class="btn primary">ذخیره پرامپت</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">پرامپت سبک‌ها (JSON)</div>
+            <textarea id="stylePromptJson" class="control" placeholder='{"پرایس_اکشن":"...","ict":"...","atr":"..."}'></textarea>
+            <div class="actions">
+              <button id="saveStylePrompts" class="btn">ذخیره JSON سبک‌ها</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">مدیریت سبک‌ها</div>
+            <div class="admin-row">
+              <input id="newStyle" class="control" placeholder="سبک جدید" />
+              <button id="addStyle" class="btn">افزودن سبک</button>
+            </div>
+            <div class="admin-row">
+              <input id="removeStyleName" class="control" placeholder="نام سبک برای حذف" />
+              <button id="removeStyle" class="btn ghost">حذف سبک</button>
+            </div>
+            <div class="mini-list" id="styleList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">کمیسیون دعوت</div>
+            <div class="admin-row">
+              <input id="globalCommission" class="control" placeholder="درصد کمیسیون کلی (مثلاً 5)" />
+              <button id="saveGlobalCommission" class="btn">ذخیره کلی</button>
+            </div>
+            <div class="admin-row">
+              <input id="commissionUser" class="control" placeholder="یوزرنیم خاص (@user)" />
+              <input id="commissionPercent" class="control" placeholder="درصد برای کاربر خاص" />
+              <button id="saveUserCommission" class="btn">ذخیره کاربر</button>
+            </div>
+            <div class="mini-list" id="commissionList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">سهمیه رایگان روزانه</div>
+            <div class="admin-row">
+              <input id="freeDailyLimit" class="control" placeholder="مثلاً 3" />
+              <button id="saveFreeLimit" class="btn">ذخیره سهمیه</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">پرامپت‌های اختصاصی (JSON)</div>
+            <textarea id="customPromptsJson" class="control" placeholder='[{"id":"p1","title":"VIP","text":"..."}]'></textarea>
+            <div class="actions">
+              <button id="saveCustomPrompts" class="btn">ذخیره پرامپت‌های اختصاصی</button>
+            </div>
+            <div class="admin-row">
+              <input id="customPromptUser" class="control" placeholder="یوزرنیم کاربر" />
+              <input id="customPromptId" class="control" placeholder="شناسه پرامپت" />
+              <button id="sendCustomPrompt" class="btn ghost">ارسال به کاربر</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">تأیید پرداخت و فعال‌سازی اشتراک</div>
+            <div class="admin-row">
+              <input id="payUsername" class="control" placeholder="یوزرنیم خریدار" />
+              <input id="payAmount" class="control" placeholder="مبلغ" />
+              <input id="payDays" class="control" placeholder="روزهای اشتراک" />
+              <input id="payDailyLimit" class="control" placeholder="سهمیه روزانه اشتراک" />
+            </div>
+            <div class="admin-row">
+              <input id="payTx" class="control" placeholder="هش تراکنش" />
+              <button id="approvePayment" class="btn primary">تأیید و فعال‌سازی</button>
+              <button id="checkPayment" class="btn ghost">چک بلاک‌چین</button>
+              <button id="activateSubscription" class="btn">فعال‌سازی دستی</button>
+            </div>
+            <div class="mini-list" id="paymentList">—</div>
+          </div>
+
+          <div class="field owner-hide" id="reportBlock">
+            <div class="label">گزارش کاربران</div>
+            <div class="actions">
+              <button id="loadUsers" class="btn">دریافت گزارش</button>
+            </div>
+            <div class="mini-list" id="usersReport">—</div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -2729,6 +3557,11 @@ const meta = document.getElementById("meta");
 const sub = document.getElementById("sub");
 const pillTxt = document.getElementById("pillTxt");
 const welcome = document.getElementById("welcome");
+const offerText = document.getElementById("offerText");
+const offerTag = document.getElementById("offerTag");
+const adminCard = document.getElementById("adminCard");
+const adminTitle = document.getElementById("adminTitle");
+const reportBlock = document.getElementById("reportBlock");
 
 function el(id){ return document.getElementById(id); }
 function val(id){ return el(id).value; }
@@ -2741,6 +3574,8 @@ const toastB = el("toastB");
 const spin = el("spin");
 
 let ALL_SYMBOLS = [];
+let INIT_DATA = "";
+let IS_STAFF = false;
 
 function showToast(title, subline = "", badge = "", loading = false){
   toastT.textContent = title || "";
@@ -2763,6 +3598,38 @@ function fillSymbols(list){
     sel.appendChild(opt);
   }
   if (cur && ALL_SYMBOLS.includes(cur)) sel.value = cur;
+}
+
+function fillStyles(list){
+  const styles = Array.isArray(list) ? list.slice() : [];
+  const sel = el("style");
+  const cur = sel.value;
+  sel.innerHTML = "";
+  for (const s of styles) {
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    sel.appendChild(opt);
+  }
+  if (cur && styles.includes(cur)) sel.value = cur;
+}
+
+function fillCustomPrompts(list){
+  const prompts = Array.isArray(list) ? list.slice() : [];
+  const sel = el("customPrompt");
+  const cur = sel.value;
+  sel.innerHTML = "";
+  const defaultOpt = document.createElement("option");
+  defaultOpt.value = "";
+  defaultOpt.textContent = "پیش‌فرض";
+  sel.appendChild(defaultOpt);
+  for (const p of prompts) {
+    const opt = document.createElement("option");
+    opt.value = String(p?.id || "");
+    opt.textContent = p?.title ? `${p.title}` : String(p?.id || "");
+    sel.appendChild(opt);
+  }
+  if (cur) sel.value = cur;
 }
 
 function filterSymbols(q){
@@ -2797,6 +3664,11 @@ async function api(path, body){
   return { status: r.status, json: j };
 }
 
+async function adminApi(path, body){
+  if (!IS_STAFF) return { status: 403, json: { ok: false, error: "forbidden" } };
+  return api(path, { initData: INIT_DATA, ...body });
+}
+
 function prettyErr(j, status){
   const e = j?.error || "نامشخص";
   if (status === 429 && String(e).startsWith("quota_exceeded")) return "سهمیه امروز تمام شد.";
@@ -2810,12 +3682,53 @@ function updateMeta(state, quota){
   sub.textContent = \`ID: \${state?.userId || "-"} | امروز(Kyiv): \${state?.dailyDate || "-"}\`;
 }
 
+function renderStyleList(styles){
+  const target = el("styleList");
+  if (!target) return;
+  target.textContent = Array.isArray(styles) && styles.length ? styles.join(" • ") : "—";
+}
+
+function renderCommissionList(commission){
+  const target = el("commissionList");
+  if (!target) return;
+  const global = commission?.globalPercent ?? 0;
+  const overrides = commission?.overrides || {};
+  const lines = [\`کلی: \${global}%\`];
+  for (const [k, v] of Object.entries(overrides)) lines.push(\`\${k}: \${v}%\`);
+  target.textContent = lines.join("\\n");
+}
+
+function renderPayments(list){
+  const target = el("paymentList");
+  if (!target) return;
+  if (!Array.isArray(list) || !list.length) { target.textContent = "—"; return; }
+  target.textContent = list.slice(0, 8).map((p) => {
+    const who = p.username || p.userId;
+    return \`• \${who} | \${p.amount} | \${p.status} | \${p.txHash || "—"}\`;
+  }).join("\\n");
+}
+
+function renderUsers(list){
+  const target = el("usersReport");
+  if (!target) return;
+  if (!Array.isArray(list) || !list.length) { target.textContent = "—"; return; }
+  target.textContent = list.map((u) => {
+    const user = u.username ? \`@\${u.username.replace(/^@/, "")}\` : u.userId;
+    return \`• \${user} | تلفن: \${u.phone || "—"} | مدت: \${u.usageDays} روز | تحلیل موفق: \${u.totalAnalyses} | آخرین تحلیل: \${u.lastAnalysisAt || "—"} | پرداخت: \${u.paymentCount} (\${u.paymentTotal || 0}) | اشتراک: \${u.subscriptionType || "free"} | انقضا: \${u.subscriptionExpiresAt || "—"} | سهمیه: \${u.dailyUsed}/\${u.dailyLimit} | رفرال: \${u.referralInvites} | TX: \${u.lastTxHash || "—"} | پرامپت: \${u.customPromptId || "—"}\`;
+  }).join("\\n");
+}
+
+function safeJsonParse(text, fallback) {
+  try { return JSON.parse(text); } catch { return fallback; }
+}
+
 async function boot(){
   out.textContent = "⏳ در حال آماده‌سازی…";
   pillTxt.textContent = "Connecting…";
   showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
 
   const initData = tg?.initData || "";
+  INIT_DATA = initData;
   const {status, json} = await api("/api/user", { initData });
 
   if (!json?.ok) {
@@ -2828,17 +3741,48 @@ async function boot(){
 
   welcome.textContent = json.welcome || "";
   fillSymbols(json.symbols || []);
+  const styleList = json.styles || [];
+  fillStyles(styleList);
+  fillCustomPrompts(json.customPrompts || []);
   if (json.state?.timeframe) setTf(json.state.timeframe);
-  if (json.state?.style) setVal("style", json.state.style);
+  if (json.state?.style && styleList.includes(json.state.style)) {
+    setVal("style", json.state.style);
+  } else if (styleList.length) {
+    setVal("style", styleList[0]);
+  }
   if (json.state?.risk) setVal("risk", json.state.risk);
+  if (typeof json.state?.customPromptId === "string") setVal("customPrompt", json.state.customPromptId);
   setVal("newsEnabled", String(!!json.state?.newsEnabled));
 
   if (json.symbols?.length) setVal("symbol", json.symbols[0]);
+  if (offerText) offerText.textContent = json.offerBanner || "فعال‌سازی اشتراک ویژه با تخفیف محدود.";
+  if (offerTag) offerTag.textContent = json.role === "owner" ? "Owner" : "Special";
 
   updateMeta(json.state, json.quota);
   out.textContent = "آماده ✅";
   pillTxt.textContent = "Online";
   hideToast();
+
+  IS_STAFF = !!json.isStaff;
+  if (IS_STAFF && adminCard) {
+    adminCard.classList.add("show");
+    if (adminTitle) adminTitle.textContent = json.role === "owner" ? "پنل اونر" : "پنل ادمین";
+    if (json.role === "owner" && reportBlock) reportBlock.classList.add("hidden");
+    await loadAdminBootstrap();
+  }
+}
+
+async function loadAdminBootstrap(){
+  const { json } = await adminApi("/api/admin/bootstrap", {});
+  if (!json?.ok) return;
+  if (el("adminPrompt")) el("adminPrompt").value = json.prompt || "";
+  if (el("stylePromptJson")) el("stylePromptJson").value = JSON.stringify(json.stylePrompts || {}, null, 2);
+  if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(json.customPrompts || [], null, 2);
+  if (el("freeDailyLimit")) el("freeDailyLimit").value = String(json.freeDailyLimit ?? "");
+  renderStyleList(json.styles || []);
+  renderCommissionList(json.commission || {});
+  renderPayments(json.payments || []);
+  if (offerText && json.offerBanner) offerText.textContent = json.offerBanner;
 }
 
 el("q").addEventListener("input", (e) => filterSymbols(e.target.value));
@@ -2861,6 +3805,7 @@ el("save").addEventListener("click", async () => {
     style: val("style"),
     risk: val("risk"),
     newsEnabled: val("newsEnabled") === "true",
+    customPromptId: val("customPrompt") || "",
   };
 
   const {status, json} = await api("/api/settings", payload);
@@ -2898,5 +3843,113 @@ el("analyze").addEventListener("click", async () => {
 });
 
 el("close").addEventListener("click", () => tg?.close());
+
+el("savePrompt")?.addEventListener("click", async () => {
+  const prompt = el("adminPrompt")?.value || "";
+  const { json } = await adminApi("/api/admin/prompt", { prompt });
+  if (json?.ok) showToast("ذخیره شد ✅", "پرامپت بروزرسانی شد", "ADM", false);
+});
+
+el("saveStylePrompts")?.addEventListener("click", async () => {
+  const raw = el("stylePromptJson")?.value || "{}";
+  const stylePrompts = safeJsonParse(raw, {});
+  const { json } = await adminApi("/api/admin/style-prompts", { stylePrompts });
+  if (json?.ok) showToast("ذخیره شد ✅", "JSON سبک‌ها بروزرسانی شد", "ADM", false);
+});
+
+el("addStyle")?.addEventListener("click", async () => {
+  const style = el("newStyle")?.value || "";
+  const { json } = await adminApi("/api/admin/styles", { action: "add", style });
+  if (json?.ok) {
+    renderStyleList(json.styles || []);
+    fillStyles(json.styles || []);
+  }
+});
+
+el("removeStyle")?.addEventListener("click", async () => {
+  const style = el("removeStyleName")?.value || "";
+  const { json } = await adminApi("/api/admin/styles", { action: "remove", style });
+  if (json?.ok) {
+    renderStyleList(json.styles || []);
+    fillStyles(json.styles || []);
+  }
+});
+
+el("saveGlobalCommission")?.addEventListener("click", async () => {
+  const percent = Number(el("globalCommission")?.value || 0);
+  const { json } = await adminApi("/api/admin/commissions", { action: "setGlobal", percent });
+  if (json?.ok) renderCommissionList(json.commission || {});
+});
+
+el("saveUserCommission")?.addEventListener("click", async () => {
+  const username = el("commissionUser")?.value || "";
+  const percent = Number(el("commissionPercent")?.value || 0);
+  const { json } = await adminApi("/api/admin/commissions", { action: "setOverride", username, percent });
+  if (json?.ok) renderCommissionList(json.commission || {});
+});
+
+el("saveFreeLimit")?.addEventListener("click", async () => {
+  const limit = Number(el("freeDailyLimit")?.value || 3);
+  const { json } = await adminApi("/api/admin/free-limit", { limit });
+  if (json?.ok) showToast("ذخیره شد ✅", "سهمیه رایگان بروزرسانی شد", "ADM", false);
+});
+
+el("saveCustomPrompts")?.addEventListener("click", async () => {
+  const raw = el("customPromptsJson")?.value || "[]";
+  const customPrompts = safeJsonParse(raw, []);
+  const { json } = await adminApi("/api/admin/custom-prompts", { customPrompts });
+  if (json?.ok) {
+    showToast("ذخیره شد ✅", "پرامپت‌های اختصاصی بروزرسانی شد", "ADM", false);
+    fillCustomPrompts(json.customPrompts || []);
+  }
+});
+
+el("sendCustomPrompt")?.addEventListener("click", async () => {
+  const username = el("customPromptUser")?.value || "";
+  const promptId = el("customPromptId")?.value || "";
+  const { json } = await adminApi("/api/admin/custom-prompts/send", { username, promptId });
+  if (json?.ok) showToast("ارسال شد ✅", "پرامپت برای کاربر ارسال شد", "ADM", false);
+});
+
+el("approvePayment")?.addEventListener("click", async () => {
+  const payload = {
+    username: el("payUsername")?.value || "",
+    amount: Number(el("payAmount")?.value || 0),
+    days: Number(el("payDays")?.value || 30),
+    txHash: el("payTx")?.value || "",
+  };
+  const { json } = await adminApi("/api/admin/payments/approve", payload);
+  if (json?.ok) {
+    showToast("پرداخت تایید شد ✅", "اشتراک فعال شد", "PAY", false);
+    renderPayments([json.payment].filter(Boolean));
+  } else {
+    showToast("خطا", "تایید پرداخت ناموفق بود", "PAY", false);
+  }
+});
+
+el("checkPayment")?.addEventListener("click", async () => {
+  const payload = {
+    txHash: el("payTx")?.value || "",
+    amount: Number(el("payAmount")?.value || 0),
+    address: "",
+  };
+  const { json } = await adminApi("/api/admin/payments/check", payload);
+  if (json?.ok) showToast("نتیجه بلاک‌چین", JSON.stringify(json.result || {}), "CHAIN", false);
+});
+
+el("activateSubscription")?.addEventListener("click", async () => {
+  const payload = {
+    username: el("payUsername")?.value || "",
+    days: Number(el("payDays")?.value || 30),
+    dailyLimit: Number(el("payDailyLimit")?.value || 50),
+  };
+  const { json } = await adminApi("/api/admin/subscription/activate", payload);
+  if (json?.ok) showToast("اشتراک فعال شد ✅", "فعال‌سازی دستی انجام شد", "ADM", false);
+});
+
+el("loadUsers")?.addEventListener("click", async () => {
+  const { json } = await adminApi("/api/admin/users", { limit: 120 });
+  if (json?.ok) renderUsers(json.users || []);
+});
 
 boot();`;
