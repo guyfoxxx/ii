@@ -72,6 +72,30 @@ export default {
         return jsonResponse({ ok: true, state: st, quota });
       }
 
+      if (url.pathname === "/api/support/ticket" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
+        const st = await ensureUser(v.userId, env);
+        const text = String(body.text || "").trim();
+        if (!text || text.length < 4) return jsonResponse({ ok: false, error: "ticket_too_short" }, 400);
+
+        const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+        if (!supportChatId) return jsonResponse({ ok: false, error: "support_unavailable" }, 503);
+
+        const clipped = text.slice(0, 300);
+        await tgSendMessage(
+          env,
+          supportChatId,
+          `📩 تیکت جدید (مینی‌اپ)\nکاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}\nشماره: ${st.profile?.phone || "-"}\nمتن:\n${clipped}`
+        );
+
+        return jsonResponse({ ok: true });
+      }
+
       if (url.pathname.startsWith("/api/admin/") && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
@@ -1357,7 +1381,7 @@ async function tgSendPhoto(env, chatId, photoUrl, caption, replyMarkup) {
   });
 }
 
-async function tgSendPhotoUpload(env, chatId, photoBytes, filename = "chart.png", caption, replyMarkup) {
+async function tgSendPhotoUpload(env, chatId, photoBytes, filename = "chart.png", caption, replyMarkup, contentType = "image/png") {
   const boundary = "----tgform" + Math.random().toString(16).slice(2);
   const CRLF = "\r\n";
 
@@ -1382,7 +1406,7 @@ async function tgSendPhotoUpload(env, chatId, photoBytes, filename = "chart.png"
 
   push(`--${boundary}${CRLF}`);
   push(`Content-Disposition: form-data; name="photo"; filename="${filename}"${CRLF}`);
-  push(`Content-Type: image/png${CRLF}${CRLF}`);
+  push(`Content-Type: ${contentType}${CRLF}${CRLF}`);
   push(new Uint8Array(photoBytes));
   push(CRLF);
 
@@ -1400,15 +1424,39 @@ async function tgSendPhotoUpload(env, chatId, photoBytes, filename = "chart.png"
   return j;
 }
 
+async function fetchPhotoBytes(env, photoUrl) {
+  const timeoutMs = Number(env.TELEGRAM_PHOTO_FETCH_TIMEOUT_MS || 7000);
+  const maxBytes = Number(env.TELEGRAM_UPLOAD_MAX_BYTES || 4000000);
+  const r = await fetchWithTimeout(photoUrl, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; MarketiQ/1.0)",
+      "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    },
+  }, timeoutMs);
+  if (!r.ok) throw new Error(`photo_fetch_${r.status}`);
+  const buf = await r.arrayBuffer();
+  if (buf.byteLength > maxBytes) throw new Error("photo_too_large");
+  return { buf, contentType: detectMimeFromHeaders(r, "image/png") };
+}
+
 async function tgSendPhotoSmart(env, chatId, photoUrl, caption, replyMarkup) {
+  try {
+    const shouldUploadFirst = /quickchart\.io/i.test(photoUrl) || /\/api\/chart/i.test(photoUrl);
+    if (shouldUploadFirst) {
+      const { buf, contentType } = await fetchPhotoBytes(env, photoUrl);
+      const upload = await tgSendPhotoUpload(env, chatId, buf, "chart.png", caption, replyMarkup, contentType);
+      if (upload?.ok) return upload;
+    }
+  } catch (e) {
+    console.error("tgSendPhotoSmart prefetch failed:", e?.message || e);
+  }
+
   const j = await tgSendPhoto(env, chatId, photoUrl, caption, replyMarkup);
   if (j?.ok) return j;
 
   try {
-    const r = await fetch(photoUrl);
-    if (!r.ok) return j;
-    const buf = await r.arrayBuffer();
-    return await tgSendPhotoUpload(env, chatId, buf, "chart.png", caption, replyMarkup);
+    const { buf, contentType } = await fetchPhotoBytes(env, photoUrl);
+    return await tgSendPhotoUpload(env, chatId, buf, "chart.png", caption, replyMarkup, contentType);
   } catch (e) {
     console.error("tgSendPhotoSmart fallback failed:", e?.message || e);
     return j;
@@ -1792,6 +1840,7 @@ function mapTimeframeToTwelve(tf) {
 }
 function mapForexSymbolForTwelve(symbol) {
   if (/^[A-Z]{6}$/.test(symbol)) return `${symbol.slice(0,3)}/${symbol.slice(3,6)}`;
+  if (symbol.endsWith("USDT") && symbol.length > 4) return `${symbol.slice(0, -4)}/USDT`;
   if (symbol === "XAUUSD") return "XAU/USD";
   if (symbol === "XAGUSD") return "XAG/USD";
   return symbol;
@@ -1839,8 +1888,8 @@ async function fetchBinanceCandles(symbol, timeframe, limit, timeoutMs) {
   if (!symbol.endsWith("USDT")) throw new Error("binance_not_crypto");
   const interval = mapTimeframeToBinance(timeframe);
   const urls = [
-    `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`,
     `https://data-api.binance.vision/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`,
+    `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`,
     `https://api.binance.us/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`,
   ];
   let lastErr = null;
@@ -2069,6 +2118,24 @@ async function setMarketCache(env, key, value) {
   await r2PutJson(env.MARKET_R2, key, value, ttlMs);
 }
 
+function defaultMarketProviders(kind) {
+  if (kind === "crypto") return ["twelvedata", "binance", "yahoo"];
+  if (kind === "forex") return ["twelvedata", "alphavantage", "finnhub", "yahoo"];
+  if (kind === "metal") return ["twelvedata", "alphavantage", "yahoo"];
+  if (kind === "index") return ["yahoo", "twelvedata"];
+  return ["yahoo", "twelvedata", "binance", "alphavantage", "finnhub"];
+}
+
+function providerSupportsSymbol(provider, symbol) {
+  const kind = assetKind(symbol);
+  if (provider === "binance") return kind === "crypto";
+  if (provider === "alphavantage") return kind === "forex" || kind === "metal";
+  if (provider === "finnhub") return kind === "forex";
+  if (provider === "twelvedata") return kind !== "unknown";
+  if (provider === "yahoo") return kind !== "unknown";
+  return true;
+}
+
 async function getMarketCandlesWithFallback(env, symbol, timeframe) {
   const timeoutMs = Number(env.MARKET_DATA_TIMEOUT_MS || 7000);
   const limit = Number(env.MARKET_DATA_CANDLES_LIMIT || 120);
@@ -2076,11 +2143,13 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
   const cached = await getMarketCache(env, cacheKey);
   if (cached) return cached;
 
-  const chain = parseOrder(env.MARKET_DATA_PROVIDER_ORDER, ["binance","twelvedata","alphavantage","finnhub","yahoo"]);
+  const kind = assetKind(symbol);
+  const chain = parseOrder(env.MARKET_DATA_PROVIDER_ORDER, defaultMarketProviders(kind));
   let lastErr = null;
 
   for (const p of chain) {
     try {
+      if (!providerSupportsSymbol(p, symbol)) continue;
       let candles = null;
       if (p === "binance") candles = await fetchBinanceCandles(symbol, timeframe, limit, timeoutMs);
       if (p === "twelvedata") candles = await fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env);
@@ -3637,6 +3706,15 @@ const MINI_APP_HTML = `<!doctype html>
 
           <div style="height:10px"></div>
           <div class="muted" style="font-size:12px; line-height:1.6;" id="welcome"></div>
+
+          <div style="height:12px"></div>
+          <div class="field">
+            <div class="label">ارسال تیکت</div>
+            <textarea id="supportTicketText" class="control" placeholder="پیام پشتیبانی را اینجا بنویس (حداکثر ۳۰۰ کاراکتر)..." maxlength="300"></textarea>
+            <div class="actions">
+              <button id="sendTicket" class="btn ghost">✉️ ارسال تیکت</button>
+            </div>
+          </div>
         </div>
 
         <div class="out" id="out">آماده…</div>
@@ -3890,6 +3968,7 @@ function prettyErr(j, status){
   if (status === 429 && String(e).startsWith("quota_exceeded")) return "سهمیه امروز تمام شد.";
   if (status === 403 && String(e) === "onboarding_required") return "ابتدا نام و شماره را داخل ربات ثبت کنید.";
   if (status === 401) return "احراز هویت تلگرام ناموفق است.";
+  if (status === 503 && String(e) === "support_unavailable") return "پشتیبانی فعلاً در دسترس نیست.";
   return "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.";
 }
 
@@ -4068,6 +4147,26 @@ el("analyze").addEventListener("click", async () => {
   }
   updateMeta(json.state, json.quota);
   showToast("آماده ✅", "خروجی دریافت شد", "OK", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("sendTicket")?.addEventListener("click", async () => {
+  const text = el("supportTicketText")?.value || "";
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length < 4) {
+    showToast("خطا", "متن تیکت کوتاه است.", "SUP", false);
+    return;
+  }
+  showToast("در حال ارسال…", "تیکت شما ارسال می‌شود", "SUP", true);
+
+  const { status, json } = await api("/api/support/ticket", { initData: INIT_DATA, text: trimmed });
+  if (!json?.ok) {
+    showToast("خطا", prettyErr(json, status), "SUP", false);
+    return;
+  }
+
+  if (el("supportTicketText")) el("supportTicketText").value = "";
+  showToast("ارسال شد ✅", "تیکت شما ثبت شد", "SUP", false);
   setTimeout(hideToast, 1200);
 });
 
