@@ -72,29 +72,6 @@ export default {
         return jsonResponse({ ok: true, state: st, quota });
       }
 
-      if (url.pathname === "/api/support/ticket" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
-
-        const st = await ensureUser(v.userId, env);
-        const text = String(body.text || "").trim();
-        if (!text || text.length < 4) return jsonResponse({ ok: false, error: "ticket_too_short" }, 400);
-        if (text.length > 300) return jsonResponse({ ok: false, error: "ticket_too_long" }, 400);
-
-        const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
-        if (!supportChatId) return jsonResponse({ ok: false, error: "support_unavailable" }, 503);
-
-        await tgSendMessage(
-          env,
-          supportChatId,
-          `📩 تیکت جدید (Mini App)\nکاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}\nشماره: ${st.profile?.phone || "-"}\nمتن:\n${text}`
-        );
-        return jsonResponse({ ok: true });
-      }
-
       if (url.pathname.startsWith("/api/admin/") && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
@@ -310,37 +287,7 @@ export default {
         }
       }
 
-      
-      if (url.pathname === "/api/chart" && request.method === "GET") {
-        const q = url.searchParams;
-        const symbol = String(q.get("symbol") || "").trim();
-        const tf = String(q.get("tf") || "H4").trim() || "H4";
-        const levelsParam = String(q.get("levels") || "").trim();
-        if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
-
-        const levels = (levelsParam ? levelsParam.split(",") : [])
-          .map((s) => Number(String(s).trim()))
-          .filter((n) => Number.isFinite(n))
-          .slice(0, 6);
-
-        try {
-          const candles = await getMarketCandlesWithFallback(env, symbol, tf);
-          const buf = await renderQuickChartPng(env, candles, symbol, tf, levels);
-          return new Response(buf, {
-            status: 200,
-            headers: {
-              "Content-Type": "image/png",
-              "Cache-Control": "public, max-age=60",
-              "Access-Control-Allow-Origin": "*",
-            },
-          });
-        } catch (e) {
-          console.error("api/chart error:", e?.message || e);
-          return jsonResponse({ ok: false, error: "chart_error" }, 500);
-        }
-      }
-
-if (url.pathname === "/api/analyze" && request.method === "POST") {
+      if (url.pathname === "/api/analyze" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
@@ -480,6 +427,7 @@ const BTN = {
   SUPPORT_TICKET: "✉️ ارسال تیکت",
   SUPPORT_FAQ: "❓ سوالات آماده",
   EDUCATION: "📚 آموزش",
+  LEVELING: "🧪 تعیین سطح",
   BACK: "⬅️ برگشت",
   HOME: "🏠 منوی اصلی",
   MINIAPP: "🧩 مینی‌اپ",
@@ -1069,7 +1017,16 @@ function kb(rows) {
 }
 
 function mainMenuKeyboard(env) {
-  return kb([[BTN.SIGNAL, BTN.SETTINGS], [BTN.WALLET, BTN.PROFILE], [BTN.INVITE, BTN.SUPPORT], [BTN.EDUCATION], [BTN.HOME]]);
+  const url = getMiniappUrl(env);
+  const miniRow = url ? [{ text: BTN.MINIAPP, web_app: { url } }] : [BTN.MINIAPP];
+  return kb([
+    [BTN.SIGNAL, BTN.SETTINGS],
+    [BTN.WALLET, BTN.PROFILE],
+    [BTN.INVITE, BTN.SUPPORT],
+    [BTN.EDUCATION, BTN.LEVELING],
+    miniRow,
+    [BTN.HOME],
+  ]);
 }
 
 function signalMenuKeyboard() {
@@ -2552,6 +2509,16 @@ async function handleUpdate(update, env) {
       return sendUsersList(env, chatId);
     }
 
+
+    if (text === BTN.LEVELING || text === "/level") {
+      if (!st.profile?.name || !st.profile?.phone) {
+        await tgSendMessage(env, chatId, "برای تعیین سطح، ابتدا پروفایل را کامل کن ✅", mainMenuKeyboard(env));
+        await startOnboarding(env, chatId, from, st);
+        return;
+      }
+      await startLeveling(env, chatId, from, st);
+      return;
+    }
     if (text === BTN.SUPPORT_FAQ || text === "/faq") {
       st.state = "support_faq";
       await saveUser(userId, st, env);
@@ -3047,17 +3014,11 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
           console.error("market provider failed (all)", e?.message || e);
           candles = [];
         }
-        if (!Array.isArray(candles) || candles.length < 2) {
+        if (!Array.isArray(candles) || candles.length === 0) {
           const cacheKey = marketCacheKey(symbol, st.timeframe || "H4");
-          // اول از کش معمولی استفاده کن؛ اگر نبود از نسخهٔ Stale
-          const cached = await getMarketCache(env, cacheKey);
-          if (Array.isArray(cached) && cached.length >= 2) candles = cached;
-          if (!Array.isArray(candles) || candles.length < 2) {
-            const stale = await getMarketCacheStale(env, cacheKey);
-            if (Array.isArray(stale) && stale.length >= 2) candles = stale;
-          }
+          candles = await getMarketCacheStale(env, cacheKey);
         }
-        if (!Array.isArray(candles) || candles.length < 2) {
+        if (!Array.isArray(candles) || candles.length === 0) {
           // اگر دیتا نداریم، عکس ارسال نکن
           await tgSendMessage(env, chatId, "⚠️ برای این نماد در این تایم‌فریم دیتای کافی پیدا نشد؛ چارت ارسال نشد.", kb([[BTN.HOME]]));
         } else {
@@ -3715,6 +3676,103 @@ const MINI_APP_HTML = `<!doctype html>
             <button id="sendSupportTicket" class="btn">✉️ ارسال تیکت</button>
           </div>
           <div class="muted" style="font-size:12px; line-height:1.6;">پاسخ از طریق پشتیبانی تلگرام ارسال می‌شود.</div>
+        </div>
+      </div>
+
+      <div class="card admin-card" id="adminCard">
+        <div class="card-h">
+          <strong id="adminTitle">پنل ادمین</strong>
+          <span>مدیریت پرامپت، سبک‌ها، پرداخت و کمیسیون</span>
+        </div>
+        <div class="card-b admin-grid">
+          <div class="field">
+            <div class="label">پرامپت اصلی تحلیل</div>
+            <textarea id="adminPrompt" class="control" placeholder="پرامپت اصلی تحلیل..."></textarea>
+            <div class="actions">
+              <button id="savePrompt" class="btn primary">ذخیره پرامپت</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">پرامپت سبک‌ها (JSON)</div>
+            <textarea id="stylePromptJson" class="control" placeholder='{"پرایس_اکشن":"...","ict":"...","atr":"..."}'></textarea>
+            <div class="actions">
+              <button id="saveStylePrompts" class="btn">ذخیره JSON سبک‌ها</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">مدیریت سبک‌ها</div>
+            <div class="admin-row">
+              <input id="newStyle" class="control" placeholder="سبک جدید" />
+              <button id="addStyle" class="btn">افزودن سبک</button>
+            </div>
+            <div class="admin-row">
+              <input id="removeStyleName" class="control" placeholder="نام سبک برای حذف" />
+              <button id="removeStyle" class="btn ghost">حذف سبک</button>
+            </div>
+            <div class="mini-list" id="styleList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">کمیسیون دعوت</div>
+            <div class="admin-row">
+              <input id="globalCommission" class="control" placeholder="درصد کمیسیون کلی (مثلاً 5)" />
+              <button id="saveGlobalCommission" class="btn">ذخیره کلی</button>
+            </div>
+            <div class="admin-row">
+              <input id="commissionUser" class="control" placeholder="یوزرنیم خاص (@user)" />
+              <input id="commissionPercent" class="control" placeholder="درصد برای کاربر خاص" />
+              <button id="saveUserCommission" class="btn">ذخیره کاربر</button>
+            </div>
+            <div class="mini-list" id="commissionList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">سهمیه رایگان روزانه</div>
+            <div class="admin-row">
+              <input id="freeDailyLimit" class="control" placeholder="مثلاً 3" />
+              <button id="saveFreeLimit" class="btn">ذخیره سهمیه</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">پرامپت‌های اختصاصی (JSON)</div>
+            <textarea id="customPromptsJson" class="control" placeholder='[{"id":"p1","title":"VIP","text":"..."}]'></textarea>
+            <div class="actions">
+              <button id="saveCustomPrompts" class="btn">ذخیره پرامپت‌های اختصاصی</button>
+            </div>
+            <div class="admin-row">
+              <input id="customPromptUser" class="control" placeholder="یوزرنیم کاربر" />
+              <input id="customPromptId" class="control" placeholder="شناسه پرامپت" />
+              <button id="sendCustomPrompt" class="btn ghost">ارسال به کاربر</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">تأیید پرداخت و فعال‌سازی اشتراک</div>
+            <div class="admin-row">
+              <input id="payUsername" class="control" placeholder="یوزرنیم خریدار" />
+              <input id="payAmount" class="control" placeholder="مبلغ" />
+              <input id="payDays" class="control" placeholder="روزهای اشتراک" />
+              <input id="payDailyLimit" class="control" placeholder="سهمیه روزانه اشتراک" />
+            </div>
+            <div class="admin-row">
+              <input id="payTx" class="control" placeholder="هش تراکنش" />
+              <button id="approvePayment" class="btn primary">تأیید و فعال‌سازی</button>
+              <button id="checkPayment" class="btn ghost">چک بلاک‌چین</button>
+              <button id="activateSubscription" class="btn">فعال‌سازی دستی</button>
+            </div>
+            <div class="mini-list" id="paymentList">—</div>
+          </div>
+
+          <div class="field owner-hide" id="reportBlock">
+            <div class="label">گزارش کاربران</div>
+            <div class="actions">
+              <button id="loadUsers" class="btn">دریافت گزارش</button>
+            </div>
+            <div class="mini-list" id="usersReport">—</div>
+          </div>
         </div>
       </div>
 
