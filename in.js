@@ -60,6 +60,13 @@ export default {
         }
         if (typeof body.risk === "string") st.risk = body.risk;
         if (typeof body.newsEnabled === "boolean") st.newsEnabled = body.newsEnabled;
+        if (body.capitalAmount != null) {
+          const cap = Number(body.capitalAmount);
+          if (Number.isFinite(cap) && cap > 0) {
+            st.capital = st.capital || { amount: 0, enabled: true };
+            st.capital.amount = cap;
+          }
+        }
         if (typeof body.customPromptId === "string") {
           const prompts = await getCustomPrompts(env);
           const id = body.customPromptId.trim();
@@ -209,6 +216,32 @@ export default {
         if (url.pathname === "/api/admin/payments/list") {
           return jsonResponse({ ok: true, payments: await listPayments(env, 100) });
         }
+        if (url.pathname === "/api/admin/capital/toggle") {
+          const username = String(body.username || "").trim();
+          const enabled = !!body.enabled;
+          const userId = await getUserIdByUsername(env, username);
+          if (!userId) return jsonResponse({ ok: false, error: "user_not_found" }, 404);
+          const st = await ensureUser(userId, env);
+          st.capital = st.capital || { amount: 0, enabled: true };
+          st.capital.enabled = enabled;
+          await saveUser(userId, st, env);
+          return jsonResponse({ ok: true, capital: st.capital });
+        }
+
+        if (url.pathname === "/api/admin/withdrawals/list") {
+          const withdrawals = await listWithdrawals(env, 100);
+          return jsonResponse({ ok: true, withdrawals });
+        }
+
+        if (url.pathname === "/api/admin/withdrawals/review") {
+          const id = String(body.id || "").trim();
+          const decision = String(body.decision || "").trim();
+          const txHash = String(body.txHash || "").trim();
+          if (!id || !["approved","rejected"].includes(decision)) return jsonResponse({ ok: false, error: "bad_request" }, 400);
+          const updated = await reviewWithdrawal(env, id, decision, txHash, v.fromLike);
+          return jsonResponse({ ok: true, withdrawal: updated });
+        }
+
 
 
         if (url.pathname === "/api/admin/payments/decision") {
@@ -398,7 +431,7 @@ export default {
 ${text}`);
         }
 
-        return jsonResponse({ ok: true, ticket });
+        return jsonResponse({ ok: true, ticket, supportNotified: !!supportChatId });
       }
 
       if (url.pathname === "/api/wallet/deposit/notify" && request.method === "POST") {
@@ -433,7 +466,8 @@ TxID: ${txid}
 وضعیت: pending`);
         }
 
-        return jsonResponse({ ok: true, payment });
+        return jsonResponse({ ok: true, payment, supportNotified: !!supportChatId });
+
       }
 
       if (url.pathname === "/api/analyze" && request.method === "POST") {
@@ -469,18 +503,21 @@ TxID: ${txid}
           const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
           let chartUrl = "";
           let levels = [];
+          let quickChartSpec = null;
           try {
             if (String(env.QUICKCHART || "") !== "0") {
               const tf = st.timeframe || "H4";
               levels = extractLevels(result);
               const origin = new URL(request.url).origin;
               chartUrl = `${origin}/api/chart?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&levels=${encodeURIComponent(levels.join(","))}`;
+              const candles = await getMarketCandlesWithFallback(env, symbol, tf).catch(() => []);
+              quickChartSpec = buildQuickChartSpec(candles, symbol, tf, levels);
             }
           } catch (e) {
             console.error("chartUrl build error:", e?.message || e);
           }
           const quickchartConfig = { symbol, timeframe: st.timeframe || "H4", levels };
-          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickchartConfig });
+          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec, quickchartConfig });
         } catch (e) {
           console.error("api/analyze error:", e);
           return jsonResponse({ ok: false, error: "server_error" }, 500);
@@ -509,12 +546,12 @@ TxID: ${txid}
       return new Response("error", { status: 500 });
     }
   },
-  async scheduled(controller, env, ctx) {
-    try {
-      ctx.waitUntil(runDailyProfileNotifications(env));
-    } catch (e) {
-      console.error("scheduled error:", e);
-    }
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil((async () => {
+      try { await runDailySuggestions(env); } catch (e) { console.error("runDailySuggestions error:", e); }
+      try { await runDailyProfileNotifications(env); } catch (e) { console.error("runDailyProfileNotifications error:", e); }
+    })());
   },
 };
 
@@ -605,12 +642,13 @@ const BTN = {
   SET_RISK: "⚠️ ریسک",
   SET_NEWS: "📰 خبر",
   SET_CAPITAL: "💼 سرمایه",
+  REQUEST_CUSTOM_PROMPT: "🧠 درخواست پرامپت اختصاصی",
 };
 
 const TYPING_INTERVAL_MS = 4000;
-const TIMEOUT_TEXT_MS = 24000;
+const TIMEOUT_TEXT_MS = 26000;
 const TIMEOUT_VISION_MS = 12000;
-const TIMEOUT_POLISH_MS = 14000;
+const TIMEOUT_POLISH_MS = 15000;
 
 /* ========================== UTILS ========================== */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1170,34 +1208,54 @@ async function listSupportTickets(env, limit = 100) {
   let list = [];
   try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
   if (!Array.isArray(list)) return [];
-  const ids = list.slice(-limit);
+  const ids = list.slice(-Number(limit));
   const out = [];
   for (const id of ids) {
     const r = await env.BOT_KV.get(`ticket:${id}`);
     if (!r) continue;
     try { out.push(JSON.parse(r)); } catch {}
   }
-  return out.sort((a,b)=>(b?.createdAt||"").localeCompare(a?.createdAt||""));
+  return out.sort((a,b)=>(String(b?.createdAt||"")).localeCompare(String(a?.createdAt||"")));
 }
 
-async function listWithdrawals(env, limit = 100) {
+async function listWithdrawals(env, limit = 50) {
+  const lim = Number(limit);
   if (env.BOT_DB) {
     try {
-      const r = await env.BOT_DB.prepare("SELECT id,userId,createdAt,amount,address,status FROM withdrawals ORDER BY createdAt DESC LIMIT ?1").bind(limit).all();
-      return Array.isArray(r?.results) ? r.results : [];
+      const rows = await env.BOT_DB.prepare("SELECT id, userId, createdAt, amount, address, status FROM withdrawals ORDER BY createdAt DESC LIMIT ?1").bind(lim).all();
+      return rows?.results || [];
     } catch (e) {
       console.error("listWithdrawals db error:", e);
     }
   }
-  if (!env.BOT_KV) return [];
-  const k = await env.BOT_KV.list({ prefix: "withdraw:", limit });
+  if (!env.BOT_KV || typeof env.BOT_KV.list !== "function") return [];
+  const listed = await env.BOT_KV.list({ prefix: "withdraw:", limit: lim });
   const out = [];
-  for (const item of (k?.keys || [])) {
-    const raw = await env.BOT_KV.get(item.name);
+  for (const k of listed?.keys || []) {
+    const raw = await env.BOT_KV.get(k.name);
     if (!raw) continue;
     try { out.push(JSON.parse(raw)); } catch {}
   }
-  return out.sort((a,b)=>(b?.createdAt||"").localeCompare(a?.createdAt||""));
+  return out.sort((a,b)=>String(b.createdAt||"").localeCompare(String(a.createdAt||"")));
+}
+
+async function reviewWithdrawal(env, id, decision, txHash, reviewer) {
+  const reviewedAt = new Date().toISOString();
+  if (env.BOT_DB) {
+    await env.BOT_DB.prepare("UPDATE withdrawals SET status=?1 WHERE id=?2").bind(decision, id).run();
+    const row = await env.BOT_DB.prepare("SELECT id, userId, createdAt, amount, address, status FROM withdrawals WHERE id=?1").bind(id).first();
+    const data = { ...(row || {}), txHash, reviewedAt, reviewedBy: normHandle(reviewer?.username) };
+    if (env.BOT_KV) await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(data));
+    return data;
+  }
+  const raw = env.BOT_KV ? await env.BOT_KV.get(`withdraw:${id}`) : null;
+  const data = raw ? JSON.parse(raw) : { id, status: "pending" };
+  data.status = decision;
+  data.txHash = txHash;
+  data.reviewedAt = reviewedAt;
+  data.reviewedBy = normHandle(reviewer?.username);
+  if (env.BOT_KV) await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(data));
+  return data;
 }
 
 async function storeCustomPromptRequest(env, req) {
@@ -1217,14 +1275,14 @@ async function listCustomPromptRequests(env, limit = 200) {
   let list = [];
   try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
   if (!Array.isArray(list)) return [];
-  const ids = list.slice(-limit);
+  const ids = list.slice(-Number(limit));
   const out = [];
   for (const id of ids) {
     const r = await env.BOT_KV.get(`custom_prompt_req:${id}`);
     if (!r) continue;
     try { out.push(JSON.parse(r)); } catch {}
   }
-  return out.sort((a,b)=>(b?.createdAt||"").localeCompare(a?.createdAt||""));
+  return out.sort((a,b)=>(String(b?.createdAt||"")).localeCompare(String(a?.createdAt||"")));
 }
 
 async function getAdminFlags(env) {
@@ -1258,7 +1316,7 @@ async function runDailyProfileNotifications(env) {
   for (const u of users) {
     const uid = Number(u?.userId || 0);
     if (!uid) continue;
-    const cap = Number(u?.profile?.capital || 0);
+    const cap = Number(u?.profile?.capital || u?.capital?.amount || 0);
     const risk = u?.risk || "متوسط";
     const msg = `🔔 پیشنهاد روزانه تحلیل
 سرمایه ثبت‌شده: ${cap || "-"} ${u?.profile?.capitalCurrency || "USDT"}
@@ -1267,6 +1325,7 @@ async function runDailyProfileNotifications(env) {
     try { await tgSendMessage(env, uid, msg, mainMenuKeyboard(env)); } catch {}
   }
 }
+
 
 async function verifyBlockchainPayment(payload, env) {
   const endpoint = (env.BLOCKCHAIN_CHECK_URL || "").toString().trim();
@@ -1308,7 +1367,7 @@ function signalMenuKeyboard() {
 }
 
 function settingsMenuKeyboard() {
-  return kb([[BTN.SET_TF, BTN.SET_STYLE], [BTN.SET_RISK, BTN.SET_NEWS], [BTN.SET_CAPITAL], [BTN.BACK, BTN.HOME]]);
+  return kb([[BTN.SET_TF, BTN.SET_STYLE], [BTN.SET_RISK, BTN.SET_NEWS], [BTN.SET_CAPITAL, BTN.REQUEST_CUSTOM_PROMPT], [BTN.BACK, BTN.HOME]]);
 }
 
 function walletMenuKeyboard() {
@@ -1451,6 +1510,11 @@ function defaultUser(userId) {
       capitalCurrency: "USDT",
     },
 
+    capital: {
+      amount: 0,
+      enabled: true,
+    },
+
     // referral / points / subscription
     referral: {
       codes: [],            // 1 code
@@ -1498,6 +1562,7 @@ function patchUser(st, userId) {
   merged.referral = { ...d.referral, ...(st?.referral || {}) };
   merged.subscription = { ...d.subscription, ...(st?.subscription || {}) };
   merged.wallet = { ...d.wallet, ...(st?.wallet || {}) };
+  merged.capital = { ...d.capital, ...(st?.capital || {}) };
   merged.stats = { ...d.stats, ...(st?.stats || {}) };
   merged.customPromptId = typeof merged.customPromptId === "string" ? merged.customPromptId : "";
   merged.pendingCustomPromptRequestId = typeof merged.pendingCustomPromptRequestId === "string" ? merged.pendingCustomPromptRequestId : "";
@@ -1765,7 +1830,7 @@ function extractImageFileId(msg, env) {
 
 /* ========================== PROVIDER CHAINS ========================== */
 async function runTextProviders(prompt, env, orderOverride) {
-  const chain = parseOrder(orderOverride || env.TEXT_PROVIDER_ORDER, ["cf","openai","openrouter","deepseek","gemini"]);
+  const chain = [...new Set(parseOrder(orderOverride || env.TEXT_PROVIDER_ORDER, ["cf","openai","openrouter","deepseek","gemini"]))];
   let lastErr = null;
   for (const p of chain) {
     try {
@@ -2449,7 +2514,9 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
     (getStyleGuide(st.style) ? `STYLE_GUIDE:\n${getStyleGuide(st.style)}\n\n` : ``) +
     (customPrompt?.text ? `CUSTOM_PROMPT:\n${customPrompt.text}\n\n` : ``) +
     `ASSET: ${symbol}\n` +
-    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}, Capital=${st.profile?.capital || 0} ${st.profile?.capitalCurrency || "USDT"}\n\n` +
+    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}, Capital=${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}
+
+` +
     `MARKET_DATA:\n${marketBlock}\n\n` +
     `RULES:
 ` +
@@ -2820,6 +2887,18 @@ Memo/Tag: ${memo}
       await startLeveling(env, chatId, from, st);
       return;
     }
+    if (text === BTN.SET_CAPITAL) {
+      st.state = "set_capital";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "💼 لطفاً سرمایه قابل معامله‌ات را به عدد وارد کن (مثال: 1000)", kb([[BTN.BACK, BTN.HOME]]));
+    }
+
+    if (text === BTN.REQUEST_CUSTOM_PROMPT) {
+      st.state = "request_custom_prompt";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "🧠 درخواستت برای پرامپت اختصاصی را بنویس (سبک، بازار، هدف).", kb([[BTN.BACK, BTN.HOME]]));
+    }
+
     if (text === BTN.SUPPORT_FAQ || text === "/faq") {
       st.state = "support_faq";
       await saveUser(userId, st, env);
@@ -2982,16 +3061,41 @@ Memo/Tag: ${memo}
     if (st.state === "set_risk") { st.risk = text; st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ ریسک: ${st.risk}`, mainMenuKeyboard(env)); }
     if (st.state === "set_news") { st.newsEnabled = text.includes("روشن"); st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ خبر: ${st.newsEnabled ? "روشن ✅" : "خاموش ❌"}`, mainMenuKeyboard(env)); }
     if (st.state === "set_capital" || st.state === "onb_capital") {
-      const cap = Number(String(text || "").replace(/,/g, "").trim());
-      if (!Number.isFinite(cap) || cap <= 0) return tgSendMessage(env, chatId, "عدد معتبر نیست. مثال: 1500", kb([[BTN.BACK, BTN.HOME]]));
+      const cap = Number(String(text || "").replace(/[, ]+/g, "").trim());
+      if (!Number.isFinite(cap) || cap <= 0) return tgSendMessage(env, chatId, "عدد سرمایه معتبر نیست. مثال: 1500", kb([[BTN.BACK, BTN.HOME]]));
+      st.profile = st.profile || {};
       st.profile.capital = cap;
-      st.profile.capitalCurrency = "USDT";
+      st.profile.capitalCurrency = st.profile.capitalCurrency || "USDT";
+      st.capital = st.capital || { amount: 0, enabled: true };
+      st.capital.amount = cap;
+      st.capital.enabled = true;
       const wasOnb = st.state === "onb_capital";
       st.state = "idle";
       await saveUser(userId, st, env);
       if (wasOnb) return startLeveling(env, chatId, from, st);
-      return tgSendMessage(env, chatId, `✅ سرمایه ثبت شد: ${cap} USDT`, mainMenuKeyboard(env));
+      return tgSendMessage(env, chatId, `✅ سرمایه ثبت شد: ${cap} ${st.profile.capitalCurrency || "USDT"}`, settingsMenuKeyboard());
     }
+
+    if (st.state === "request_custom_prompt") {
+      const req = String(text || "").trim();
+      if (req.length < 8) {
+        return tgSendMessage(env, chatId, "متن درخواست خیلی کوتاه است.", kb([[BTN.BACK, BTN.HOME]]));
+      }
+      const reqId = `cpr_${Date.now()}_${st.userId}`;
+      const item = { id: reqId, userId: String(st.userId), username: st.profile?.username || "", text: req, status: "pending", createdAt: new Date().toISOString() };
+      await storeCustomPromptRequest(env, item);
+      const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+      if (supportChatId) {
+        await tgSendMessage(env, supportChatId, `🧠 درخواست پرامپت اختصاصی جدید #${reqId}
+کاربر: ${item.username ? '@'+item.username : item.userId}
+متن:
+${req}`);
+      }
+      st.state = "idle";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "✅ درخواست ثبت شد. بعد از تایید ادمین فعال می‌شود.", settingsMenuKeyboard());
+    }
+
     if (st.state === "support_faq") {
       const idx = Number(text.trim());
       const faq = getSupportFaq();
@@ -3103,7 +3207,7 @@ ${textClean}`);
         await tgSendMessage(env, supportChatId, `💳 درخواست واریز جدید
 کاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}
 TxID: ${txid}
-مبلغ: ${payment.amount || "-"}`);
+${Number.isFinite(payment.amount) && payment.amount > 0 ? `مبلغ: ${payment.amount}` : ""}`);
       }
       st.state = "idle";
       await saveUser(userId, st, env);
@@ -3327,6 +3431,37 @@ function inviteShareText(st, env) {
 QuickChart renders Chart.js configs as images via https://quickchart.io/chart .
 Financial (candlestick/OHLC) charts are supported via chartjs-chart-financial plugin.
 */
+function buildQuickChartSpec(candles, symbol, tf, levels = []) {
+  const items = (candles || []).slice(-60).map((c) => ({
+    x: new Date(c.t || c.time || c.ts || c.timestamp || Date.now()).toISOString(),
+    o: Number(c.o),
+    h: Number(c.h),
+    l: Number(c.l),
+    c: Number(c.c),
+  }));
+  const annotations = (levels || []).slice(0, 6).map((lvl, idx) => ({
+    type: "line",
+    scaleID: "y",
+    value: Number(lvl),
+    borderColor: idx === 0 ? "#00d1ff" : idx === 1 ? "#ff6b6b" : "#f7c948",
+    borderWidth: 1.5,
+    borderDash: [6, 4],
+    label: { enabled: true, content: `L${idx + 1}: ${Number(lvl).toFixed(4)}` },
+  }));
+  return {
+    type: "candlestick",
+    data: { datasets: [{ label: `${symbol} ${tf}`, data: items }] },
+    options: {
+      plugins: {
+        legend: { display: false },
+        title: { display: true, text: `${symbol} · ${tf}` },
+        annotation: { annotations },
+      },
+      scales: { x: { ticks: { maxRotation: 0, autoSkip: true } } },
+    },
+  };
+}
+
 function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
   const items = (candles || []).slice(-60).map((c) => ({
     x: new Date(c.t || c.time || c.ts || c.timestamp || Date.now()).toISOString(),
@@ -4718,3 +4853,20 @@ el("loadUsers")?.addEventListener("click", async () => {
 });
 
 boot();`;
+
+
+async function runDailySuggestions(env) {
+  if (!env.BOT_KV) return;
+  const hour = Number(new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Kyiv", hour: "2-digit", hour12: false }).format(new Date()));
+  if (![9, 18].includes(hour)) return;
+  const users = await listUsers(env, 400);
+  for (const u of users) {
+    if (!u?.userId || !u?.profile?.phone) continue;
+    const market = u.profile?.preferredMarket || "بازار";
+    const style = u.style || "پرایس اکشن";
+    const cap = u.capital?.enabled === false ? "" : (u.capital?.amount ? ` | سرمایه: ${u.capital.amount}` : "");
+    const msg = `🔔 پیشنهاد تحلیل روزانه
+بر اساس پروفایل شما (${market} / ${style}${cap})، امروز ۲ تحلیل برنامه‌ریزی کن: یکی روندی، یکی برگشتی.`;
+    await tgSendMessage(env, Number(u.userId), msg, mainMenuKeyboard(env));
+  }
+}
