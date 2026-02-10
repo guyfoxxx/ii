@@ -88,7 +88,7 @@ export default {
         if (!isStaff(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
 
         if (url.pathname === "/api/admin/bootstrap") {
-          const [prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals] = await Promise.all([
+          const [prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals, tickets, adminFlags] = await Promise.all([
             getAnalysisPrompt(env),
             getStyleList(env),
             getCommissionSettings(env),
@@ -97,9 +97,11 @@ export default {
             getStylePromptMap(env),
             getCustomPrompts(env),
             getFreeDailyLimit(env),
-            listWithdrawals(env, 25),
+            listWithdrawals(env, 100),
+            listSupportTickets(env, 100),
+            getAdminFlags(env),
           ]);
-          return jsonResponse({ ok: true, prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals });
+          return jsonResponse({ ok: true, prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals, tickets, adminFlags });
         }
 
         if (url.pathname === "/api/admin/prompt") {
@@ -144,6 +146,15 @@ export default {
           await setFreeDailyLimit(env, limit);
           return jsonResponse({ ok: true, freeDailyLimit: await getFreeDailyLimit(env) });
         }
+
+        if (url.pathname === "/api/admin/features") {
+          const flags = await getAdminFlags(env);
+          if (typeof body.capitalModeEnabled === "boolean") flags.capitalModeEnabled = body.capitalModeEnabled;
+          if (typeof body.profileTipsEnabled === "boolean") flags.profileTipsEnabled = body.profileTipsEnabled;
+          await setAdminFlags(env, flags);
+          return jsonResponse({ ok: true, adminFlags: await getAdminFlags(env) });
+        }
+
 
         if (url.pathname === "/api/admin/offer") {
           if (typeof body.offerBanner === "string" && env.BOT_KV) {
@@ -232,6 +243,49 @@ export default {
         }
 
 
+
+        if (url.pathname === "/api/admin/payments/decision") {
+          const paymentId = String(body.paymentId || "").trim();
+          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
+          const raw = env.BOT_KV ? await env.BOT_KV.get(`payment:${paymentId}`) : "";
+          if (!raw) return jsonResponse({ ok: false, error: "payment_not_found" }, 404);
+          let payment = null;
+          try { payment = JSON.parse(raw); } catch {}
+          if (!payment) return jsonResponse({ ok: false, error: "payment_bad_json" }, 500);
+          payment.status = status;
+          payment.reviewedAt = new Date().toISOString();
+          payment.reviewedBy = normHandle(v.fromLike?.username);
+          if (env.BOT_KV) await env.BOT_KV.put(`payment:${paymentId}`, JSON.stringify(payment));
+          return jsonResponse({ ok: true, payment });
+        }
+
+        if (url.pathname === "/api/admin/withdrawals/list") {
+          return jsonResponse({ ok: true, withdrawals: await listWithdrawals(env, 200) });
+        }
+
+        if (url.pathname === "/api/admin/withdrawals/decision") {
+          const id = String(body.withdrawalId || "").trim();
+          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
+          if (!id) return jsonResponse({ ok: false, error: "withdrawal_id_required" }, 400);
+
+          if (env.BOT_DB) {
+            await env.BOT_DB.prepare("UPDATE withdrawals SET status=?1 WHERE id=?2").bind(status, id).run();
+          }
+          if (env.BOT_KV) {
+            const raw = await env.BOT_KV.get(`withdraw:${id}`);
+            if (raw) {
+              try {
+                const w = JSON.parse(raw);
+                w.status = status;
+                w.reviewedAt = new Date().toISOString();
+                w.reviewedBy = normHandle(v.fromLike?.username);
+                await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(w));
+              } catch {}
+            }
+          }
+          return jsonResponse({ ok: true, status, withdrawalId: id });
+        }
+
         if (url.pathname === "/api/admin/payments/approve") {
           const username = String(body.username || "").trim();
           const userId = await getUserIdByUsername(env, username);
@@ -298,6 +352,27 @@ export default {
           return jsonResponse({ ok: true, subscription: st.subscription });
         }
 
+        if (url.pathname === "/api/admin/custom-prompts/requests") {
+          if (String(body.action || "") === "decide") {
+            const requestId = String(body.requestId || "").trim();
+            const status = String(body.status || "").trim();
+            const requests = await listCustomPromptRequests(env, 200);
+            const req = requests.find((x) => x.id === requestId);
+            if (!req) return jsonResponse({ ok: false, error: "request_not_found" }, 404);
+            req.status = status === "approved" ? "approved" : "rejected";
+            req.decidedAt = new Date().toISOString();
+            req.decidedBy = normHandle(v.fromLike?.username);
+            await storeCustomPromptRequest(env, req);
+            if (req.status === "approved" && req.promptId) {
+              const st = await ensureUser(req.userId, env);
+              st.customPromptId = String(req.promptId);
+              await saveUser(req.userId, st, env);
+            }
+            return jsonResponse({ ok: true, request: req });
+          }
+          return jsonResponse({ ok: true, requests: await listCustomPromptRequests(env, 200) });
+        }
+
         if (url.pathname === "/api/admin/custom-prompts/send") {
           const username = String(body.username || "").trim();
           const promptId = String(body.promptId || "").trim();
@@ -324,34 +399,75 @@ export default {
       if (url.pathname === "/api/support/ticket" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
         const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
         const st = await ensureUser(v.userId, env);
         const text = String(body.text || "").trim();
+        const kind = String(body.kind || "general").trim();
         if (text.length < 4) return jsonResponse({ ok: false, error: "ticket_too_short" }, 400);
 
-        const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
-        if (!supportChatId) return jsonResponse({ ok: false, error: "support_unavailable" }, 503);
-
-        const ticketId = `t_${Date.now()}_${v.userId}`;
-        const payload = {
-          id: ticketId,
-          userId: String(v.userId),
+        const ticket = {
+          id: `t_${Date.now()}_${st.userId}`,
+          userId: String(st.userId),
           username: st.profile?.username || "",
           phone: st.profile?.phone || "",
           text,
+          kind,
+          status: "pending",
           createdAt: new Date().toISOString(),
-          status: "open",
         };
-        if (env.BOT_KV) {
-          await env.BOT_KV.put(`ticket:${ticketId}`, JSON.stringify(payload));
-        }
-        await tgSendMessage(env, supportChatId, `📩 تیکت جدید #${ticketId}
-کاربر: ${payload.username ? "@" + payload.username : payload.userId}
-شماره: ${payload.phone || "-"}
+        await storeSupportTicket(env, ticket);
+
+        const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+        if (supportChatId) {
+          await tgSendMessage(env, supportChatId, `📩 تیکت جدید
+شناسه: ${ticket.id}
+نوع: ${kind}
+کاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}
+شماره: ${st.profile?.phone || "-"}
 متن:
 ${text}`);
-        return jsonResponse({ ok: true, ticketId });
+        }
+
+        return jsonResponse({ ok: true, ticket, supportNotified: !!supportChatId });
+      }
+
+      if (url.pathname === "/api/wallet/deposit/notify" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
+        const st = await ensureUser(v.userId, env);
+        const txid = String(body.txid || body.txHash || "").trim();
+        const amount = Number(body.amount || 0);
+        if (!txid) return jsonResponse({ ok: false, error: "txid_required" }, 400);
+
+        const payment = {
+          id: `dep_${Date.now()}_${st.userId}`,
+          userId: String(st.userId),
+          username: st.profile?.username || "",
+          amount,
+          txHash: txid,
+          status: "pending",
+          createdAt: new Date().toISOString(),
+          source: "user_txid",
+        };
+        await storePayment(env, payment);
+
+        const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+        if (supportChatId) {
+          await tgSendMessage(env, supportChatId, `💳 درخواست واریز جدید
+کاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}
+TxID: ${txid}
+مبلغ: ${amount || "-"}
+وضعیت: pending`);
+        }
+
+        return jsonResponse({ ok: true, payment, supportNotified: !!supportChatId });
+
       }
 
       if (url.pathname === "/api/analyze" && request.method === "POST") {
@@ -400,7 +516,8 @@ ${text}`);
           } catch (e) {
             console.error("chartUrl build error:", e?.message || e);
           }
-          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec });
+          const quickchartConfig = { symbol, timeframe: st.timeframe || "H4", levels };
+          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec, quickchartConfig });
         } catch (e) {
           console.error("api/analyze error:", e);
           return jsonResponse({ ok: false, error: "server_error" }, 500);
@@ -431,7 +548,10 @@ ${text}`);
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runDailySuggestions(env));
+    ctx.waitUntil((async () => {
+      try { await runDailySuggestions(env); } catch (e) { console.error("runDailySuggestions error:", e); }
+      try { await runDailyProfileNotifications(env); } catch (e) { console.error("runDailyProfileNotifications error:", e); }
+    })());
   },
 };
 
@@ -500,6 +620,7 @@ const BTN = {
   SUPPORT: "🆘 پشتیبانی",
   SUPPORT_TICKET: "✉️ ارسال تیکت",
   SUPPORT_FAQ: "❓ سوالات آماده",
+  SUPPORT_CUSTOM_PROMPT: "🧠 درخواست پرامپت اختصاصی",
   EDUCATION: "📚 آموزش",
   LEVELING: "🧪 تعیین سطح",
   BACK: "⬅️ برگشت",
@@ -1070,13 +1191,45 @@ async function listPayments(env, limit = 50) {
   return out.sort((a, b) => (b?.createdAt || "").localeCompare(a?.createdAt || ""));
 }
 
+async function storeSupportTicket(env, ticket) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put(`ticket:${ticket.id}`, JSON.stringify(ticket));
+  const raw = await env.BOT_KV.get("tickets:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  if (!list.includes(ticket.id)) list.push(ticket.id);
+  await env.BOT_KV.put("tickets:index", JSON.stringify(list.slice(-1000)));
+}
+
+async function listSupportTickets(env, limit = 100) {
+  if (!env.BOT_KV) return [];
+  const raw = await env.BOT_KV.get("tickets:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) return [];
+  const ids = list.slice(-Number(limit));
+  const out = [];
+  for (const id of ids) {
+    const r = await env.BOT_KV.get(`ticket:${id}`);
+    if (!r) continue;
+    try { out.push(JSON.parse(r)); } catch {}
+  }
+  return out.sort((a,b)=>(String(b?.createdAt||"")).localeCompare(String(a?.createdAt||"")));
+}
+
 async function listWithdrawals(env, limit = 50) {
+  const lim = Number(limit);
   if (env.BOT_DB) {
-    const rows = await env.BOT_DB.prepare("SELECT id, userId, createdAt, amount, address, status FROM withdrawals ORDER BY createdAt DESC LIMIT ?1").bind(Number(limit)).all();
-    return rows?.results || [];
+    try {
+      const rows = await env.BOT_DB.prepare("SELECT id, userId, createdAt, amount, address, status FROM withdrawals ORDER BY createdAt DESC LIMIT ?1").bind(lim).all();
+      return rows?.results || [];
+    } catch (e) {
+      console.error("listWithdrawals db error:", e);
+    }
   }
   if (!env.BOT_KV || typeof env.BOT_KV.list !== "function") return [];
-  const listed = await env.BOT_KV.list({ prefix: "withdraw:", limit: Number(limit) });
+  const listed = await env.BOT_KV.list({ prefix: "withdraw:", limit: lim });
   const out = [];
   for (const k of listed?.keys || []) {
     const raw = await env.BOT_KV.get(k.name);
@@ -1104,6 +1257,75 @@ async function reviewWithdrawal(env, id, decision, txHash, reviewer) {
   if (env.BOT_KV) await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(data));
   return data;
 }
+
+async function storeCustomPromptRequest(env, req) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put(`custom_prompt_req:${req.id}`, JSON.stringify(req));
+  const raw = await env.BOT_KV.get("custom_prompt_req:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  if (!list.includes(req.id)) list.push(req.id);
+  await env.BOT_KV.put("custom_prompt_req:index", JSON.stringify(list.slice(-1000)));
+}
+
+async function listCustomPromptRequests(env, limit = 200) {
+  if (!env.BOT_KV) return [];
+  const raw = await env.BOT_KV.get("custom_prompt_req:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) return [];
+  const ids = list.slice(-Number(limit));
+  const out = [];
+  for (const id of ids) {
+    const r = await env.BOT_KV.get(`custom_prompt_req:${id}`);
+    if (!r) continue;
+    try { out.push(JSON.parse(r)); } catch {}
+  }
+  return out.sort((a,b)=>(String(b?.createdAt||"")).localeCompare(String(a?.createdAt||"")));
+}
+
+async function getAdminFlags(env) {
+  if (!env.BOT_KV) return { capitalModeEnabled: true, profileTipsEnabled: true };
+  const raw = await env.BOT_KV.get("settings:admin_flags");
+  try {
+    const j = raw ? JSON.parse(raw) : {};
+    return {
+      capitalModeEnabled: typeof j.capitalModeEnabled === "boolean" ? j.capitalModeEnabled : true,
+      profileTipsEnabled: typeof j.profileTipsEnabled === "boolean" ? j.profileTipsEnabled : true,
+    };
+  } catch {
+    return { capitalModeEnabled: true, profileTipsEnabled: true };
+  }
+}
+
+async function setAdminFlags(env, flags) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put("settings:admin_flags", JSON.stringify({
+    capitalModeEnabled: !!flags.capitalModeEnabled,
+    profileTipsEnabled: !!flags.profileTipsEnabled,
+  }));
+}
+
+async function runDailyProfileNotifications(env) {
+  const flags = await getAdminFlags(env);
+  if (!flags.profileTipsEnabled) return;
+  const users = await listUsers(env, 500);
+  const hr = new Date().getUTCHours();
+  if (!(hr === 8 || hr === 20)) return;
+  for (const u of users) {
+    const uid = Number(u?.userId || 0);
+    if (!uid) continue;
+    const cap = Number(u?.profile?.capital || u?.capital?.amount || 0);
+    const risk = u?.risk || "متوسط";
+    const msg = `🔔 پیشنهاد روزانه تحلیل
+سرمایه ثبت‌شده: ${cap || "-"} ${u?.profile?.capitalCurrency || "USDT"}
+ریسک: ${risk}
+پیشنهاد: امروز با مدیریت سرمایه محافظه‌کارانه و تایید چند-سبکی وارد شو.`;
+    try { await tgSendMessage(env, uid, msg, mainMenuKeyboard(env)); } catch {}
+  }
+}
+
 
 async function verifyBlockchainPayment(payload, env) {
   const endpoint = (env.BLOCKCHAIN_CHECK_URL || "").toString().trim();
@@ -1284,6 +1506,8 @@ function defaultUser(userId) {
       level: "", // beginner/intermediate/pro
       levelNotes: "",
       onboardingDone: false,
+      capital: 0,
+      capitalCurrency: "USDT",
     },
 
     capital: {
@@ -1327,6 +1551,7 @@ function defaultUser(userId) {
       totalPaymentAmount: 0,
     },
     customPromptId: "",
+    pendingCustomPromptRequestId: "",
   };
 }
 
@@ -1340,6 +1565,9 @@ function patchUser(st, userId) {
   merged.capital = { ...d.capital, ...(st?.capital || {}) };
   merged.stats = { ...d.stats, ...(st?.stats || {}) };
   merged.customPromptId = typeof merged.customPromptId === "string" ? merged.customPromptId : "";
+  merged.pendingCustomPromptRequestId = typeof merged.pendingCustomPromptRequestId === "string" ? merged.pendingCustomPromptRequestId : "";
+  merged.profile.capital = Number.isFinite(Number(merged.profile?.capital)) ? Number(merged.profile.capital) : 0;
+  merged.profile.capitalCurrency = typeof merged.profile?.capitalCurrency === "string" ? merged.profile.capitalCurrency : "USDT";
 
   merged.timeframe = merged.timeframe || d.timeframe;
   merged.style = merged.style || d.style;
@@ -2286,13 +2514,27 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
     (getStyleGuide(st.style) ? `STYLE_GUIDE:\n${getStyleGuide(st.style)}\n\n` : ``) +
     (customPrompt?.text ? `CUSTOM_PROMPT:\n${customPrompt.text}\n\n` : ``) +
     `ASSET: ${symbol}\n` +
-    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}, Capital=${st.capital?.enabled === false ? "disabled" : (st.capital?.amount || "unknown")}\n\n` +
+    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}, Capital=${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}
+
+` +
     `MARKET_DATA:\n${marketBlock}\n\n` +
-    `RULES:\n` +
-    `- خروجی فقط فارسی و دقیقاً بخش‌های ۱ تا ۵\n` +
-    `- سطح‌های قیمتی را مشخص کن (X/Y/Z)\n` +
-    `- شرط کندلی را واضح بگو (close/wick)\n` +
-    `- از داده OHLC استفاده کن، خیال‌بافی نکن\n\n` +
+    `RULES:
+` +
+    `- خروجی فقط فارسی و دقیقاً بخش‌های ۱ تا ۵
+` +
+    `- از ترکیب سبک‌ها (پرایس اکشن، اسمارت‌مانی، ساختار بازار، حجم، سناریو) استفاده کن
+` +
+    `- مدیریت سرمایه متناسب با Capital را لحاظ کن و سایز پوزیشن پیشنهادی بده
+` +
+    `- quickchart_config را به شکل JSON داخلی بساز اما به کاربر نمایش نده
+` +
+    `- سطح‌های قیمتی را مشخص کن (X/Y/Z)
+` +
+    `- شرط کندلی را واضح بگو (close/wick)
+` +
+    `- از داده OHLC استفاده کن، خیال‌بافی نکن
+
+` +
     `EXTRA:\n${userExtra}`
   );
 }
@@ -2568,12 +2810,21 @@ async function handleUpdate(update, env) {
     if (text === BTN.WALLET_DEPOSIT) {
       const wallet = await getWallet(env);
       const memo = `U${st.userId}`;
+      st.state = "wallet_deposit_txid";
+      await saveUser(userId, st, env);
       const txt =
-        `➕ واریز\n\n` +
-        (wallet ? `آدرس ولت:\n${wallet}\n` : "") +
-        `\nMemo/Tag: ${memo}\n\n` +
-        `بعد از واریز، رسید/TxID را برای پشتیبانی ارسال کن تا حساب شارژ شود.`;
-      return tgSendMessage(env, chatId, txt, walletMenuKeyboard());
+        `➕ واریز
+
+` +
+        (wallet ? `آدرس ولت:
+${wallet}
+` : "") +
+        `
+Memo/Tag: ${memo}
+
+` +
+        `TxID پرداخت را همینجا بفرست (در صورت نیاز: <txid> <amount>).`;
+      return tgSendMessage(env, chatId, txt, kb([[BTN.BACK, BTN.HOME]]));
     }
 
     if (text === BTN.WALLET_WITHDRAW) {
@@ -2609,7 +2860,7 @@ async function handleUpdate(update, env) {
         env,
         chatId,
         `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.\n\nپیام مستقیم: ${handle}${walletLine}`,
-        kb([[BTN.SUPPORT_FAQ, BTN.SUPPORT_TICKET], [BTN.HOME]])
+        kb([[BTN.SUPPORT_FAQ, BTN.SUPPORT_TICKET], [BTN.SUPPORT_CUSTOM_PROMPT], [BTN.HOME]])
       );
     }
 
@@ -2772,6 +3023,13 @@ async function handleUpdate(update, env) {
       await saveUser(userId, st, env);
       return tgSendMessage(env, chatId, "📰 خبر:", optionsKeyboard(["روشن ✅","خاموش ❌"]));
     }
+    if (text === BTN.SET_CAPITAL) {
+      const flags = await getAdminFlags(env);
+      if (!flags.capitalModeEnabled) return tgSendMessage(env, chatId, "⚠️ مدیریت سرمایه توسط ادمین غیرفعال است.", settingsMenuKeyboard());
+      st.state = "set_capital";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "💼 سرمایه را وارد کن (عدد).", kb([[BTN.BACK, BTN.HOME]]));
+    }
 
     if (text === BTN.SUPPORT_FAQ) {
       st.state = "support_faq";
@@ -2787,6 +3045,12 @@ async function handleUpdate(update, env) {
       return tgSendMessage(env, chatId, "✉️ متن تیکت را بنویس (حداکثر ۳۰۰ کاراکتر):", kb([[BTN.BACK, BTN.HOME]]));
     }
 
+    if (text === BTN.SUPPORT_CUSTOM_PROMPT) {
+      st.state = "support_custom_prompt";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "🧠 نیازت را برای پرامپت اختصاصی بنویس (حداکثر ۴۰۰ کاراکتر).", kb([[BTN.BACK, BTN.HOME]]));
+    }
+
     if (st.state === "set_tf") { st.timeframe = text; st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ تایم‌فریم: ${st.timeframe}`, mainMenuKeyboard(env)); }
     if (st.state === "set_style") {
       st.style = ALLOWED_STYLE_LIST.includes(text) ? text : st.style;
@@ -2796,16 +3060,20 @@ async function handleUpdate(update, env) {
     }
     if (st.state === "set_risk") { st.risk = text; st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ ریسک: ${st.risk}`, mainMenuKeyboard(env)); }
     if (st.state === "set_news") { st.newsEnabled = text.includes("روشن"); st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ خبر: ${st.newsEnabled ? "روشن ✅" : "خاموش ❌"}`, mainMenuKeyboard(env)); }
-    if (st.state === "set_capital") {
-      const amount = Number(String(text).replace(/[, ]+/g, ""));
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return tgSendMessage(env, chatId, "عدد سرمایه معتبر نیست. مثال: 1500", kb([[BTN.BACK, BTN.HOME]]));
-      }
+    if (st.state === "set_capital" || st.state === "onb_capital") {
+      const cap = Number(String(text || "").replace(/[, ]+/g, "").trim());
+      if (!Number.isFinite(cap) || cap <= 0) return tgSendMessage(env, chatId, "عدد سرمایه معتبر نیست. مثال: 1500", kb([[BTN.BACK, BTN.HOME]]));
+      st.profile = st.profile || {};
+      st.profile.capital = cap;
+      st.profile.capitalCurrency = st.profile.capitalCurrency || "USDT";
       st.capital = st.capital || { amount: 0, enabled: true };
-      st.capital.amount = amount;
+      st.capital.amount = cap;
+      st.capital.enabled = true;
+      const wasOnb = st.state === "onb_capital";
       st.state = "idle";
       await saveUser(userId, st, env);
-      return tgSendMessage(env, chatId, `✅ سرمایه ثبت شد: ${amount}`, settingsMenuKeyboard());
+      if (wasOnb) return startLeveling(env, chatId, from, st);
+      return tgSendMessage(env, chatId, `✅ سرمایه ثبت شد: ${cap} ${st.profile.capitalCurrency || "USDT"}`, settingsMenuKeyboard());
     }
 
     if (st.state === "request_custom_prompt") {
@@ -2815,7 +3083,7 @@ async function handleUpdate(update, env) {
       }
       const reqId = `cpr_${Date.now()}_${st.userId}`;
       const item = { id: reqId, userId: String(st.userId), username: st.profile?.username || "", text: req, status: "pending", createdAt: new Date().toISOString() };
-      if (env.BOT_KV) await env.BOT_KV.put(`custom_prompt_req:${reqId}`, JSON.stringify(item));
+      await storeCustomPromptRequest(env, item);
       const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
       if (supportChatId) {
         await tgSendMessage(env, supportChatId, `🧠 درخواست پرامپت اختصاصی جدید #${reqId}
@@ -2844,13 +3112,49 @@ ${req}`);
       }
       st.state = "idle";
       await saveUser(userId, st, env);
+      const ticket = { id: `t_${Date.now()}_${st.userId}`, userId: String(st.userId), username: st.profile?.username || "", phone: st.profile?.phone || "", text: textClean, kind: "general", status: "pending", createdAt: new Date().toISOString() };
+      await storeSupportTicket(env, ticket);
       const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
       if (supportChatId) {
-        await tgSendMessage(env, supportChatId, `📩 تیکت جدید\nکاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}\nشماره: ${st.profile?.phone || "-"}\nمتن:\n${textClean}`);
-        return tgSendMessage(env, chatId, "✅ تیکت شما ارسال شد. پاسخ از طریق پشتیبانی ارسال می‌شود.", mainMenuKeyboard(env));
+        await tgSendMessage(env, supportChatId, `📩 تیکت جدید
+شناسه: ${ticket.id}
+کاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}
+شماره: ${st.profile?.phone || "-"}
+متن:
+${textClean}`);
       }
-      return tgSendMessage(env, chatId, "⚠️ پشتیبانی در دسترس نیست. لطفاً بعداً تلاش کن.", mainMenuKeyboard(env));
+      return tgSendMessage(env, chatId, "✅ تیکت شما ثبت شد و در صف بررسی ادمین است.", mainMenuKeyboard(env));
     }
+
+    if (st.state === "support_custom_prompt") {
+      const textClean = String(text || "").trim();
+      if (!textClean || textClean.length < 8) {
+        return tgSendMessage(env, chatId, "برای درخواست پرامپت اختصاصی، توضیح کامل‌تری ارسال کن.", kb([[BTN.BACK, BTN.HOME]]));
+      }
+      st.state = "idle";
+      const req = {
+        id: `cpr_${Date.now()}_${st.userId}`,
+        userId: String(st.userId),
+        username: st.profile?.username || "",
+        text: textClean,
+        status: "pending",
+        promptId: "",
+        createdAt: new Date().toISOString(),
+      };
+      st.pendingCustomPromptRequestId = req.id;
+      await saveUser(userId, st, env);
+      await storeCustomPromptRequest(env, req);
+      const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+      if (supportChatId) {
+        await tgSendMessage(env, supportChatId, `🧠 درخواست پرامپت اختصاصی
+شناسه: ${req.id}
+کاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}
+متن:
+${textClean}`);
+      }
+      return tgSendMessage(env, chatId, "✅ درخواست شما ثبت شد. بعد از تایید ادمین، پرامپت اختصاصی فعال می‌شود.", mainMenuKeyboard(env));
+    }
+
 
     if (isSymbol(text)) {
       if (!st.profile?.name || !st.profile?.phone) {
@@ -2890,18 +3194,24 @@ ${req}`);
 
 
     if (st.state === "wallet_deposit_txid") {
-      const txid = String(text || "").trim();
-      if (txid.length < 10) return tgSendMessage(env, chatId, "TxID نامعتبر است. دوباره ارسال کن.", kb([[BTN.BACK, BTN.HOME]]));
-      const pid = `dep_${Date.now()}_${st.userId}`;
-      const item = { id: pid, userId: String(st.userId), username: st.profile?.username || "", txHash: txid, status: "pending", createdAt: new Date().toISOString(), type: "deposit" };
-      if (env.BOT_KV) await storePayment(env, item);
+      const parts = String(text || "").trim().split(/\s+/).filter(Boolean);
+      const txid = String(parts[0] || "").trim();
+      const amount = Number(parts[1] || 0);
+      if (!txid || txid.length < 8) {
+        return tgSendMessage(env, chatId, "TxID نامعتبر است. دوباره ارسال کن.", kb([[BTN.BACK, BTN.HOME]]));
+      }
+      const payment = { id: `dep_${Date.now()}_${st.userId}`, userId: String(st.userId), username: st.profile?.username || "", amount: Number.isFinite(amount) ? amount : 0, txHash: txid, status: "pending", createdAt: new Date().toISOString(), source: "bot_txid" };
+      await storePayment(env, payment);
+      const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+      if (supportChatId) {
+        await tgSendMessage(env, supportChatId, `💳 درخواست واریز جدید
+کاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}
+TxID: ${txid}
+${Number.isFinite(payment.amount) && payment.amount > 0 ? `مبلغ: ${payment.amount}` : ""}`);
+      }
       st.state = "idle";
       await saveUser(userId, st, env);
-      const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
-      if (supportChatId) await tgSendMessage(env, supportChatId, `💳 درخواست واریز جدید
-کاربر: ${item.username ? '@'+item.username : item.userId}
-TxID: ${txid}`);
-      return tgSendMessage(env, chatId, "✅ TxID ثبت شد و برای بررسی ادمین ارسال شد.", walletMenuKeyboard());
+      return tgSendMessage(env, chatId, "✅ درخواست واریز ثبت شد و پس از بررسی تایید می‌شود.", walletMenuKeyboard());
     }
 
     if (st.state === "wallet_withdraw") {
@@ -2988,6 +3298,12 @@ async function startOnboarding(env, chatId, from, st) {
     st.state = "onb_market";
     await saveUser(st.userId, st, env);
     return tgSendMessage(env, chatId, "بازار مورد علاقه‌ات کدام است؟", optionsKeyboard(["کریپتو", "فارکس", "فلزات", "سهام"]));
+  }
+  const flags = await getAdminFlags(env);
+  if (flags.capitalModeEnabled && !Number(st.profile?.capital || 0)) {
+    st.state = "onb_capital";
+    await saveUser(st.userId, st, env);
+    return tgSendMessage(env, chatId, "💼 سرمایه تقریبی‌ات را وارد کن (عدد). مثال: 1000", kb([[BTN.BACK, BTN.HOME]]));
   }
   await startLeveling(env, chatId, from, st);
 }
