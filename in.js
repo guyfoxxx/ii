@@ -5685,12 +5685,12 @@ el("downloadReportPdf")?.addEventListener("click", async () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ initData: INIT_DATA, limit: 250 }),
     });
-    if (!r.ok) throw new Error(`http_${r.status}`);
+    if (!r.ok) throw new Error(\`http_\${r.status}\`);
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `admin-report-${Date.now()}.pdf`;
+    a.download = \`admin-report-\${Date.now()}.pdf\`;
     document.body.appendChild(a);
     a.click();
     a.remove();
