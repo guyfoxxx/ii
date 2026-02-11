@@ -104,6 +104,62 @@ export default {
           return jsonResponse({ ok: true, prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals, tickets, adminFlags });
         }
 
+        if (url.pathname === "/api/admin/wallet") {
+          if (!isOwner(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+          if (!env.BOT_KV) return jsonResponse({ ok: false, error: "bot_kv_missing" }, 500);
+          const wallet = typeof body.wallet === "string" ? body.wallet.trim() : null;
+          if (wallet !== null) {
+            await setWallet(env, wallet);
+          }
+          return jsonResponse({ ok: true, wallet: await getWallet(env) });
+        }
+
+        if (url.pathname === "/api/admin/tickets/list") {
+          const limit = Math.min(300, Math.max(1, Number(body.limit || 100)));
+          const tickets = await listSupportTickets(env, limit);
+          return jsonResponse({ ok: true, tickets });
+        }
+
+        if (url.pathname === "/api/admin/tickets/update") {
+          const id = String(body.id || "").trim();
+          const status = String(body.status || "").trim();
+          const reply = String(body.reply || "").trim();
+          if (!id) return jsonResponse({ ok: false, error: "ticket_id_required" }, 400);
+          const allowed = ["pending", "answered", "closed"];
+          if (!allowed.includes(status)) return jsonResponse({ ok: false, error: "bad_status" }, 400);
+
+          const nextStatus = reply ? (status === "pending" ? "answered" : status) : status;
+
+          let updated = null;
+          try {
+            updated = await updateSupportTicket(env, id, {
+              status: nextStatus,
+              reply: reply || undefined,
+              updatedBy: normHandle(v.fromLike?.username),
+            });
+          } catch (e) {
+            const msg = String(e?.message || e || "update_failed");
+            const http = msg.includes("not_found") ? 404 : 500;
+            return jsonResponse({ ok: false, error: msg }, http);
+          }
+
+          if (reply && updated?.userId) {
+            const chat = Number(updated.userId);
+            if (chat) {
+              const who = updated.username ? ("@" + String(updated.username).replace(/^@/, "")) : updated.userId;
+              const msg = `📩 پاسخ پشتیبانی
+
+شناسه تیکت: ${updated.id}
+کاربر: ${who}
+
+${reply}`;
+              await tgSendMessage(env, chat, msg);
+            }
+          }
+
+          return jsonResponse({ ok: true, ticket: updated });
+        }
+
         if (url.pathname === "/api/admin/prompt") {
           if (typeof body.prompt === "string" && env.BOT_KV) {
             await env.BOT_KV.put("settings:analysis_prompt", body.prompt.trim());
@@ -148,6 +204,7 @@ export default {
         }
 
         if (url.pathname === "/api/admin/features") {
+          if (!isOwner(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
           const flags = await getAdminFlags(env);
           if (typeof body.capitalModeEnabled === "boolean") flags.capitalModeEnabled = body.capitalModeEnabled;
           if (typeof body.profileTipsEnabled === "boolean") flags.profileTipsEnabled = body.profileTipsEnabled;
@@ -183,6 +240,7 @@ export default {
         }
 
         if (url.pathname === "/api/admin/users") {
+          if (!isOwner(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
           const users = await listUsers(env, Number(body.limit || 100));
           const now = Date.now();
           const report = users.map((u) => {
@@ -242,6 +300,49 @@ export default {
           return jsonResponse({ ok: true, withdrawal: updated });
         }
 
+
+
+        if (url.pathname === "/api/admin/payments/decision") {
+          const paymentId = String(body.paymentId || "").trim();
+          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
+          const raw = env.BOT_KV ? await env.BOT_KV.get(`payment:${paymentId}`) : "";
+          if (!raw) return jsonResponse({ ok: false, error: "payment_not_found" }, 404);
+          let payment = null;
+          try { payment = JSON.parse(raw); } catch {}
+          if (!payment) return jsonResponse({ ok: false, error: "payment_bad_json" }, 500);
+          payment.status = status;
+          payment.reviewedAt = new Date().toISOString();
+          payment.reviewedBy = normHandle(v.fromLike?.username);
+          if (env.BOT_KV) await env.BOT_KV.put(`payment:${paymentId}`, JSON.stringify(payment));
+          return jsonResponse({ ok: true, payment });
+        }
+
+        if (url.pathname === "/api/admin/withdrawals/list") {
+          return jsonResponse({ ok: true, withdrawals: await listWithdrawals(env, 200) });
+        }
+
+        if (url.pathname === "/api/admin/withdrawals/decision") {
+          const id = String(body.withdrawalId || "").trim();
+          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
+          if (!id) return jsonResponse({ ok: false, error: "withdrawal_id_required" }, 400);
+
+          if (env.BOT_DB) {
+            await env.BOT_DB.prepare("UPDATE withdrawals SET status=?1 WHERE id=?2").bind(status, id).run();
+          }
+          if (env.BOT_KV) {
+            const raw = await env.BOT_KV.get(`withdraw:${id}`);
+            if (raw) {
+              try {
+                const w = JSON.parse(raw);
+                w.status = status;
+                w.reviewedAt = new Date().toISOString();
+                w.reviewedBy = normHandle(v.fromLike?.username);
+                await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(w));
+              } catch {}
+            }
+          }
+          return jsonResponse({ ok: true, status, withdrawalId: id });
+        }
 
 
         if (url.pathname === "/api/admin/payments/decision") {
@@ -355,19 +456,48 @@ export default {
         if (url.pathname === "/api/admin/custom-prompts/requests") {
           if (String(body.action || "") === "decide") {
             const requestId = String(body.requestId || "").trim();
-            const status = String(body.status || "").trim();
+            const statusRaw = String(body.status || "").trim();
+            const status = statusRaw === "approved" ? "approved" : "rejected";
+            const promptId = String(body.promptId || "").trim();
+
             const requests = await listCustomPromptRequests(env, 200);
             const req = requests.find((x) => x.id === requestId);
             if (!req) return jsonResponse({ ok: false, error: "request_not_found" }, 404);
-            req.status = status === "approved" ? "approved" : "rejected";
+
+            req.status = status;
+            if (status === "approved") {
+              req.promptId = promptId || req.promptId || "";
+              if (!req.promptId) return jsonResponse({ ok: false, error: "prompt_id_required" }, 400);
+            } else {
+              req.promptId = "";
+            }
+
             req.decidedAt = new Date().toISOString();
             req.decidedBy = normHandle(v.fromLike?.username);
+
             await storeCustomPromptRequest(env, req);
-            if (req.status === "approved" && req.promptId) {
+
+            if (req.status === "approved") {
               const st = await ensureUser(req.userId, env);
               st.customPromptId = String(req.promptId);
               await saveUser(req.userId, st, env);
             }
+
+            // notify user
+            const chat = Number(req.userId);
+            if (chat) {
+              const msg = req.status === "approved"
+                ? `✅ درخواست پرامپت اختصاصی شما تایید شد.
+
+شناسه پرامپت: ${req.promptId}
+
+از منوی تنظیمات می‌تونی پرامپت اختصاصی رو انتخاب کنی.`
+                : `❌ درخواست پرامپت اختصاصی شما رد شد.
+
+اگر سوالی داری، از بخش پشتیبانی تیکت بزن.`;
+              await tgSendMessage(env, chat, msg);
+            }
+
             return jsonResponse({ ok: true, request: req });
           }
           return jsonResponse({ ok: true, requests: await listCustomPromptRequests(env, 200) });
@@ -431,6 +561,7 @@ export default {
 ${text}`);
         }
 
+
         return jsonResponse({ ok: true, ticket, supportNotified: !!supportChatId });
       }
 
@@ -466,8 +597,52 @@ TxID: ${txid}
 وضعیت: pending`);
         }
 
-        return jsonResponse({ ok: true, payment, supportNotified: !!supportChatId });
 
+        return jsonResponse({ ok: true, payment, supportNotified: !!supportChatId });
+      }
+
+      if (url.pathname === "/api/chart" && request.method === "GET") {
+        const symbol = String(url.searchParams.get("symbol") || "").trim().toUpperCase();
+        const tf = String(url.searchParams.get("tf") || "H4").trim().toUpperCase();
+        const levelsRaw = String(url.searchParams.get("levels") || "").trim();
+        const levels = levelsRaw
+          ? levelsRaw.split(",").map((x) => Number(x)).filter((n) => Number.isFinite(n)).slice(0, 6)
+          : [];
+
+        if (!symbol || !isSymbol(symbol)) {
+          return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
+        }
+
+        let candles = [];
+        try {
+          candles = await getMarketCandlesWithFallback(env, symbol, tf);
+        } catch (e) {
+          console.error("api/chart market fallback failed:", e?.message || e);
+          candles = [];
+        }
+
+        if (!Array.isArray(candles) || candles.length === 0) {
+          const cacheKey = marketCacheKey(symbol, tf);
+          candles = await getMarketCacheStale(env, cacheKey);
+        }
+
+        if (!Array.isArray(candles) || candles.length === 0) {
+          return jsonResponse({ ok: false, error: "no_market_data" }, 404);
+        }
+
+        try {
+          const png = await renderQuickChartPng(env, candles, symbol, tf, levels);
+          return new Response(png, {
+            status: 200,
+            headers: {
+              "Content-Type": "image/png",
+              "Cache-Control": "public, max-age=60",
+            },
+          });
+        } catch (e) {
+          console.error("api/chart quickchart render failed:", e?.message || e);
+          return jsonResponse({ ok: false, error: "chart_render_failed" }, 502);
+        }
       }
 
       if (url.pathname === "/api/analyze" && request.method === "POST") {
@@ -642,6 +817,7 @@ const BTN = {
   SET_RISK: "⚠️ ریسک",
   SET_NEWS: "📰 خبر",
   SET_CAPITAL: "💼 سرمایه",
+
   REQUEST_CUSTOM_PROMPT: "🧠 درخواست پرامپت اختصاصی",
 };
 
@@ -708,7 +884,7 @@ function isAdmin(from, env) {
 
 function kyivDateString(d = new Date()) {
   return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Kyiv",
+    timeZone: "Asia/Tehran",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -1208,6 +1384,7 @@ async function listSupportTickets(env, limit = 100) {
   let list = [];
   try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
   if (!Array.isArray(list)) return [];
+
   const ids = list.slice(-Number(limit));
   const out = [];
   for (const id of ids) {
@@ -1215,7 +1392,37 @@ async function listSupportTickets(env, limit = 100) {
     if (!r) continue;
     try { out.push(JSON.parse(r)); } catch {}
   }
+
   return out.sort((a,b)=>(String(b?.createdAt||"")).localeCompare(String(a?.createdAt||"")));
+}
+
+
+async function updateSupportTicket(env, id, patch = {}) {
+  if (!env.BOT_KV) throw new Error("BOT_KV missing");
+  const key = `ticket:${id}`;
+  const raw = await env.BOT_KV.get(key);
+  if (!raw) throw new Error("ticket_not_found");
+  let t = null;
+  try { t = JSON.parse(raw); } catch {}
+  if (!t) throw new Error("ticket_bad_json");
+
+  const next = { ...t };
+  if (typeof patch.status === "string" && patch.status) next.status = patch.status;
+  if (typeof patch.reply === "string") next.reply = patch.reply;
+  if (typeof patch.updatedBy === "string" && patch.updatedBy) next.updatedBy = patch.updatedBy;
+  next.updatedAt = new Date().toISOString();
+
+  await env.BOT_KV.put(key, JSON.stringify(next));
+
+  // ensure index
+  const idxRaw = await env.BOT_KV.get("tickets:index");
+  let list = [];
+  try { list = idxRaw ? JSON.parse(idxRaw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  if (!list.includes(id)) list.push(id);
+  await env.BOT_KV.put("tickets:index", JSON.stringify(list.slice(-1000)));
+
+  return next;
 }
 
 async function listWithdrawals(env, limit = 50) {
@@ -1228,6 +1435,7 @@ async function listWithdrawals(env, limit = 50) {
       console.error("listWithdrawals db error:", e);
     }
   }
+
   if (!env.BOT_KV || typeof env.BOT_KV.list !== "function") return [];
   const listed = await env.BOT_KV.list({ prefix: "withdraw:", limit: lim });
   const out = [];
@@ -1275,6 +1483,7 @@ async function listCustomPromptRequests(env, limit = 200) {
   let list = [];
   try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
   if (!Array.isArray(list)) return [];
+
   const ids = list.slice(-Number(limit));
   const out = [];
   for (const id of ids) {
@@ -1282,6 +1491,7 @@ async function listCustomPromptRequests(env, limit = 200) {
     if (!r) continue;
     try { out.push(JSON.parse(r)); } catch {}
   }
+
   return out.sort((a,b)=>(String(b?.createdAt||"")).localeCompare(String(a?.createdAt||"")));
 }
 
@@ -1316,6 +1526,7 @@ async function runDailyProfileNotifications(env) {
   for (const u of users) {
     const uid = Number(u?.userId || 0);
     if (!uid) continue;
+
     const cap = Number(u?.profile?.capital || u?.capital?.amount || 0);
     const risk = u?.risk || "متوسط";
     const msg = `🔔 پیشنهاد روزانه تحلیل
@@ -1350,14 +1561,11 @@ function kb(rows) {
 }
 
 function mainMenuKeyboard(env) {
-  const url = getMiniappUrl(env);
-  const miniRow = url ? [{ text: BTN.MINIAPP, web_app: { url } }] : [BTN.MINIAPP];
   return kb([
     [BTN.SIGNAL, BTN.SETTINGS],
     [BTN.WALLET, BTN.PROFILE],
     [BTN.INVITE, BTN.SUPPORT],
     [BTN.EDUCATION, BTN.LEVELING],
-    miniRow,
     [BTN.HOME],
   ]);
 }
@@ -1367,6 +1575,7 @@ function signalMenuKeyboard() {
 }
 
 function settingsMenuKeyboard() {
+
   return kb([[BTN.SET_TF, BTN.SET_STYLE], [BTN.SET_RISK, BTN.SET_NEWS], [BTN.SET_CAPITAL, BTN.REQUEST_CUSTOM_PROMPT], [BTN.BACK, BTN.HOME]]);
 }
 
@@ -1508,6 +1717,7 @@ function defaultUser(userId) {
       onboardingDone: false,
       capital: 0,
       capitalCurrency: "USDT",
+
     },
 
     capital: {
@@ -1670,6 +1880,16 @@ async function tgSendMessage(env, chatId, text, replyMarkup) {
     text: String(text).slice(0, 3900),
     reply_markup: replyMarkup,
     disable_web_page_preview: true,
+  });
+}
+
+async function tgSendMessageHtml(env, chatId, html, replyMarkup) {
+  return tgApi(env, "sendMessage", {
+    chat_id: chatId,
+    text: String(html).slice(0, 3900),
+    parse_mode: "HTML",
+    reply_markup: replyMarkup,
+    disable_web_page_preview: false,
   });
 }
 
@@ -2514,6 +2734,7 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
     (getStyleGuide(st.style) ? `STYLE_GUIDE:\n${getStyleGuide(st.style)}\n\n` : ``) +
     (customPrompt?.text ? `CUSTOM_PROMPT:\n${customPrompt.text}\n\n` : ``) +
     `ASSET: ${symbol}\n` +
+
     `USER SETTINGS: Style=${st.style}, Risk=${st.risk}, Capital=${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}
 
 ` +
@@ -2526,6 +2747,7 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
 ` +
     `- مدیریت سرمایه متناسب با Capital را لحاظ کن و سایز پوزیشن پیشنهادی بده
 ` +
+
     `- quickchart_config را به شکل JSON داخلی بساز اما به کاربر نمایش نده
 ` +
     `- سطح‌های قیمتی را مشخص کن (X/Y/Z)
@@ -2842,11 +3064,17 @@ Memo/Tag: ${memo}
       const { link, share } = inviteShareText(st, env);
       if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
       const txt =
-        `🤝 دعوت دوستان\n\n` +
-        `🔗 لینک رفرال اختصاصی:\n${link}\n\n` +
-        (share ? `برای اشتراک‌گذاری سریع:\n${share}\n` : "");
-      return tgSendMessage(env, chatId, txt, mainMenuKeyboard(env));
+        `🤝 دعوت دوستان
+
+` +
+        `🔗 لینک رفرال اختصاصی: <a href="${escapeHtml(link)}">باز کردن لینک دعوت</a>
+
+` +
+        (share ? `برای اشتراک‌گذاری سریع: <a href="${escapeHtml(share)}">ارسال لینک</a>
+` : "");
+      return tgSendMessageHtml(env, chatId, txt, mainMenuKeyboard(env));
     }
+
 
     if (text === "/education" || text === BTN.EDUCATION) {
       return tgSendMessage(env, chatId, "📚 آموزش و مفاهیم بازار\n\nبه‌زودی محتوای آموزشی اضافه می‌شود.", mainMenuKeyboard(env));
@@ -2867,10 +3095,14 @@ Memo/Tag: ${memo}
     if (text === "/miniapp" || text === BTN.MINIAPP) {
       const url = getMiniappUrl(env);
       if (!url) {
-        return tgSendMessage(env, chatId, "⚠️ لینک مینی‌اپ تنظیم نشده.\n\nدر Wrangler / داشبورد یک متغیر ENV به نام MINIAPP_URL یا PUBLIC_BASE_URL بگذار (مثلاً https://<your-worker-domain>/ ) و دوباره Deploy کن.", mainMenuKeyboard(env));
+        return tgSendMessage(env, chatId, `⚠️ لینک مینی‌اپ تنظیم نشده.
+
+در Wrangler / داشبورد یک متغیر ENV به نام MINIAPP_URL یا PUBLIC_BASE_URL بگذار (مثلاً https://<your-worker-domain>/ ) و دوباره Deploy کن.`, mainMenuKeyboard(env));
       }
-      return tgSendMessage(env, chatId, "🧩 برای باز کردن مینی‌اپ روی دکمه زیر بزن:", miniappInlineKeyboard(env) || mainMenuKeyboard(env));
+      return tgSendMessage(env, chatId, `🧩 لینک مینی‌اپ:
+${url}`, mainMenuKeyboard(env));
     }
+
 
     if (text === "/users") {
       if (!isStaff(from, env)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین/اونر می‌تواند لیست کاربران را ببیند.", mainMenuKeyboard(env));
@@ -3061,6 +3293,7 @@ Memo/Tag: ${memo}
     if (st.state === "set_risk") { st.risk = text; st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ ریسک: ${st.risk}`, mainMenuKeyboard(env)); }
     if (st.state === "set_news") { st.newsEnabled = text.includes("روشن"); st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ خبر: ${st.newsEnabled ? "روشن ✅" : "خاموش ❌"}`, mainMenuKeyboard(env)); }
     if (st.state === "set_capital" || st.state === "onb_capital") {
+
       const cap = Number(String(text || "").replace(/[, ]+/g, "").trim());
       if (!Number.isFinite(cap) || cap <= 0) return tgSendMessage(env, chatId, "عدد سرمایه معتبر نیست. مثال: 1500", kb([[BTN.BACK, BTN.HOME]]));
       st.profile = st.profile || {};
@@ -3073,6 +3306,7 @@ Memo/Tag: ${memo}
       st.state = "idle";
       await saveUser(userId, st, env);
       if (wasOnb) return startLeveling(env, chatId, from, st);
+
       return tgSendMessage(env, chatId, `✅ سرمایه ثبت شد: ${cap} ${st.profile.capitalCurrency || "USDT"}`, settingsMenuKeyboard());
     }
 
@@ -3114,6 +3348,7 @@ ${req}`);
       await saveUser(userId, st, env);
       const ticket = { id: `t_${Date.now()}_${st.userId}`, userId: String(st.userId), username: st.profile?.username || "", phone: st.profile?.phone || "", text: textClean, kind: "general", status: "pending", createdAt: new Date().toISOString() };
       await storeSupportTicket(env, ticket);
+
       const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
       if (supportChatId) {
         await tgSendMessage(env, supportChatId, `📩 تیکت جدید
@@ -3207,6 +3442,7 @@ ${textClean}`);
         await tgSendMessage(env, supportChatId, `💳 درخواست واریز جدید
 کاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}
 TxID: ${txid}
+
 ${Number.isFinite(payment.amount) && payment.amount > 0 ? `مبلغ: ${payment.amount}` : ""}`);
       }
       st.state = "idle";
@@ -3380,7 +3616,7 @@ function isSymbol(t) {
 /* ========================== TEXTS ========================== */
 function getSupportFaq() {
   return [
-    { q: "چطور سهمیه روزانه شارژ می‌شود؟", a: "سهمیه هر روز (Kyiv) صفر می‌شود و مجدداً قابل استفاده است." },
+    { q: "چطور سهمیه روزانه شارژ می‌شود؟", a: "سهمیه هر روز (Tehran) صفر می‌شود و مجدداً قابل استفاده است." },
     { q: "چرا تحلیل ناموفق شد؟", a: "اتصال دیتا یا مدل ممکن است موقتاً قطع باشد. چند دقیقه بعد دوباره تلاش کن." },
     { q: "چطور اشتراک فعال کنم؟", a: "پرداخت را انجام بده و هش تراکنش را برای ادمین ارسال کن تا تأیید و فعال شود." },
     { q: "چطور رفرال کار می‌کند؟", a: "هر دعوت موفق با شماره جدید ۳ امتیاز دارد. هر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه." },
@@ -3414,7 +3650,7 @@ function profileText(st, from, env) {
   const code = (st.referral?.codes || [])[0] || "";
   const deep = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "-";
 
-  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Kyiv): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
+  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Tehran): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
 }
 
 function inviteShareText(st, env) {
@@ -3463,31 +3699,14 @@ function buildQuickChartSpec(candles, symbol, tf, levels = []) {
 }
 
 function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
-  const items = (candles || []).slice(-60).map((c) => ({
-    x: new Date(c.t || c.time || c.ts || c.timestamp || Date.now()).toISOString(),
+  const items = (candles || []).slice(-80).map((c) => ({
+    x: Number(c.t || c.time || c.ts || c.timestamp || Date.now()),
     o: Number(c.o),
     h: Number(c.h),
     l: Number(c.l),
     c: Number(c.c),
-  }));
+  })).filter((x) => Number.isFinite(x.x) && Number.isFinite(x.o) && Number.isFinite(x.h) && Number.isFinite(x.l) && Number.isFinite(x.c));
 
-  const annotations = (levels || []).slice(0, 6).map((lvl, idx) => ({
-    type: "line",
-    scaleID: "y",
-    value: lvl,
-    borderColor: "rgba(109,94,246,0.65)",
-    borderWidth: 2,
-    borderDash: [4, 4],
-    label: {
-      enabled: true,
-      content: `Zone ${idx + 1}: ${lvl}`,
-      backgroundColor: "rgba(0,0,0,0.6)",
-      color: "#fff",
-      position: "end",
-    },
-  }));
-
-  // Basic Chart.js + chartjs-chart-financial config
   const cfg = {
     type: "candlestick",
     data: {
@@ -3495,19 +3714,13 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
         {
           label: `${symbol} ${tf}`,
           data: items,
-          color: {
-            up: "#2FE3A5",
-            down: "#FF4D4D",
-            unchanged: "#888",
-          },
+          color: { up: "#2FE3A5", down: "#FF4D4D", unchanged: "#888" },
         },
       ],
     },
     options: {
-      plugins: {
-        legend: { display: false },
-        annotation: { annotations },
-      },
+      parsing: false,
+      plugins: { legend: { display: false } },
       scales: {
         x: { ticks: { maxRotation: 0, autoSkip: true } },
       },
@@ -3515,9 +3728,17 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
   };
 
   const encoded = encodeURIComponent(JSON.stringify(cfg));
-  // width/height params supported by /chart endpoint
-  return `https://quickchart.io/chart?w=900&h=450&devicePixelRatio=2&c=${encoded}`;
+  return `https://quickchart.io/chart?version=4&format=png&w=900&h=450&devicePixelRatio=2&plugins=chartjs-chart-financial&c=${encoded}`;
 }
+
+function stripHiddenModelOutput(text) {
+  let out = String(text || "");
+  out = out.replace(/\*\*?\s*quickchart_config\s*\*\*?/gi, "");
+  out = out.replace(/```\s*json[\s\S]*?quickchart[\s\S]*?```/gi, "");
+  out = out.replace(/quickchart_config\s*:\s*\{[\s\S]*?\}/gi, "");
+  return out.trim();
+}
+
 async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
   await tgSendMessage(env, chatId, `⏳ جمع‌آوری داده و تحلیل ${symbol}...`, kb([[BTN.HOME]]));
 
@@ -3649,8 +3870,9 @@ async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
     draft = await runTextProviders(compactPrompt, env, st.textOrder);
   }
   const polished = await runPolishProviders(draft, env, st.polishOrder);
-  if (useCache && polished) await setAnalysisCache(env, cacheKey, polished);
-  return polished;
+  const clean = stripHiddenModelOutput(polished);
+  if (useCache && clean) await setAnalysisCache(env, cacheKey, clean);
+  return clean;
 }
 
 async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
@@ -3796,6 +4018,13 @@ function escapeXml(s) {
     .replaceAll(">","&gt;")
     .replaceAll('"',"&quot;")
     .replaceAll("'","&apos;");
+}
+function escapeHtml(s) {
+  return String(s || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
 
 /* ========================== MINI APP INLINE ASSETS ========================== */
@@ -4073,6 +4302,8 @@ const MINI_APP_HTML = `<!doctype html>
     .admin-grid{ display:grid; gap: 10px; }
     .admin-row{ display:flex; gap:8px; flex-wrap:wrap; }
     .admin-row .control{ flex:1; min-width: 140px; }
+    .toggle{ display:flex; align-items:center; gap:8px; padding: 8px 10px; border: 1px solid rgba(255,255,255,.12); border-radius: 12px; }
+    .toggle input{ width:18px; height:18px; }
     textarea.control{ min-height: 120px; resize: vertical; }
     .mini-list{ font-size: 12px; color: var(--muted); white-space: pre-wrap; }
   </style>
@@ -4205,7 +4436,7 @@ const MINI_APP_HTML = `<!doctype html>
       <div class="card admin-card" id="adminCard">
         <div class="card-h">
           <strong id="adminTitle">پنل ادمین</strong>
-          <span>مدیریت پرامپت، سبک‌ها، پرداخت و کمیسیون</span>
+          <span>مدیریت پرامپت، سبک‌ها، پرداخت، برداشت و تیکت‌ها</span>
         </div>
         <div class="card-b admin-grid">
           <div class="field">
@@ -4289,8 +4520,104 @@ const MINI_APP_HTML = `<!doctype html>
             <div class="mini-list" id="paymentList">—</div>
           </div>
 
-          <div class="field owner-hide" id="reportBlock">
-            <div class="label">گزارش کاربران</div>
+          
+          <div class="field">
+            <div class="label">بنر پیشنهاد (نمایش داخل مینی‌اپ)</div>
+            <textarea id="offerBannerInput" class="control" placeholder="متن بنر پیشنهاد..."></textarea>
+            <div class="actions">
+              <button id="saveOfferBanner" class="btn">ذخیره بنر</button>
+            </div>
+          </div>
+
+          <div class="field owner-hide" id="featureFlagsBlock">
+            <div class="label">ویژگی‌ها (فقط اونر)</div>
+            <div class="admin-row">
+              <label class="toggle">
+                <input type="checkbox" id="flagCapitalMode" />
+                <span>حالت سرمایه (Capital Mode)</span>
+              </label>
+              <label class="toggle">
+                <input type="checkbox" id="flagProfileTips" />
+                <span>نوتیف پیشنهاد روزانه</span>
+              </label>
+              <button id="saveFeatureFlags" class="btn">ذخیره</button>
+            </div>
+            <div class="muted" style="font-size:12px; line-height:1.6;">این تنظیمات روی همه کاربران اثر دارد.</div>
+          </div>
+
+          <div class="field owner-hide" id="walletSettingsBlock">
+            <div class="label">تنظیم آدرس ولت (فقط اونر)</div>
+            <textarea id="walletAddressInput" class="control" placeholder="آدرس ولت جهت پرداخت (مثلاً TRC20)..."></textarea>
+            <div class="actions">
+              <button id="saveWallet" class="btn">ذخیره آدرس</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">مدیریت تیکت‌ها</div>
+            <div class="actions">
+              <button id="refreshTickets" class="btn">بروزرسانی</button>
+            </div>
+            <select id="ticketSelect" class="control"></select>
+            <textarea id="ticketReply" class="control" placeholder="پاسخ به کاربر (اختیاری)"></textarea>
+            <div class="admin-row">
+              <select id="ticketStatus" class="control">
+                <option value="pending">pending</option>
+                <option value="answered">answered</option>
+                <option value="closed">closed</option>
+              </select>
+              <button id="updateTicket" class="btn primary">ثبت وضعیت / ارسال پاسخ</button>
+            </div>
+            <div class="mini-list" id="ticketsList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">مدیریت برداشت‌ها</div>
+            <div class="actions">
+              <button id="refreshWithdrawals" class="btn">بروزرسانی</button>
+            </div>
+            <select id="withdrawSelect" class="control"></select>
+            <div class="admin-row">
+              <select id="withdrawDecision" class="control">
+                <option value="approved">approved</option>
+                <option value="rejected">rejected</option>
+              </select>
+              <input id="withdrawTxHash" class="control" placeholder="TxHash (برای approved)" />
+              <button id="reviewWithdrawalBtn" class="btn primary">ثبت</button>
+            </div>
+            <div class="mini-list" id="withdrawalsList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">درخواست‌های پرامپت اختصاصی</div>
+            <div class="actions">
+              <button id="refreshPromptReqs" class="btn">بروزرسانی</button>
+            </div>
+            <select id="promptReqSelect" class="control"></select>
+            <div class="admin-row">
+              <input id="promptReqPromptId" class="control" placeholder="Prompt ID برای فعال‌سازی (در صورت approve)" />
+              <select id="promptReqDecision" class="control">
+                <option value="approved">approve</option>
+                <option value="rejected">reject</option>
+              </select>
+              <button id="decidePromptReqBtn" class="btn primary">ثبت</button>
+            </div>
+            <div class="mini-list" id="promptReqList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">فعال/غیرفعال کردن سرمایه برای کاربر</div>
+            <div class="admin-row">
+              <input id="capitalToggleUser" class="control" placeholder="یوزرنیم (@user)" />
+              <select id="capitalToggleEnabled" class="control">
+                <option value="true">enabled</option>
+                <option value="false">disabled</option>
+              </select>
+              <button id="saveCapitalToggle" class="btn">ثبت</button>
+            </div>
+          </div>
+<div class="field owner-hide" id="reportBlock">
+            <div class="label">گزارش کامل کاربران (فقط اونر)</div>
             <div class="actions">
               <button id="loadUsers" class="btn">دریافت گزارش</button>
             </div>
@@ -4299,116 +4626,9 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
       </div>
 
-      <div class="card admin-card" id="adminCard">
-        <div class="card-h">
-          <strong id="adminTitle">پنل ادمین</strong>
-          <span>مدیریت پرامپت، سبک‌ها، پرداخت و کمیسیون</span>
-        </div>
-        <div class="card-b admin-grid">
-          <div class="field">
-            <div class="label">پرامپت اصلی تحلیل</div>
-            <textarea id="adminPrompt" class="control" placeholder="پرامپت اصلی تحلیل..."></textarea>
-            <div class="actions">
-              <button id="savePrompt" class="btn primary">ذخیره پرامپت</button>
-            </div>
-          </div>
+      
 
-          <div class="field">
-            <div class="label">پرامپت سبک‌ها (JSON)</div>
-            <textarea id="stylePromptJson" class="control" placeholder='{"پرایس_اکشن":"...","ict":"...","atr":"..."}'></textarea>
-            <div class="actions">
-              <button id="saveStylePrompts" class="btn">ذخیره JSON سبک‌ها</button>
-            </div>
-          </div>
-
-          <div class="field">
-            <div class="label">مدیریت سبک‌ها</div>
-            <div class="admin-row">
-              <input id="newStyle" class="control" placeholder="سبک جدید" />
-              <button id="addStyle" class="btn">افزودن سبک</button>
-            </div>
-            <div class="admin-row">
-              <input id="removeStyleName" class="control" placeholder="نام سبک برای حذف" />
-              <button id="removeStyle" class="btn ghost">حذف سبک</button>
-            </div>
-            <div class="mini-list" id="styleList">—</div>
-          </div>
-
-          <div class="field">
-            <div class="label">کمیسیون دعوت</div>
-            <div class="admin-row">
-              <input id="globalCommission" class="control" placeholder="درصد کمیسیون کلی (مثلاً 5)" />
-              <button id="saveGlobalCommission" class="btn">ذخیره کلی</button>
-            </div>
-            <div class="admin-row">
-              <input id="commissionUser" class="control" placeholder="یوزرنیم خاص (@user)" />
-              <input id="commissionPercent" class="control" placeholder="درصد برای کاربر خاص" />
-              <button id="saveUserCommission" class="btn">ذخیره کاربر</button>
-            </div>
-            <div class="mini-list" id="commissionList">—</div>
-          </div>
-
-          <div class="field">
-            <div class="label">سهمیه رایگان روزانه</div>
-            <div class="admin-row">
-              <input id="freeDailyLimit" class="control" placeholder="مثلاً 3" />
-              <button id="saveFreeLimit" class="btn">ذخیره سهمیه</button>
-            </div>
-          </div>
-
-          <div class="field">
-            <div class="label">پرامپت‌های اختصاصی (JSON)</div>
-            <textarea id="customPromptsJson" class="control" placeholder='[{"id":"p1","title":"VIP","text":"..."}]'></textarea>
-            <div class="actions">
-              <button id="saveCustomPrompts" class="btn">ذخیره پرامپت‌های اختصاصی</button>
-            </div>
-            <div class="admin-row">
-              <input id="customPromptUser" class="control" placeholder="یوزرنیم کاربر" />
-              <input id="customPromptId" class="control" placeholder="شناسه پرامپت" />
-              <button id="sendCustomPrompt" class="btn ghost">ارسال به کاربر</button>
-            </div>
-          </div>
-
-          <div class="field">
-            <div class="label">تأیید پرداخت و فعال‌سازی اشتراک</div>
-            <div class="admin-row">
-              <input id="payUsername" class="control" placeholder="یوزرنیم خریدار" />
-              <input id="payAmount" class="control" placeholder="مبلغ" />
-              <input id="payDays" class="control" placeholder="روزهای اشتراک" />
-              <input id="payDailyLimit" class="control" placeholder="سهمیه روزانه اشتراک" />
-            </div>
-            <div class="admin-row">
-              <input id="payTx" class="control" placeholder="هش تراکنش" />
-              <button id="approvePayment" class="btn primary">تأیید و فعال‌سازی</button>
-              <button id="checkPayment" class="btn ghost">چک بلاک‌چین</button>
-              <button id="activateSubscription" class="btn">فعال‌سازی دستی</button>
-            </div>
-            <div class="mini-list" id="paymentList">—</div>
-          </div>
-
-          <div class="field owner-hide" id="reportBlock">
-            <div class="label">گزارش کاربران</div>
-            <div class="actions">
-              <button id="loadUsers" class="btn">دریافت گزارش</button>
-            </div>
-            <div class="mini-list" id="usersReport">—</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="toast" id="toast">
-    <div class="spin" id="spin" style="display:none"></div>
-    <div style="min-width:0">
-      <div class="t" id="toastT">…</div>
-      <div class="s" id="toastS"></div>
-    </div>
-    <div class="badge" id="toastB"></div>
-  </div>
-
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="/app.js"></script>
+      <script src="/app.js"></script>
 </body>
 </html>`;
 
@@ -4439,6 +4659,10 @@ const spin = el("spin");
 let ALL_SYMBOLS = [];
 let INIT_DATA = "";
 let IS_STAFF = false;
+let IS_OWNER = false;
+let ADMIN_TICKETS = [];
+let ADMIN_WITHDRAWALS = [];
+let ADMIN_PROMPT_REQS = [];
 
 function showToast(title, subline = "", badge = "", loading = false){
   toastT.textContent = title || "";
@@ -4542,7 +4766,7 @@ function prettyErr(j, status){
 
 function updateMeta(state, quota){
   meta.textContent = \`سهمیه: \${quota || "-"}\`;
-  sub.textContent = \`ID: \${state?.userId || "-"} | امروز(Kyiv): \${state?.dailyDate || "-"}\`;
+  sub.textContent = \`ID: \${state?.userId || "-"} | امروز(Tehran): \${state?.dailyDate || "-"}\`;
 }
 
 function renderStyleList(styles){
@@ -4571,6 +4795,127 @@ function renderPayments(list){
   }).join("\\n");
 }
 
+
+function shortText(s, n = 80){
+  s = String(s || "").replace(/\s+/g, " ").trim();
+  return s.length > n ? (s.slice(0, n) + "…") : s;
+}
+
+function renderTickets(list){
+  ADMIN_TICKETS = Array.isArray(list) ? list.slice() : [];
+  const sel = el("ticketSelect");
+  const target = el("ticketsList");
+  if (sel) sel.innerHTML = "";
+  if (!ADMIN_TICKETS.length){
+    if (sel){
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent = "—";
+      sel.appendChild(o);
+    }
+    if (target) target.textContent = "—";
+    return;
+  }
+
+  const items = ADMIN_TICKETS.slice().sort((a,b) => String(b?.createdAt||"").localeCompare(String(a?.createdAt||"")));
+  if (sel){
+    for (const t of items){
+      const o = document.createElement("option");
+      o.value = t.id || "";
+      const who = t.username ? ("@"+String(t.username).replace(/^@/,"")) : (t.userId || "-");
+      o.textContent = \`\${t.id || "-"} | \${who} | \${t.status || "pending"}\`;
+      sel.appendChild(o);
+    }
+  }
+  if (target){
+    target.textContent = items.slice(0, 25).map((t) => {
+      const who = t.username ? ("@"+String(t.username).replace(/^@/,"")) : (t.userId || "-");
+      return \`• \${t.id} | \${who} | \${t.status || "pending"} | \${shortText(t.text, 80)}\`;
+    }).join("\n");
+  }
+}
+
+function renderWithdrawals(list){
+  ADMIN_WITHDRAWALS = Array.isArray(list) ? list.slice() : [];
+  const sel = el("withdrawSelect");
+  const target = el("withdrawalsList");
+  if (sel) sel.innerHTML = "";
+  if (!ADMIN_WITHDRAWALS.length){
+    if (sel){
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent = "—";
+      sel.appendChild(o);
+    }
+    if (target) target.textContent = "—";
+    return;
+  }
+  const items = ADMIN_WITHDRAWALS.slice().sort((a,b) => String(b?.createdAt||"").localeCompare(String(a?.createdAt||"")));
+  if (sel){
+    for (const w of items){
+      const o = document.createElement("option");
+      o.value = w.id || "";
+      o.textContent = \`\${w.id || "-"} | \${w.userId || "-"} | \${w.amount || 0} | \${w.status || "pending"}\`;
+      sel.appendChild(o);
+    }
+  }
+  if (target){
+    target.textContent = items.slice(0, 25).map((w) => {
+      return \`• \${w.id} | \${w.userId || "-"} | \${w.amount || 0} | \${w.status || "pending"} | \${shortText(w.address, 32)}\`;
+    }).join("\n");
+  }
+}
+
+function renderPromptReqs(list){
+  ADMIN_PROMPT_REQS = Array.isArray(list) ? list.slice() : [];
+  const sel = el("promptReqSelect");
+  const target = el("promptReqList");
+  if (sel) sel.innerHTML = "";
+  if (!ADMIN_PROMPT_REQS.length){
+    if (sel){
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent = "—";
+      sel.appendChild(o);
+    }
+    if (target) target.textContent = "—";
+    return;
+  }
+  const items = ADMIN_PROMPT_REQS.slice().sort((a,b) => String(b?.createdAt||"").localeCompare(String(a?.createdAt||"")));
+  if (sel){
+    for (const r of items){
+      const o = document.createElement("option");
+      o.value = r.id || "";
+      const who = r.username ? ("@"+String(r.username).replace(/^@/,"")) : (r.userId || "-");
+      o.textContent = \`\${r.id || "-"} | \${who} | \${r.status || "pending"}\`;
+      sel.appendChild(o);
+    }
+  }
+  if (target){
+    target.textContent = items.slice(0, 25).map((r) => {
+      const who = r.username ? ("@"+String(r.username).replace(/^@/,"")) : (r.userId || "-");
+      const pid = r.promptId ? \` | prompt:\${r.promptId}\` : "";
+      return \`• \${r.id} | \${who} | \${r.status || "pending"}\${pid}\`;
+    }).join("\n");
+  }
+}
+
+async function refreshTickets(){
+  const { json } = await adminApi("/api/admin/tickets/list", { limit: 100 });
+  if (json?.ok) renderTickets(json.tickets || []);
+}
+
+async function refreshWithdrawals(){
+  const { json } = await adminApi("/api/admin/withdrawals/list", {});
+  if (json?.ok) renderWithdrawals(json.withdrawals || []);
+}
+
+async function refreshPromptReqs(){
+  const { json } = await adminApi("/api/admin/custom-prompts/requests", {});
+  if (json?.ok) renderPromptReqs(json.requests || []);
+}
+
+
 function renderUsers(list){
   const target = el("usersReport");
   if (!target) return;
@@ -4579,6 +4924,42 @@ function renderUsers(list){
     const user = u.username ? \`@\${u.username.replace(/^@/, "")}\` : u.userId;
     return \`• \${user} | تلفن: \${u.phone || "—"} | مدت: \${u.usageDays} روز | تحلیل موفق: \${u.totalAnalyses} | آخرین تحلیل: \${u.lastAnalysisAt || "—"} | پرداخت: \${u.paymentCount} (\${u.paymentTotal || 0}) | اشتراک: \${u.subscriptionType || "free"} | انقضا: \${u.subscriptionExpiresAt || "—"} | سهمیه: \${u.dailyUsed}/\${u.dailyLimit} | رفرال: \${u.referralInvites} | TX: \${u.lastTxHash || "—"} | پرامپت: \${u.customPromptId || "—"}\`;
   }).join("\\n");
+}
+
+function renderFullAdminReport(users, payments, withdrawals, tickets) {
+  const target = el("usersReport");
+  if (!target) return;
+
+  const u = Array.isArray(users) ? users : [];
+  const p = Array.isArray(payments) ? payments : [];
+  const w = Array.isArray(withdrawals) ? withdrawals : [];
+  const t = Array.isArray(tickets) ? tickets : [];
+
+  const head = [
+    \`📊 گزارش کامل ادمین (Asia/Tehran)\`,
+    \`کاربران: \${u.length} | پرداخت‌ها: \${p.length} | برداشت‌ها: \${w.length} | تیکت‌ها: \${t.length}\`,
+    \`────────────────────\`,
+  ];
+
+  const usersBlock = u.slice(0, 80).map((x) => {
+    const user = x.username ? \`@\${x.username.replace(/^@/, "")}\` : x.userId;
+    return \`• \${user} | تحلیل موفق: \${x.totalAnalyses || 0} | سهمیه: \${x.dailyUsed || 0}/\${x.dailyLimit || 0} | اشتراک: \${x.subscriptionType || "free"} | TX: \${x.lastTxHash || "—"}\`;
+  });
+
+  const payBlock = p.slice(0, 40).map((x) => \`• \${x.username || x.userId} | \${x.amount || 0} | \${x.status || "-"} | \${x.txHash || "—"}\`);
+  const wdBlock = w.slice(0, 40).map((x) => \`• \${x.userId || "-"} | \${x.amount || 0} | \${x.status || "pending"} | \${x.address || "—"}\`);
+  const tkBlock = t.slice(0, 40).map((x) => \`• \${x.username || x.userId || "-"} | \${x.status || "pending"} | \${String(x.text || "").slice(0, 80)}\`);
+
+  target.textContent = [
+    ...head,
+    "👥 کاربران:", ...(usersBlock.length ? usersBlock : ["—"]),
+    "",
+    "💳 پرداخت‌ها:", ...(payBlock.length ? payBlock : ["—"]),
+    "",
+    "➖ برداشت‌ها:", ...(wdBlock.length ? wdBlock : ["—"]),
+    "",
+    "🎫 تیکت‌ها:", ...(tkBlock.length ? tkBlock : ["—"]),
+  ].join("\n");
 }
 
 function safeJsonParse(text, fallback) {
@@ -4627,10 +5008,20 @@ async function boot(){
   hideToast();
 
   IS_STAFF = !!json.isStaff;
+  IS_OWNER = json.role === "owner";
+
   if (IS_STAFF && adminCard) {
     adminCard.classList.add("show");
-    if (adminTitle) adminTitle.textContent = json.role === "owner" ? "پنل اونر" : "پنل ادمین";
-    if (json.role === "owner" && reportBlock) reportBlock.classList.add("hidden");
+    if (adminTitle) adminTitle.textContent = IS_OWNER ? "پنل اونر" : "پنل ادمین";
+
+    // Owner-only blocks
+    document.querySelectorAll(".owner-hide").forEach((x) => {
+      x.classList.toggle("hidden", !IS_OWNER);
+    });
+
+    if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
+    if (IS_OWNER && el("walletAddressInput")) el("walletAddressInput").value = json.wallet || "";
+
     await loadAdminBootstrap();
   }
 }
@@ -4638,14 +5029,27 @@ async function boot(){
 async function loadAdminBootstrap(){
   const { json } = await adminApi("/api/admin/bootstrap", {});
   if (!json?.ok) return;
+
   if (el("adminPrompt")) el("adminPrompt").value = json.prompt || "";
   if (el("stylePromptJson")) el("stylePromptJson").value = JSON.stringify(json.stylePrompts || {}, null, 2);
   if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(json.customPrompts || [], null, 2);
   if (el("freeDailyLimit")) el("freeDailyLimit").value = String(json.freeDailyLimit ?? "");
+  if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
+
+  if (json.adminFlags) {
+    if (el("flagCapitalMode")) el("flagCapitalMode").checked = !!json.adminFlags.capitalModeEnabled;
+    if (el("flagProfileTips")) el("flagProfileTips").checked = !!json.adminFlags.profileTipsEnabled;
+  }
+
   renderStyleList(json.styles || []);
   renderCommissionList(json.commission || {});
   renderPayments(json.payments || []);
-  if (offerText && json.offerBanner) offerText.textContent = json.offerBanner;
+  renderTickets(json.tickets || []);
+  renderWithdrawals(json.withdrawals || []);
+  if (offerText) offerText.textContent = json.offerBanner || (offerText.textContent || "");
+
+  // load prompt requests
+  if (el("promptReqSelect")) await refreshPromptReqs();
 }
 
 el("q").addEventListener("input", (e) => filterSymbols(e.target.value));
@@ -4794,6 +5198,144 @@ el("saveFreeLimit")?.addEventListener("click", async () => {
   if (json?.ok) showToast("ذخیره شد ✅", "سهمیه رایگان بروزرسانی شد", "ADM", false);
 });
 
+
+el("saveOfferBanner")?.addEventListener("click", async () => {
+  const offerBanner = el("offerBannerInput")?.value || "";
+  const { json } = await adminApi("/api/admin/offer", { offerBanner });
+  if (json?.ok) {
+    if (offerText) offerText.textContent = json.offerBanner || offerBanner;
+    showToast("ذخیره شد ✅", "بنر بروزرسانی شد", "ADM", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ذخیره بنر ناموفق بود", "ADM", false);
+  }
+});
+
+el("saveFeatureFlags")?.addEventListener("click", async () => {
+  const capitalModeEnabled = !!el("flagCapitalMode")?.checked;
+  const profileTipsEnabled = !!el("flagProfileTips")?.checked;
+  const { json } = await adminApi("/api/admin/features", { capitalModeEnabled, profileTipsEnabled });
+  if (json?.ok) {
+    showToast("ذخیره شد ✅", "ویژگی‌ها بروزرسانی شد", "OWN", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ذخیره ویژگی‌ها ناموفق بود", "OWN", false);
+  }
+});
+
+el("saveWallet")?.addEventListener("click", async () => {
+  const wallet = el("walletAddressInput")?.value || "";
+  const { json } = await adminApi("/api/admin/wallet", { wallet });
+  if (json?.ok) {
+    showToast("ذخیره شد ✅", "آدرس ولت بروزرسانی شد", "OWN", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ذخیره آدرس ولت ناموفق بود", "OWN", false);
+  }
+});
+
+el("refreshTickets")?.addEventListener("click", async () => {
+  showToast("در حال دریافت…", "لیست تیکت‌ها", "TICKET", true);
+  await refreshTickets();
+  showToast("آماده ✅", "تیکت‌ها بروزرسانی شد", "TICKET", false);
+  setTimeout(hideToast, 1000);
+});
+
+el("updateTicket")?.addEventListener("click", async () => {
+  const id = el("ticketSelect")?.value || "";
+  const status = el("ticketStatus")?.value || "pending";
+  const reply = (el("ticketReply")?.value || "").trim();
+  if (!id) { showToast("خطا", "یک تیکت انتخاب کنید.", "TICKET", false); return; }
+  showToast("در حال ثبت…", "بروزرسانی تیکت", "TICKET", true);
+  const { json } = await adminApi("/api/admin/tickets/update", { id, status, reply });
+  if (json?.ok) {
+    if (el("ticketReply")) el("ticketReply").value = "";
+    await refreshTickets();
+    showToast("ثبت شد ✅", "تیکت بروزرسانی شد", "TICKET", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ثبت تیکت ناموفق بود", "TICKET", false);
+  }
+});
+
+el("ticketSelect")?.addEventListener("change", () => {
+  const id = el("ticketSelect")?.value || "";
+  const t = ADMIN_TICKETS.find((x) => x.id === id);
+  if (t && el("ticketStatus")) el("ticketStatus").value = t.status || "pending";
+});
+
+el("refreshWithdrawals")?.addEventListener("click", async () => {
+  showToast("در حال دریافت…", "لیست برداشت‌ها", "WD", true);
+  await refreshWithdrawals();
+  showToast("آماده ✅", "برداشت‌ها بروزرسانی شد", "WD", false);
+  setTimeout(hideToast, 1000);
+});
+
+el("reviewWithdrawalBtn")?.addEventListener("click", async () => {
+  const id = el("withdrawSelect")?.value || "";
+  const decision = el("withdrawDecision")?.value || "rejected";
+  const txHash = (el("withdrawTxHash")?.value || "").trim();
+  if (!id) { showToast("خطا", "یک برداشت انتخاب کنید.", "WD", false); return; }
+  showToast("در حال ثبت…", "بررسی برداشت", "WD", true);
+  const { json } = await adminApi("/api/admin/withdrawals/review", { id, decision, txHash });
+  if (json?.ok) {
+    if (el("withdrawTxHash")) el("withdrawTxHash").value = "";
+    await refreshWithdrawals();
+    showToast("ثبت شد ✅", "برداشت بروزرسانی شد", "WD", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ثبت برداشت ناموفق بود", "WD", false);
+  }
+});
+
+el("refreshPromptReqs")?.addEventListener("click", async () => {
+  showToast("در حال دریافت…", "درخواست‌های پرامپت", "PR", true);
+  await refreshPromptReqs();
+  showToast("آماده ✅", "لیست بروزرسانی شد", "PR", false);
+  setTimeout(hideToast, 1000);
+});
+
+el("decidePromptReqBtn")?.addEventListener("click", async () => {
+  const requestId = el("promptReqSelect")?.value || "";
+  const status = el("promptReqDecision")?.value || "rejected";
+  const promptId = (el("promptReqPromptId")?.value || "").trim();
+  if (!requestId) { showToast("خطا", "یک درخواست را انتخاب کنید.", "PR", false); return; }
+  if (status === "approved" && !promptId) {
+    showToast("خطا", "برای تایید باید Prompt ID وارد کنید.", "PR", false);
+    return;
+  }
+  showToast("در حال ثبت…", "بررسی درخواست", "PR", true);
+  const { json } = await adminApi("/api/admin/custom-prompts/requests", { action: "decide", requestId, status, promptId });
+  if (json?.ok) {
+    await refreshPromptReqs();
+    showToast("ثبت شد ✅", "درخواست بروزرسانی شد", "PR", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ثبت درخواست ناموفق بود", "PR", false);
+  }
+});
+
+el("promptReqSelect")?.addEventListener("change", () => {
+  const id = el("promptReqSelect")?.value || "";
+  const r = ADMIN_PROMPT_REQS.find((x) => x.id === id);
+  if (r && el("promptReqPromptId")) el("promptReqPromptId").value = r.promptId || "";
+  if (r && el("promptReqDecision")) el("promptReqDecision").value = (r.status === "approved" ? "approved" : (r.status === "rejected" ? "rejected" : "rejected"));
+});
+
+el("saveCapitalToggle")?.addEventListener("click", async () => {
+  const username = (el("capitalToggleUser")?.value || "").trim();
+  const enabled = (el("capitalToggleEnabled")?.value || "true") === "true";
+  if (!username) { showToast("خطا", "یوزرنیم را وارد کنید.", "CAP", false); return; }
+  const { json } = await adminApi("/api/admin/capital/toggle", { username, enabled });
+  if (json?.ok) {
+    showToast("ثبت شد ✅", "تنظیم سرمایه بروزرسانی شد", "CAP", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ثبت ناموفق بود", "CAP", false);
+  }
+});
+
+
 el("saveCustomPrompts")?.addEventListener("click", async () => {
   const raw = el("customPromptsJson")?.value || "[]";
   const customPrompts = safeJsonParse(raw, []);
@@ -4848,8 +5390,15 @@ el("activateSubscription")?.addEventListener("click", async () => {
 });
 
 el("loadUsers")?.addEventListener("click", async () => {
-  const { json } = await adminApi("/api/admin/users", { limit: 120 });
-  if (json?.ok) renderUsers(json.users || []);
+  const [{ json: usersJson }, { json: bootJson }] = await Promise.all([
+    adminApi("/api/admin/users", { limit: 200 }),
+    adminApi("/api/admin/bootstrap", {}),
+  ]);
+  if (usersJson?.ok && bootJson?.ok) {
+    renderFullAdminReport(usersJson.users || [], bootJson.payments || [], bootJson.withdrawals || [], bootJson.tickets || []);
+  } else if (usersJson?.ok) {
+    renderUsers(usersJson.users || []);
+  }
 });
 
 boot();`;
