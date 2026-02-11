@@ -721,6 +721,25 @@ TxID: ${txid}
         });
       }
 
+      if (url.pathname === "/api/news" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
+        const symbol = String(body.symbol || "").trim().toUpperCase();
+        if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
+
+        try {
+          const articles = await fetchSymbolNewsFa(symbol, env);
+          return jsonResponse({ ok: true, symbol, articles, count: articles.length });
+        } catch (e) {
+          console.error("api/news failed:", e?.message || e);
+          return jsonResponse({ ok: false, error: "news_unavailable", symbol, articles: [] }, 502);
+        }
+      }
+
       if (url.pathname === "/api/analyze" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
@@ -2835,6 +2854,70 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
   throw lastErr || new Error("market_data_alt_failed");
 }
 
+async function fetchSymbolNewsFa(symbol, env) {
+  const query = symbolNewsQueryFa(symbol);
+  const timeoutMs = Number(env.NEWS_TIMEOUT_MS || 9000);
+  const limit = Math.min(8, Math.max(3, Number(env.NEWS_ITEMS_LIMIT || 6)));
+
+  const urls = [
+    "https://news.google.com/rss/search?q=" + encodeURIComponent(query) + "&hl=fa&gl=IR&ceid=IR:fa",
+    "https://news.google.com/rss/search?q=" + encodeURIComponent(symbol + " market") + "&hl=fa&gl=IR&ceid=IR:fa",
+  ];
+
+  let lastErr = null;
+  for (const u of urls) {
+    try {
+      const r = await fetchWithTimeout(u, { headers: { "User-Agent": "Mozilla/5.0" } }, timeoutMs);
+      if (!r.ok) throw new Error("news_http_" + r.status);
+      const xml = await r.text();
+      const items = parseRssItems(xml, limit);
+      if (items.length) return items;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("news_failed");
+}
+
+function symbolNewsQueryFa(symbol) {
+  const map = {
+    BTCUSDT: "بیت کوین", ETHUSDT: "اتریوم", BNBUSDT: "بایننس کوین", SOLUSDT: "سولانا",
+    XRPUSDT: "ریپل", ADAUSDT: "کاردانو", DOGEUSDT: "دوج کوین", AVAXUSDT: "آوالانچ",
+    EURUSD: "یورو دلار", GBPUSD: "پوند دلار", USDJPY: "دلار ین", AUDUSD: "دلار استرالیا",
+    XAUUSD: "طلا", XAGUSD: "نقره", DJI: "داوجونز", NDX: "نزدک", SPX: "اس اند پی 500"
+  };
+  return (map[symbol] || symbol) + " بازار مالی";
+}
+
+function stripTags(s) {
+  return String(s || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function decodeXmlEntities(s) {
+  return String(s || "")
+    .split("&amp;").join("&")
+    .split("&lt;").join("<")
+    .split("&gt;").join(">")
+    .split("&quot;").join('"')
+    .split("&#39;").join("'");
+}
+
+function parseRssItems(xml, limit) {
+  const raw = String(xml || "");
+  const blocks = raw.match(/<item>[\s\S]*?<\/item>/g) || [];
+  const out = [];
+  for (const b of blocks.slice(0, limit * 2)) {
+    const title = decodeXmlEntities(stripTags((b.match(/<title>([\s\S]*?)<\/title>/i) || [])[1] || "")).trim();
+    const link = decodeXmlEntities(((b.match(/<link>([\s\S]*?)<\/link>/i) || [])[1] || "").trim());
+    const source = decodeXmlEntities(stripTags((b.match(/<source[^>]*>([\s\S]*?)<\/source>/i) || [])[1] || "")).trim();
+    const pubDate = decodeXmlEntities(stripTags((b.match(/<pubDate>([\s\S]*?)<\/pubDate>/i) || [])[1] || "")).trim();
+    if (!title || !link) continue;
+    out.push({ title: title.slice(0, 180), url: link, source: source || "Google News", publishedAt: pubDate || "" });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 function timeframeMinutes(tf) {
   const map = { M1: 1, M5: 5, M15: 15, M30: 30, H1: 60, H4: 240, D1: 1440, W1: 10080 };
   return map[String(tf || "").toUpperCase()] || 0;
@@ -4669,6 +4752,16 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
       </div>
 
+      <div class="card" id="newsCard">
+        <div class="card-h">
+          <strong>📰 اخبار فارسی نماد</strong>
+          <button id="refreshNews" class="btn ghost" style="min-width:unset; padding:6px 10px;">بروزرسانی</button>
+        </div>
+        <div class="card-b">
+          <div class="mini-list" id="newsList">در حال دریافت خبر…</div>
+        </div>
+      </div>
+
       <div class="card">
         <div class="card-h">
           <strong>تحلیل سریع</strong>
@@ -5031,6 +5124,7 @@ let ADMIN_WITHDRAWALS = [];
 let ADMIN_PROMPT_REQS = [];
 let QUOTE_TIMER = null;
 let QUOTE_BUSY = false;
+let NEWS_TIMER = null;
 
 const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
 
@@ -5205,6 +5299,51 @@ function setupLiveQuotePolling(){
   if (QUOTE_TIMER) clearInterval(QUOTE_TIMER);
   refreshLiveQuote(true);
   QUOTE_TIMER = setInterval(() => { refreshLiveQuote(false); }, 12000);
+}
+
+function renderNewsList(json){
+  const target = el("newsList");
+  if (!target) return;
+  if (!json?.ok || !Array.isArray(json.articles) || !json.articles.length) {
+    target.textContent = "فعلاً خبر مرتبطی پیدا نشد.";
+    return;
+  }
+  target.innerHTML = "";
+  for (const a of json.articles.slice(0, 6)) {
+    const row = document.createElement("div");
+    const title = document.createElement("a");
+    title.href = a.url || "#";
+    title.target = "_blank";
+    title.rel = "noopener noreferrer";
+    title.textContent = "• " + String(a.title || "بدون عنوان");
+    title.style.color = "#c7d2fe";
+    title.style.textDecoration = "none";
+    const meta = document.createElement("div");
+    meta.className = "muted";
+    meta.style.fontSize = "11px";
+    meta.textContent = (a.source || "") + (a.publishedAt ? (" | " + a.publishedAt) : "");
+    row.appendChild(title);
+    row.appendChild(meta);
+    row.style.marginBottom = "8px";
+    target.appendChild(row);
+  }
+}
+
+async function refreshSymbolNews(force = false){
+  if (!INIT_DATA) return;
+  if (!force && document.hidden) return;
+  const symbol = val("symbol") || "";
+  if (!symbol) return;
+  const target = el("newsList");
+  if (target && force) target.textContent = "در حال دریافت خبر…";
+  const { json } = await api("/api/news", { initData: INIT_DATA, symbol });
+  renderNewsList(json);
+}
+
+function setupNewsPolling(){
+  if (NEWS_TIMER) clearInterval(NEWS_TIMER);
+  refreshSymbolNews(true);
+  NEWS_TIMER = setInterval(() => { refreshSymbolNews(false); }, 60000);
 }
 
 function renderChartFallbackSvg(svgText){
@@ -5485,6 +5624,7 @@ async function boot(){
   pillTxt.textContent = "Online";
   hideToast();
   setupLiveQuotePolling();
+  setupNewsPolling();
 
   IS_STAFF = !!json.isStaff;
   IS_OWNER = json.role === "owner";
@@ -5534,8 +5674,9 @@ async function loadAdminBootstrap(){
 }
 
 el("q").addEventListener("input", (e) => filterSymbols(e.target.value));
-el("symbol")?.addEventListener("change", () => refreshLiveQuote(true));
+el("symbol")?.addEventListener("change", () => { refreshLiveQuote(true); refreshSymbolNews(true); });
 el("timeframe")?.addEventListener("change", () => refreshLiveQuote(true));
+el("refreshNews")?.addEventListener("click", () => refreshSymbolNews(true));
 
 el("tfChips").addEventListener("click", (e) => {
   const chip = e.target?.closest?.(".chip");
@@ -5589,6 +5730,7 @@ el("analyze").addEventListener("click", async () => {
 
   out.textContent = json.result || "⚠️ بدون خروجی";
   await refreshLiveQuote(true);
+  await refreshSymbolNews(true);
 
   // Render chart if available
   const chartCard = el("chartCard");
