@@ -667,7 +667,18 @@ TxID: ${txid}
           });
         } catch (e) {
           console.error("api/chart quickchart render failed:", e?.message || e);
-          return jsonResponse({ ok: false, error: "chart_render_failed" }, 502);
+          const autoLevels = (Array.isArray(levels) && levels.length)
+            ? levels
+            : extractLevelsFromCandles(candles);
+          const svg = buildLevelsOnlySvg(symbol, tf, autoLevels);
+          return new Response(svg, {
+            status: 200,
+            headers: {
+              "Content-Type": "image/svg+xml; charset=utf-8",
+              "Cache-Control": "public, max-age=30",
+              "X-Chart-Fallback": "internal_svg",
+            },
+          });
         }
       }
 
@@ -2725,9 +2736,9 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
 
   // fallback: use near timeframe source and aggregate to requested tf
   const altTimeframes = {
-    M15: ["M5"],
-    H1: ["M15"],
-    H4: ["H1"],
+    M15: ["H1"],
+    H1: ["M15", "H4"],
+    H4: ["H1", "D1"],
     D1: ["H4", "H1"],
   };
   const candidates = altTimeframes[tf] || [];
@@ -2744,7 +2755,27 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
     }
   }
 
+  // final fallback: try stale cache from any timeframe and remap
+  const remapped = await getAnyTimeframeMarketCache(env, symbol, tf, limit);
+  if (Array.isArray(remapped) && remapped.length) {
+    await setMarketCache(env, cacheKey, remapped.slice(-limit));
+    return remapped.slice(-limit);
+  }
+
   throw lastErr || new Error("market_data_all_failed");
+}
+
+async function getAnyTimeframeMarketCache(env, symbol, targetTf, limit) {
+  const tfs = ["M15", "H1", "H4", "D1"];
+  for (const sourceTf of tfs) {
+    const cacheKey = marketCacheKey(symbol, sourceTf);
+    const cached = await getMarketCacheStale(env, cacheKey);
+    if (!Array.isArray(cached) || !cached.length) continue;
+    const mapped = aggregateCandlesToTimeframe(cached, sourceTf, targetTf);
+    if (Array.isArray(mapped) && mapped.length) return mapped.slice(-limit);
+    if (String(sourceTf) === String(targetTf)) return cached.slice(-limit);
+  }
+  return [];
 }
 
 async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs, limit) {
@@ -4059,12 +4090,55 @@ async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
     console.error("text providers failed (retry compact):", e?.message || e);
     const compactBlock = buildMarketBlock(candles, 40);
     const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env);
-    draft = await runTextProviders(compactPrompt, env, st.textOrder);
+    try {
+      draft = await runTextProviders(compactPrompt, env, st.textOrder);
+    } catch (e2) {
+      console.error("text providers failed (fallback local):", e2?.message || e2);
+      draft = buildLocalFallbackAnalysis(symbol, st, candles, e2?.message || e?.message || "text_provider_unavailable");
+    }
   }
   const polished = await runPolishProviders(draft, env, st.polishOrder);
   const clean = stripHiddenModelOutput(polished);
   if (useCache && clean) await setAnalysisCache(env, cacheKey, clean);
   return clean;
+}
+
+function buildLocalFallbackAnalysis(symbol, st, candles, reason = "") {
+  const tf = st?.timeframe || "H4";
+  const snap = computeSnapshot(Array.isArray(candles) ? candles : []);
+  const hi = Number(snap?.range50?.hi || snap?.lastPrice || 0);
+  const lo = Number(snap?.range50?.lo || snap?.lastPrice || 0);
+  const mid = (hi && lo) ? (hi + lo) / 2 : Number(snap?.lastPrice || 0);
+  const spread = Math.max(0, hi - lo);
+  const z1 = Number((mid - spread * 0.15).toFixed(6));
+  const z2 = Number(mid.toFixed(6));
+  const z3 = Number((mid + spread * 0.15).toFixed(6));
+  const last = Number((snap?.lastPrice || mid || 0).toFixed(6));
+  const bias = snap?.trend || "نامشخص";
+  const why = reason ? `\n\n(حالت پایداری: ${String(reason).slice(0, 80)})` : "";
+
+  return (
+`1) ساختار بازار (${symbol} - ${tf})
+روند فعلی: ${bias}
+آخرین قیمت: ${last}
+دامنه 50 کندل اخیر: ${Number(lo.toFixed(6))} تا ${Number(hi.toFixed(6))}
+
+2) زون‌های مهم
+زون حمایتی: ${z1}
+زون تعادلی: ${z2}
+زون مقاومتی: ${z3}
+
+3) سناریوی معامله
+سناریوی خرید: تثبیت بالای ${z2} و پولبک موفق به همین ناحیه.
+سناریوی فروش: شکست معتبر ${z1} و بسته‌شدن کندل زیر آن.
+
+4) مدیریت ریسک
+ریسک پیشنهادی: ${st?.risk || "normal"}
+حدضرر را پشت زون شکست قرار بده و ورود پله‌ای انجام بده.
+
+5) جمع‌بندی
+این خروجی با موتور فالبک داخلی تولید شده تا سرویس قطع نشود. برای تایید نهایی، رفتار کندلی لحظه‌ای را چک کن.${why}`
+  );
 }
 
 async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
@@ -4132,12 +4206,52 @@ async function renderQuickChartPng(env, candles, symbol, tf, levels = []) {
   return await r.arrayBuffer();
 }
 
+function buildLevelsOnlySvg(symbol, timeframe, levels = []) {
+  const clean = (Array.isArray(levels) ? levels : []).filter((x) => Number.isFinite(Number(x))).map(Number).slice(0, 8);
+  const rows = clean.length ? clean : [0, 1, 2];
+  const width = 1200;
+  const height = 700;
+  const pad = 70;
+  const innerH = height - pad * 2;
+  const sorted = [...rows].sort((a, b) => b - a);
+  const max = Math.max(...sorted, 1);
+  const min = Math.min(...sorted, 0);
+  const den = Math.max(1e-9, max - min);
+  const yFor = (p) => pad + ((max - p) / den) * innerH;
+  const lines = sorted.map((p, i) => {
+    const y = yFor(p);
+    const c = i % 2 === 0 ? "#2FE3A5" : "#FFB020";
+    return `<line x1="${pad}" y1="${y}" x2="${width-pad}" y2="${y}" stroke="${c}" stroke-width="2" stroke-dasharray="6 6"/><text x="${width-pad-8}" y="${y-6}" fill="${c}" font-size="22" text-anchor="end">${p}</text>`;
+  }).join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+  <rect width="100%" height="100%" fill="#0B0F17"/>
+  <text x="${pad}" y="42" fill="#E6F0FF" font-size="30" font-family="Arial">${escapeXml(symbol)} - ${escapeXml(timeframe)} (Internal Fallback)</text>
+  <rect x="${pad}" y="${pad}" width="${width-pad*2}" height="${innerH}" rx="14" fill="#101827" stroke="#223047"/>
+  ${lines}
+</svg>`;
+}
+
 function extractLevels(text) {
   const nums = (String(text || "").match(/\b\d{1,6}(?:\.\d{1,6})?\b/g) || [])
     .map(Number)
     .filter(n => Number.isFinite(n));
   const uniq = [...new Set(nums)].sort((a,b)=>a-b);
   return uniq.slice(0, 6);
+}
+
+function extractLevelsFromCandles(candles) {
+  if (!Array.isArray(candles) || !candles.length) return [];
+  const tail = candles.slice(-60);
+  const highs = tail.map((x) => Number(x?.h)).filter((n) => Number.isFinite(n));
+  const lows = tail.map((x) => Number(x?.l)).filter((n) => Number.isFinite(n));
+  if (!highs.length || !lows.length) return [];
+  const hi = Math.max(...highs);
+  const lo = Math.min(...lows);
+  const mid = (hi + lo) / 2;
+  const q1 = lo + (hi - lo) * 0.25;
+  const q3 = lo + (hi - lo) * 0.75;
+  return [lo, q1, mid, q3, hi].map((n) => Number(n.toFixed(6)));
 }
 
 function buildZonesSvgFromAnalysis(analysisText, symbol, timeframe) {
@@ -4847,6 +4961,7 @@ const MINI_APP_HTML = `<!doctype html>
 
 const MINI_APP_JS = `const tg = window.Telegram?.WebApp;
 if (tg) tg.ready();
+if (tg?.expand) tg.expand();
 
 const out = document.getElementById("out");
 const meta = document.getElementById("meta");
@@ -5216,7 +5331,7 @@ async function boot(){
   pillTxt.textContent = "Connecting…";
   showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
 
-  const initData = tg?.initData || "";
+  const initData = tg?.initData || localStorage.getItem("miniapp_init_data") || "";
   if (!initData) {
     hideToast();
     pillTxt.textContent = "Offline";
@@ -5224,9 +5339,13 @@ async function boot(){
     return;
   }
   INIT_DATA = initData;
+  try { localStorage.setItem("miniapp_init_data", initData); } catch {}
   const {status, json} = await api("/api/user", { initData });
 
   if (!json?.ok) {
+    if (status === 401) {
+      try { localStorage.removeItem("miniapp_init_data"); } catch {}
+    }
     hideToast();
     pillTxt.textContent = "Offline";
     out.textContent = "⚠️ خطا: " + prettyErr(json, status);
