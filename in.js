@@ -4211,8 +4211,6 @@ async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
     } catch (e2) {
       console.error("text providers failed (fallback local):", e2?.message || e2);
       draft = buildLocalFallbackAnalysis(symbol, st.timeframe || "H4", candles, e2?.message || "text_provider_timeout");
-
-    }
   }
   const polished = await runPolishProviders(draft, env, st.polishOrder);
   const clean = stripHiddenModelOutput(polished);
@@ -4357,19 +4355,40 @@ function extractLevels(text) {
   return uniq.slice(0, 6);
 }
 
-function extractLevelsFromCandles(candles) {
-  if (!Array.isArray(candles) || !candles.length) return [];
-  const tail = candles.slice(-60);
-  const highs = tail.map((x) => Number(x?.h)).filter((n) => Number.isFinite(n));
-  const lows = tail.map((x) => Number(x?.l)).filter((n) => Number.isFinite(n));
-  if (!highs.length || !lows.length) return [];
-  const hi = Math.max(...highs);
-  const lo = Math.min(...lows);
-  const mid = (hi + lo) / 2;
-  const q1 = lo + (hi - lo) * 0.25;
-  const q3 = lo + (hi - lo) * 0.75;
-  return [lo, q1, mid, q3, hi].map((n) => Number(n.toFixed(6)));
-}
+function extractLevelsFromCandles(candles, maxLevels = 8) {
+  const arr = Array.isArray(candles)
+    ? candles.filter((x) => Number.isFinite(Number(x?.h)) && Number.isFinite(Number(x?.l)) && Number.isFinite(Number(x?.c)))
+    : [];
+  if (!arr.length) return [];
+
+  const tail = arr.slice(-Math.min(80, arr.length));
+  const highs = tail.map((x) => Number(x.h));
+  const lows = tail.map((x) => Number(x.l));
+  const closes = tail.map((x) => Number(x.c));
+  const levels = [];
+
+  const pushUniq = (n) => {
+    if (!Number.isFinite(n) || n <= 0) return;
+    if (!levels.some((x) => Math.abs(x - n) / Math.max(1, n) < 0.0015)) {
+      levels.push(Number(n.toFixed(6)));
+    }
+  };
+
+  pushUniq(Math.max(...highs));
+  pushUniq(Math.min(...lows));
+
+  const sorted = closes.slice().sort((a, b) => a - b);
+  const q = (p) => {
+    const idx = Math.max(0, Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p)));
+    return sorted[idx];
+  };
+
+  pushUniq(q(0.25));
+  pushUniq(q(0.5));
+  pushUniq(q(0.75));
+  pushUniq(closes[closes.length - 1]);
+
+  return levels.slice(0, Math.max(1, Number(maxLevels) || 8));
 
 function buildZonesSvgFromAnalysis(analysisText, symbol, timeframe) {
   const levels = extractLevels(analysisText);
@@ -5554,7 +5573,6 @@ async function boot(){
   const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
   const savedInitData = localStorage.getItem("miniapp_init_data") || "";
   const initData = tg?.initData || qsInitData || savedInitData;
-
   if (!initData) {
     hideToast();
     pillTxt.textContent = "Offline";
