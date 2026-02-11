@@ -671,6 +671,56 @@ TxID: ${txid}
         }
       }
 
+      if (url.pathname === "/api/quote" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
+        const st = await ensureUser(v.userId, env);
+        const symbol = String(body.symbol || "").trim();
+        const tf = String(body.timeframe || st.timeframe || "H4").toUpperCase();
+        if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
+
+        let candles = [];
+        try {
+          candles = await getMarketCandlesWithFallback(env, symbol, tf);
+        } catch (e) {
+          console.error("api/quote market fallback failed:", e?.message || e);
+          candles = [];
+        }
+        if (!Array.isArray(candles) || !candles.length) {
+          candles = await getMarketCacheStale(env, marketCacheKey(symbol, tf));
+        }
+        if (!Array.isArray(candles) || !candles.length) {
+          return jsonResponse({ ok: false, error: "quote_unavailable" }, 404);
+        }
+
+        const snap = computeSnapshot(candles);
+        if (!snap || !Number.isFinite(Number(snap.lastPrice))) {
+          return jsonResponse({ ok: false, error: "quote_bad_data" }, 502);
+        }
+        const cp = Number(snap.changePct || 0);
+        const status = cp > 0.08 ? "up" : (cp < -0.08 ? "down" : "flat");
+        const quality = candles.length >= minCandlesForTimeframe(tf) ? "full" : "limited";
+
+        return jsonResponse({
+          ok: true,
+          symbol,
+          timeframe: tf,
+          price: Number(snap.lastPrice),
+          changePct: cp,
+          trend: snap.trend || "نامشخص",
+          sma20: snap.sma20,
+          sma50: snap.sma50,
+          lastTs: snap.lastTs,
+          candles: candles.length,
+          quality,
+          status,
+        });
+      }
+
       if (url.pathname === "/api/analyze" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
@@ -711,9 +761,14 @@ TxID: ${txid}
               const tf = st.timeframe || "H4";
               levels = extractLevels(result);
               const origin = new URL(request.url).origin;
-              chartUrl = `${origin}/api/chart?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&levels=${encodeURIComponent(levels.join(","))}`;
               const candles = await getMarketCandlesWithFallback(env, symbol, tf).catch(() => []);
-              quickChartSpec = buildQuickChartSpec(candles, symbol, tf, levels);
+              if (Array.isArray(candles) && candles.length) {
+                chartUrl = `${origin}/api/chart?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&levels=${encodeURIComponent(levels.join(","))}`;
+                quickChartSpec = buildQuickChartSpec(candles, symbol, tf, levels);
+              } else if (levels.length) {
+                chartUrl = buildQuickChartLevelsOnlyUrl(symbol, tf, levels);
+                quickChartSpec = { fallback: "levels_only", symbol, timeframe: tf, levels };
+              }
             }
           } catch (e) {
             console.error("chartUrl build error:", e?.message || e);
@@ -2699,8 +2754,9 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
   const limit = Number(env.MARKET_DATA_CANDLES_LIMIT || 120);
   const tf = String(timeframe || "H4").toUpperCase();
   const cacheKey = marketCacheKey(symbol, tf);
+  const minNeed = minCandlesForTimeframe(tf);
   const cached = await getMarketCache(env, cacheKey);
-  if (Array.isArray(cached) && cached.length) return cached;
+  if (Array.isArray(cached) && cached.length >= Math.min(6, minNeed)) return cached;
 
   const chain = resolveMarketProviderChain(env, symbol);
   let lastErr = null;
@@ -2715,7 +2771,7 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
       if (p === "yahoo") candles = await fetchYahooChartCandles(symbol, tf, limit, timeoutMs);
       if (Array.isArray(candles) && candles.length) {
         await setMarketCache(env, cacheKey, candles);
-        return candles;
+        if (candles.length >= minNeed) return candles;
       }
     } catch (e) {
       lastErr = e;
@@ -2723,21 +2779,24 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
     }
   }
 
+  const stale = await getMarketCacheStale(env, cacheKey);
+  if (Array.isArray(stale) && stale.length) return stale;
+
   // fallback: use near timeframe source and aggregate to requested tf
   const altTimeframes = {
-    M15: ["M5"],
-    H1: ["M15"],
-    H4: ["H1"],
+    M15: ["M5", "M1"],
+    H1: ["M15", "M5"],
+    H4: ["H1", "M15"],
     D1: ["H4", "H1"],
   };
   const candidates = altTimeframes[tf] || [];
   for (const altTf of candidates) {
     try {
-      const altCandles = await getMarketCandlesWithFallbackRaw(env, symbol, altTf, timeoutMs, limit * 4);
-      const mapped = aggregateCandlesToTimeframe(altCandles, altTf, tf);
+      const altCandles = await getMarketCandlesWithFallbackRaw(env, symbol, altTf, timeoutMs, limit * 8);
+      const mapped = aggregateCandlesToTimeframe(altCandles, altTf, tf).slice(-limit);
       if (Array.isArray(mapped) && mapped.length) {
-        await setMarketCache(env, cacheKey, mapped.slice(-limit));
-        return mapped.slice(-limit);
+        await setMarketCache(env, cacheKey, mapped);
+        if (mapped.length >= Math.min(8, minNeed)) return mapped;
       }
     } catch (e) {
       lastErr = e;
@@ -2837,6 +2896,37 @@ function computeSnapshot(candles) {
 function candlesToCompactCSV(candles, maxRows = 80) {
   const tail = candles.slice(-maxRows);
   return tail.map(x => `${x.t},${x.o},${x.h},${x.l},${x.c}`).join("\n");
+}
+
+function minCandlesForTimeframe(tf) {
+  const m = { M15: 48, H1: 36, H4: 30, D1: 20 };
+  return m[String(tf || "").toUpperCase()] || 24;
+}
+
+function buildLocalFallbackAnalysis(symbol, timeframe, candles, reason) {
+  const snap = computeSnapshot(Array.isArray(candles) ? candles : []);
+  const levels = extractLevelsFromCandles(candles, 8);
+  const levelTxt = levels.length ? levels.join(" | ") : "داده کافی نیست";
+  const risk = snap ? (Math.abs(Number(snap.changePct || 0)) > 2 ? "بالا" : "متوسط") : "نامشخص";
+  const bias = snap?.trend || "نامشخص";
+  return [
+    `۱) وضعیت کلی`,
+    `نماد ${symbol} در تایم‌فریم ${timeframe} با بایاس ${bias} ارزیابی شد.`,
+    snap ? `قیمت آخر: ${snap.lastPrice} | تغییر: ${snap.changePct}%` : "قیمت لحظه‌ای معتبر در دسترس نیست.",
+    ``,
+    `۲) زون‌ها و سطوح`,
+    `سطوح پیشنهادی (auto): ${levelTxt}`,
+    ``,
+    `۳) سناریوها`,
+    `سناریوی اصلی: ادامه ${bias === "صعودی" ? "حرکت رو به بالا" : (bias === "نزولی" ? "فشار فروش" : "نوسانی")}.`,
+    `سناریوی جایگزین: شکست ساختار خلاف جهت و بازگشت به محدوده‌های میانی.`,
+    ``,
+    `۴) مدیریت ریسک`,
+    `ریسک بازار: ${risk}. ورود پله‌ای، حدضرر اجباری و کاهش اهرم توصیه می‌شود.`,
+    ``,
+    `۵) وضعیت سرویس`,
+    `تحلیل با فالبک داخلی تولید شد (${reason || "text_provider_unavailable"}).`,
+  ].join("\n");
 }
 
 /* ========================== TEXT BUILDERS ========================== */
@@ -3859,6 +3949,24 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
   return `https://quickchart.io/chart?version=4&format=png&w=900&h=450&devicePixelRatio=2&plugins=chartjs-chart-financial&c=${encoded}`;
 }
 
+function buildQuickChartLevelsOnlyUrl(symbol, tf, levels = []) {
+  const lv = levels.map(Number).filter(Number.isFinite).slice(0, 12);
+  const labels = lv.map((_, i) => `L${i + 1}`);
+  const cfg = {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{ label: `${symbol} ${tf} levels`, data: lv, borderColor: "#22d3ee", backgroundColor: "rgba(34,211,238,.15)", fill: true, tension: 0.2 }],
+    },
+    options: {
+      plugins: { legend: { display: true }, title: { display: true, text: `${symbol} · ${tf} · levels` } },
+      scales: { y: { grid: { color: "rgba(148,163,184,.25)" } }, x: { grid: { color: "rgba(148,163,184,.15)" } } },
+    },
+  };
+  const encoded = encodeURIComponent(JSON.stringify(cfg));
+  return `https://quickchart.io/chart?version=4&format=png&w=900&h=450&devicePixelRatio=2&c=${encoded}`;
+}
+
 function stripHiddenModelOutput(text) {
   let out = String(text || "");
   out = out.replace(/\*\*?\s*quickchart_config\s*\*\*?/gi, "");
@@ -4057,9 +4165,14 @@ async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
     draft = await runTextProviders(prompt, env, st.textOrder);
   } catch (e) {
     console.error("text providers failed (retry compact):", e?.message || e);
-    const compactBlock = buildMarketBlock(candles, 40);
-    const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env);
-    draft = await runTextProviders(compactPrompt, env, st.textOrder);
+    try {
+      const compactBlock = buildMarketBlock(candles, 40);
+      const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env);
+      draft = await runTextProviders(compactPrompt, env, st.textOrder);
+    } catch (e2) {
+      console.error("text providers failed (fallback local):", e2?.message || e2);
+      draft = buildLocalFallbackAnalysis(symbol, st.timeframe || "H4", candles, e2?.message || "text_provider_timeout");
+    }
   }
   const polished = await runPolishProviders(draft, env, st.polishOrder);
   const clean = stripHiddenModelOutput(polished);
@@ -4138,6 +4251,42 @@ function extractLevels(text) {
     .filter(n => Number.isFinite(n));
   const uniq = [...new Set(nums)].sort((a,b)=>a-b);
   return uniq.slice(0, 6);
+}
+
+function extractLevelsFromCandles(candles, maxLevels = 8) {
+  const arr = Array.isArray(candles)
+    ? candles.filter((x) => Number.isFinite(Number(x?.h)) && Number.isFinite(Number(x?.l)) && Number.isFinite(Number(x?.c)))
+    : [];
+  if (!arr.length) return [];
+
+  const tail = arr.slice(-Math.min(80, arr.length));
+  const highs = tail.map((x) => Number(x.h));
+  const lows = tail.map((x) => Number(x.l));
+  const closes = tail.map((x) => Number(x.c));
+  const levels = [];
+
+  const pushUniq = (n) => {
+    if (!Number.isFinite(n) || n <= 0) return;
+    if (!levels.some((x) => Math.abs(x - n) / Math.max(1, n) < 0.0015)) {
+      levels.push(Number(n.toFixed(6)));
+    }
+  };
+
+  pushUniq(Math.max(...highs));
+  pushUniq(Math.min(...lows));
+
+  const sorted = closes.slice().sort((a, b) => a - b);
+  const q = (p) => {
+    const idx = Math.max(0, Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p)));
+    return sorted[idx];
+  };
+
+  pushUniq(q(0.25));
+  pushUniq(q(0.5));
+  pushUniq(q(0.75));
+  pushUniq(closes[closes.length - 1]);
+
+  return levels.slice(0, Math.max(1, Number(maxLevels) || 8));
 }
 
 function buildZonesSvgFromAnalysis(analysisText, symbol, timeframe) {
@@ -4500,6 +4649,13 @@ const MINI_APP_HTML = `<!doctype html>
     .toggle input{ width:18px; height:18px; }
     textarea.control{ min-height: 120px; resize: vertical; }
     .mini-list{ font-size: 12px; color: var(--muted); white-space: pre-wrap; }
+    .quote-grid{ display:grid; grid-template-columns: repeat(auto-fit,minmax(160px,1fr)); gap:10px; }
+    .quote-item{ border:1px solid rgba(255,255,255,.12); border-radius:14px; padding:10px; background:rgba(255,255,255,.04); }
+    .quote-item .k{ font-size:11px; color:var(--muted); }
+    .quote-item .v{ font-size:16px; font-weight:800; margin-top:4px; }
+    .q-up{ color: var(--good); }
+    .q-down{ color: var(--bad); }
+    .q-flat{ color: var(--warn); }
   </style>
 </head>
 <body>
@@ -4525,6 +4681,22 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="tag" id="offerTag">Special</div>
         </div>
       </div>
+      <div class="card" id="quoteCard">
+        <div class="card-h">
+          <strong>داشبورد قیمت لحظه‌ای</strong>
+          <span id="quoteStamp">—</span>
+        </div>
+        <div class="card-b">
+          <div class="quote-grid">
+            <div class="quote-item"><div class="k">نماد</div><div class="v" id="quoteSymbol">—</div></div>
+            <div class="quote-item"><div class="k">قیمت</div><div class="v" id="quotePrice">—</div></div>
+            <div class="quote-item"><div class="k">تغییر</div><div class="v" id="quoteChange">—</div></div>
+            <div class="quote-item"><div class="k">روند</div><div class="v" id="quoteTrend">—</div></div>
+          </div>
+          <div class="muted" style="font-size:12px; margin-top:8px;" id="quoteMeta">در حال دریافت داده…</div>
+        </div>
+      </div>
+
       <div class="card">
         <div class="card-h">
           <strong>تحلیل سریع</strong>
@@ -4873,10 +5045,13 @@ let ALL_SYMBOLS = [];
 let INIT_DATA = "";
 let IS_STAFF = false;
 let IS_OWNER = false;
+const API_BASE = window.location.origin;
 let ADMIN_TICKETS = [];
 let ADMIN_TICKETS_ALL = [];
 let ADMIN_WITHDRAWALS = [];
 let ADMIN_PROMPT_REQS = [];
+let QUOTE_TIMER = null;
+let QUOTE_BUSY = false;
 
 const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
 
@@ -4958,13 +5133,26 @@ function setTf(tf){
 }
 
 async function api(path, body){
-  const r = await fetch(path, {
-    method: "POST",
-    headers: {"content-type":"application/json"},
-    body: JSON.stringify(body),
-  });
-  const j = await r.json().catch(() => null);
-  return { status: r.status, json: j };
+  let lastErr = null;
+  for (let i = 0; i < 2; i++) {
+    try {
+      const ac = new AbortController();
+      const tm = setTimeout(() => ac.abort("timeout"), 12000 + (i * 4000));
+      const r = await fetch(`\${API_BASE}\${path}`, {
+        method: "POST",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify(body),
+        signal: ac.signal,
+      });
+      clearTimeout(tm);
+      const j = await r.json().catch(() => null);
+      return { status: r.status, json: j };
+    } catch (e) {
+      lastErr = e;
+      await new Promise((res) => setTimeout(res, 350 * (i + 1)));
+    }
+  }
+  return { status: 599, json: { ok: false, error: String(lastErr?.message || lastErr || "network_error") } };
 }
 
 async function adminApi(path, body){
@@ -4981,6 +5169,62 @@ function prettyErr(j, status){
     return "احراز هویت تلگرام ناموفق است.";
   }
   return "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.";
+}
+
+function fmtPrice(v){
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  const digits = n >= 1000 ? 2 : (n >= 1 ? 4 : 6);
+  return n.toLocaleString("en-US", { maximumFractionDigits: digits });
+}
+
+function setQuoteUi(data, errMsg = ""){
+  const qSym = el("quoteSymbol");
+  const qPrice = el("quotePrice");
+  const qChange = el("quoteChange");
+  const qTrend = el("quoteTrend");
+  const qStamp = el("quoteStamp");
+  const qMeta = el("quoteMeta");
+  if (!qSym || !qPrice || !qChange || !qTrend || !qStamp || !qMeta) return;
+
+  if (!data?.ok) {
+    qMeta.textContent = errMsg || "داده قیمت در دسترس نیست.";
+    qStamp.textContent = "—";
+    return;
+  }
+
+  const cp = Number(data.changePct || 0);
+  qSym.textContent = data.symbol || "—";
+  qPrice.textContent = fmtPrice(data.price);
+  qChange.textContent = `\${cp > 0 ? "+" : ""}\${cp.toFixed(3)}%`;
+  qTrend.textContent = data.trend || "نامشخص";
+
+  qChange.classList.remove("q-up","q-down","q-flat");
+  qChange.classList.add(data.status === "up" ? "q-up" : (data.status === "down" ? "q-down" : "q-flat"));
+  const dt = data.lastTs ? new Date(Number(data.lastTs)) : new Date();
+  qStamp.textContent = dt.toLocaleTimeString("fa-IR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  qMeta.textContent = `TF: \${data.timeframe || "-"} | candles: \${data.candles || 0} | کیفیت: \${data.quality === "full" ? "کامل" : "محدود"}`;
+}
+
+async function refreshLiveQuote(force = false){
+  if (!INIT_DATA || QUOTE_BUSY) return;
+  if (!force && document.hidden) return;
+  QUOTE_BUSY = true;
+  try {
+    const symbol = val("symbol") || "";
+    const timeframe = val("timeframe") || "H4";
+    if (!symbol) return;
+    const { json } = await api("/api/quote", { initData: INIT_DATA, symbol, timeframe });
+    setQuoteUi(json, "خطا در دریافت قیمت لحظه‌ای");
+  } finally {
+    QUOTE_BUSY = false;
+  }
+}
+
+function setupLiveQuotePolling(){
+  if (QUOTE_TIMER) clearInterval(QUOTE_TIMER);
+  refreshLiveQuote(true);
+  QUOTE_TIMER = setInterval(() => { refreshLiveQuote(false); }, 12000);
 }
 
 function renderChartFallbackSvg(svgText){
@@ -5216,7 +5460,9 @@ async function boot(){
   pillTxt.textContent = "Connecting…";
   showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
 
-  const initData = tg?.initData || "";
+  const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
+  const savedInitData = localStorage.getItem("miniapp_init_data") || "";
+  const initData = tg?.initData || qsInitData || savedInitData;
   if (!initData) {
     hideToast();
     pillTxt.textContent = "Offline";
@@ -5224,6 +5470,7 @@ async function boot(){
     return;
   }
   INIT_DATA = initData;
+  localStorage.setItem("miniapp_init_data", initData);
   const {status, json} = await api("/api/user", { initData });
 
   if (!json?.ok) {
@@ -5257,6 +5504,7 @@ async function boot(){
   out.textContent = "آماده ✅";
   pillTxt.textContent = "Online";
   hideToast();
+  setupLiveQuotePolling();
 
   IS_STAFF = !!json.isStaff;
   IS_OWNER = json.role === "owner";
@@ -5306,12 +5554,15 @@ async function loadAdminBootstrap(){
 }
 
 el("q").addEventListener("input", (e) => filterSymbols(e.target.value));
+el("symbol")?.addEventListener("change", () => refreshLiveQuote(true));
+el("timeframe")?.addEventListener("change", () => refreshLiveQuote(true));
 
 el("tfChips").addEventListener("click", (e) => {
   const chip = e.target?.closest?.(".chip");
   const tf = chip?.dataset?.tf;
   if (!tf) return;
   setTf(tf);
+  refreshLiveQuote(true);
 });
 
 el("save").addEventListener("click", async () => {
@@ -5357,6 +5608,8 @@ el("analyze").addEventListener("click", async () => {
   }
 
   out.textContent = json.result || "⚠️ بدون خروجی";
+  await refreshLiveQuote(true);
+
   // Render chart if available
   const chartCard = el("chartCard");
   const chartImg = el("chartImg");
@@ -5680,7 +5933,7 @@ el("loadUsers")?.addEventListener("click", async () => {
 el("downloadReportPdf")?.addEventListener("click", async () => {
   try {
     showToast("در حال ساخت PDF…", "گزارش کامل", "PDF", true);
-    const r = await fetch("/api/admin/report/pdf", {
+    const r = await fetch(`\${API_BASE}/api/admin/report/pdf`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ initData: INIT_DATA, limit: 250 }),
