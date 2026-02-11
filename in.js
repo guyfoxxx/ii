@@ -523,8 +523,7 @@ TxID: ${txid}
           } catch (e) {
             console.error("chartUrl build error:", e?.message || e);
           }
-          const quickchartConfig = { symbol, timeframe: st.timeframe || "H4", levels };
-          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickchartConfig });
+          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels });
         } catch (e) {
           console.error("api/analyze error:", e);
           return jsonResponse({ ok: false, error: "server_error" }, 500);
@@ -714,7 +713,7 @@ function isAdmin(from, env) {
 
 function kyivDateString(d = new Date()) {
   return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Kyiv",
+    timeZone: "Asia/Tehran",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -2510,8 +2509,6 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
 ` +
     `- مدیریت سرمایه متناسب با Capital را لحاظ کن و سایز پوزیشن پیشنهادی بده
 ` +
-    `- quickchart_config را به شکل JSON داخلی بساز اما به کاربر نمایش نده
-` +
     `- سطح‌های قیمتی را مشخص کن (X/Y/Z)
 ` +
     `- شرط کندلی را واضح بگو (close/wick)
@@ -3337,7 +3334,7 @@ function isSymbol(t) {
 /* ========================== TEXTS ========================== */
 function getSupportFaq() {
   return [
-    { q: "چطور سهمیه روزانه شارژ می‌شود؟", a: "سهمیه هر روز (Kyiv) صفر می‌شود و مجدداً قابل استفاده است." },
+    { q: "چطور سهمیه روزانه شارژ می‌شود؟", a: "سهمیه هر روز (Tehran) صفر می‌شود و مجدداً قابل استفاده است." },
     { q: "چرا تحلیل ناموفق شد؟", a: "اتصال دیتا یا مدل ممکن است موقتاً قطع باشد. چند دقیقه بعد دوباره تلاش کن." },
     { q: "چطور اشتراک فعال کنم؟", a: "پرداخت را انجام بده و هش تراکنش را برای ادمین ارسال کن تا تأیید و فعال شود." },
     { q: "چطور رفرال کار می‌کند؟", a: "هر دعوت موفق با شماره جدید ۳ امتیاز دارد. هر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه." },
@@ -3371,7 +3368,7 @@ function profileText(st, from, env) {
   const code = (st.referral?.codes || [])[0] || "";
   const deep = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "-";
 
-  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Kyiv): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
+  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Tehran): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
 }
 
 function inviteShareText(st, env) {
@@ -3389,31 +3386,14 @@ QuickChart renders Chart.js configs as images via https://quickchart.io/chart .
 Financial (candlestick/OHLC) charts are supported via chartjs-chart-financial plugin.
 */
 function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
-  const items = (candles || []).slice(-60).map((c) => ({
-    x: new Date(c.t || c.time || c.ts || c.timestamp || Date.now()).toISOString(),
+  const items = (candles || []).slice(-80).map((c) => ({
+    x: Number(c.t || c.time || c.ts || c.timestamp || Date.now()),
     o: Number(c.o),
     h: Number(c.h),
     l: Number(c.l),
     c: Number(c.c),
-  }));
+  })).filter((x) => Number.isFinite(x.x) && Number.isFinite(x.o) && Number.isFinite(x.h) && Number.isFinite(x.l) && Number.isFinite(x.c));
 
-  const annotations = (levels || []).slice(0, 6).map((lvl, idx) => ({
-    type: "line",
-    scaleID: "y",
-    value: lvl,
-    borderColor: "rgba(109,94,246,0.65)",
-    borderWidth: 2,
-    borderDash: [4, 4],
-    label: {
-      enabled: true,
-      content: `Zone ${idx + 1}: ${lvl}`,
-      backgroundColor: "rgba(0,0,0,0.6)",
-      color: "#fff",
-      position: "end",
-    },
-  }));
-
-  // Basic Chart.js + chartjs-chart-financial config
   const cfg = {
     type: "candlestick",
     data: {
@@ -3421,19 +3401,13 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
         {
           label: `${symbol} ${tf}`,
           data: items,
-          color: {
-            up: "#2FE3A5",
-            down: "#FF4D4D",
-            unchanged: "#888",
-          },
+          color: { up: "#2FE3A5", down: "#FF4D4D", unchanged: "#888" },
         },
       ],
     },
     options: {
-      plugins: {
-        legend: { display: false },
-        annotation: { annotations },
-      },
+      parsing: false,
+      plugins: { legend: { display: false } },
       scales: {
         x: { ticks: { maxRotation: 0, autoSkip: true } },
       },
@@ -3441,9 +3415,17 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
   };
 
   const encoded = encodeURIComponent(JSON.stringify(cfg));
-  // width/height params supported by /chart endpoint
-  return `https://quickchart.io/chart?w=900&h=450&devicePixelRatio=2&c=${encoded}`;
+  return `https://quickchart.io/chart?version=4&format=png&w=900&h=450&devicePixelRatio=2&plugins=chartjs-chart-financial&c=${encoded}`;
 }
+
+function stripHiddenModelOutput(text) {
+  let out = String(text || "");
+  out = out.replace(/\*\*?\s*quickchart_config\s*\*\*?/gi, "");
+  out = out.replace(/```\s*json[\s\S]*?quickchart[\s\S]*?```/gi, "");
+  out = out.replace(/quickchart_config\s*:\s*\{[\s\S]*?\}/gi, "");
+  return out.trim();
+}
+
 async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
   await tgSendMessage(env, chatId, `⏳ جمع‌آوری داده و تحلیل ${symbol}...`, kb([[BTN.HOME]]));
 
@@ -3575,8 +3557,9 @@ async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
     draft = await runTextProviders(compactPrompt, env, st.textOrder);
   }
   const polished = await runPolishProviders(draft, env, st.polishOrder);
-  if (useCache && polished) await setAnalysisCache(env, cacheKey, polished);
-  return polished;
+  const clean = stripHiddenModelOutput(polished);
+  if (useCache && clean) await setAnalysisCache(env, cacheKey, clean);
+  return clean;
 }
 
 async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
@@ -4475,7 +4458,7 @@ function prettyErr(j, status){
 
 function updateMeta(state, quota){
   meta.textContent = \`سهمیه: \${quota || "-"}\`;
-  sub.textContent = \`ID: \${state?.userId || "-"} | امروز(Kyiv): \${state?.dailyDate || "-"}\`;
+  sub.textContent = \`ID: \${state?.userId || "-"} | امروز(Tehran): \${state?.dailyDate || "-"}\`;
 }
 
 function renderStyleList(styles){
@@ -4512,6 +4495,42 @@ function renderUsers(list){
     const user = u.username ? \`@\${u.username.replace(/^@/, "")}\` : u.userId;
     return \`• \${user} | تلفن: \${u.phone || "—"} | مدت: \${u.usageDays} روز | تحلیل موفق: \${u.totalAnalyses} | آخرین تحلیل: \${u.lastAnalysisAt || "—"} | پرداخت: \${u.paymentCount} (\${u.paymentTotal || 0}) | اشتراک: \${u.subscriptionType || "free"} | انقضا: \${u.subscriptionExpiresAt || "—"} | سهمیه: \${u.dailyUsed}/\${u.dailyLimit} | رفرال: \${u.referralInvites} | TX: \${u.lastTxHash || "—"} | پرامپت: \${u.customPromptId || "—"}\`;
   }).join("\\n");
+}
+
+function renderFullAdminReport(users, payments, withdrawals, tickets) {
+  const target = el("usersReport");
+  if (!target) return;
+
+  const u = Array.isArray(users) ? users : [];
+  const p = Array.isArray(payments) ? payments : [];
+  const w = Array.isArray(withdrawals) ? withdrawals : [];
+  const t = Array.isArray(tickets) ? tickets : [];
+
+  const head = [
+    `📊 گزارش کامل ادمین (Asia/Tehran)`,
+    `کاربران: ${u.length} | پرداخت‌ها: ${p.length} | برداشت‌ها: ${w.length} | تیکت‌ها: ${t.length}`,
+    `────────────────────`,
+  ];
+
+  const usersBlock = u.slice(0, 80).map((x) => {
+    const user = x.username ? `@${x.username.replace(/^@/, "")}` : x.userId;
+    return `• ${user} | تحلیل موفق: ${x.totalAnalyses || 0} | سهمیه: ${x.dailyUsed || 0}/${x.dailyLimit || 0} | اشتراک: ${x.subscriptionType || "free"} | TX: ${x.lastTxHash || "—"}`;
+  });
+
+  const payBlock = p.slice(0, 40).map((x) => `• ${x.username || x.userId} | ${x.amount || 0} | ${x.status || "-"} | ${x.txHash || "—"}`);
+  const wdBlock = w.slice(0, 40).map((x) => `• ${x.userId || "-"} | ${x.amount || 0} | ${x.status || "pending"} | ${x.address || "—"}`);
+  const tkBlock = t.slice(0, 40).map((x) => `• ${x.username || x.userId || "-"} | ${x.status || "pending"} | ${String(x.text || "").slice(0, 80)}`);
+
+  target.textContent = [
+    ...head,
+    "👥 کاربران:", ...(usersBlock.length ? usersBlock : ["—"]),
+    "",
+    "💳 پرداخت‌ها:", ...(payBlock.length ? payBlock : ["—"]),
+    "",
+    "➖ برداشت‌ها:", ...(wdBlock.length ? wdBlock : ["—"]),
+    "",
+    "🎫 تیکت‌ها:", ...(tkBlock.length ? tkBlock : ["—"]),
+  ].join("\n");
 }
 
 function safeJsonParse(text, fallback) {
@@ -4781,8 +4800,15 @@ el("activateSubscription")?.addEventListener("click", async () => {
 });
 
 el("loadUsers")?.addEventListener("click", async () => {
-  const { json } = await adminApi("/api/admin/users", { limit: 120 });
-  if (json?.ok) renderUsers(json.users || []);
+  const [{ json: usersJson }, { json: bootJson }] = await Promise.all([
+    adminApi("/api/admin/users", { limit: 200 }),
+    adminApi("/api/admin/bootstrap", {}),
+  ]);
+  if (usersJson?.ok && bootJson?.ok) {
+    renderFullAdminReport(usersJson.users || [], bootJson.payments || [], bootJson.withdrawals || [], bootJson.tickets || []);
+  } else if (usersJson?.ok) {
+    renderUsers(usersJson.users || []);
+  }
 });
 
 boot();`;
