@@ -17,7 +17,7 @@ export default {
       if (url.pathname === "/api/user" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN);
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -47,7 +47,7 @@ export default {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN);
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -83,7 +83,7 @@ export default {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN);
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
         if (!isStaff(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
 
@@ -269,6 +269,24 @@ ${reply}`;
             };
           });
           return jsonResponse({ ok: true, users: report });
+        }
+
+        if (url.pathname === "/api/admin/report/pdf") {
+          if (!isOwner(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+          const users = await listUsers(env, Math.min(300, Math.max(1, Number(body.limit || 200))));
+          const payments = await listPayments(env, 120);
+          const withdrawals = await listWithdrawals(env, 120);
+          const tickets = await listSupportTickets(env, 120);
+          const lines = buildAdminReportLines(users, payments, withdrawals, tickets);
+          const pdfBytes = buildSimplePdfFromText(lines.join("\n"));
+          return new Response(pdfBytes, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/pdf",
+              "Content-Disposition": `attachment; filename=admin-report-${Date.now()}.pdf`,
+              "Cache-Control": "no-store",
+            },
+          });
         }
 
         if (url.pathname === "/api/admin/payments/list") {
@@ -530,7 +548,7 @@ ${reply}`;
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN);
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -568,7 +586,7 @@ ${text}`);
       if (url.pathname === "/api/wallet/deposit/notify" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN);
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -649,7 +667,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN);
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -679,6 +697,7 @@ TxID: ${txid}
           let chartUrl = "";
           let levels = [];
           let quickChartSpec = null;
+          let zonesSvg = "";
           try {
             if (String(env.QUICKCHART || "") !== "0") {
               const tf = st.timeframe || "H4";
@@ -691,8 +710,13 @@ TxID: ${txid}
           } catch (e) {
             console.error("chartUrl build error:", e?.message || e);
           }
+          try {
+            zonesSvg = buildZonesSvgFromAnalysis(result, symbol, st.timeframe || "H4");
+          } catch (e) {
+            console.error("zones svg build error:", e?.message || e);
+          }
           const quickchartConfig = { symbol, timeframe: st.timeframe || "H4", levels };
-          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec, quickchartConfig });
+          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec, quickchartConfig, zonesSvg });
         } catch (e) {
           console.error("api/analyze error:", e);
           return jsonResponse({ ok: false, error: "server_error" }, 500);
@@ -2643,9 +2667,10 @@ async function setMarketCache(env, key, value) {
 async function getMarketCandlesWithFallback(env, symbol, timeframe) {
   const timeoutMs = Number(env.MARKET_DATA_TIMEOUT_MS || 12000);
   const limit = Number(env.MARKET_DATA_CANDLES_LIMIT || 120);
-  const cacheKey = marketCacheKey(symbol, timeframe);
+  const tf = String(timeframe || "H4").toUpperCase();
+  const cacheKey = marketCacheKey(symbol, tf);
   const cached = await getMarketCache(env, cacheKey);
-  if (cached) return cached;
+  if (Array.isArray(cached) && cached.length) return cached;
 
   const chain = resolveMarketProviderChain(env, symbol);
   let lastErr = null;
@@ -2653,12 +2678,12 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
   for (const p of chain) {
     try {
       let candles = null;
-      if (p === "binance") candles = await fetchBinanceCandles(symbol, timeframe, limit, timeoutMs);
-      if (p === "twelvedata") candles = await fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env);
-      if (p === "alphavantage") candles = await fetchAlphaVantageFxIntraday(symbol, timeframe, limit, timeoutMs, env);
-      if (p === "finnhub") candles = await fetchFinnhubForexCandles(symbol, timeframe, limit, timeoutMs, env);
-      if (p === "yahoo") candles = await fetchYahooChartCandles(symbol, timeframe, limit, timeoutMs);
-      if (candles) {
+      if (p === "binance") candles = await fetchBinanceCandles(symbol, tf, limit, timeoutMs);
+      if (p === "twelvedata") candles = await fetchTwelveDataCandles(symbol, tf, limit, timeoutMs, env);
+      if (p === "alphavantage") candles = await fetchAlphaVantageFxIntraday(symbol, tf, limit, timeoutMs, env);
+      if (p === "finnhub") candles = await fetchFinnhubForexCandles(symbol, tf, limit, timeoutMs, env);
+      if (p === "yahoo") candles = await fetchYahooChartCandles(symbol, tf, limit, timeoutMs);
+      if (Array.isArray(candles) && candles.length) {
         await setMarketCache(env, cacheKey, candles);
         return candles;
       }
@@ -2668,7 +2693,80 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
     }
   }
 
+  // fallback: use near timeframe source and aggregate to requested tf
+  const altTimeframes = {
+    M15: ["M5"],
+    H1: ["M15"],
+    H4: ["H1"],
+    D1: ["H4", "H1"],
+  };
+  const candidates = altTimeframes[tf] || [];
+  for (const altTf of candidates) {
+    try {
+      const altCandles = await getMarketCandlesWithFallbackRaw(env, symbol, altTf, timeoutMs, limit * 4);
+      const mapped = aggregateCandlesToTimeframe(altCandles, altTf, tf);
+      if (Array.isArray(mapped) && mapped.length) {
+        await setMarketCache(env, cacheKey, mapped.slice(-limit));
+        return mapped.slice(-limit);
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+
   throw lastErr || new Error("market_data_all_failed");
+}
+
+async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs, limit) {
+  const cacheKey = marketCacheKey(symbol, timeframe);
+  const cached = await getMarketCache(env, cacheKey);
+  if (Array.isArray(cached) && cached.length) return cached;
+  const chain = resolveMarketProviderChain(env, symbol);
+  let lastErr = null;
+  for (const p of chain) {
+    try {
+      let candles = null;
+      if (p === "binance") candles = await fetchBinanceCandles(symbol, timeframe, limit, timeoutMs);
+      if (p === "twelvedata") candles = await fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env);
+      if (p === "alphavantage") candles = await fetchAlphaVantageFxIntraday(symbol, timeframe, limit, timeoutMs, env);
+      if (p === "finnhub") candles = await fetchFinnhubForexCandles(symbol, timeframe, limit, timeoutMs, env);
+      if (p === "yahoo") candles = await fetchYahooChartCandles(symbol, timeframe, limit, timeoutMs);
+      if (Array.isArray(candles) && candles.length) {
+        await setMarketCache(env, cacheKey, candles);
+        return candles;
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("market_data_alt_failed");
+}
+
+function timeframeMinutes(tf) {
+  const map = { M1: 1, M5: 5, M15: 15, M30: 30, H1: 60, H4: 240, D1: 1440, W1: 10080 };
+  return map[String(tf || "").toUpperCase()] || 0;
+}
+
+function aggregateCandlesToTimeframe(candles, fromTf, toTf) {
+  if (!Array.isArray(candles) || candles.length < 2) return candles || [];
+  const fromMin = timeframeMinutes(fromTf);
+  const toMin = timeframeMinutes(toTf);
+  if (!fromMin || !toMin || toMin <= fromMin || toMin % fromMin !== 0) return candles;
+  const step = Math.max(1, Math.round(toMin / fromMin));
+  const out = [];
+  for (let i = 0; i < candles.length; i += step) {
+    const chunk = candles.slice(i, i + step).filter((x) => Number.isFinite(x?.o) && Number.isFinite(x?.h) && Number.isFinite(x?.l) && Number.isFinite(x?.c));
+    if (!chunk.length) continue;
+    out.push({
+      t: chunk[0].t,
+      o: chunk[0].o,
+      h: Math.max(...chunk.map((x) => x.h)),
+      l: Math.min(...chunk.map((x) => x.l)),
+      c: chunk[chunk.length - 1].c,
+      v: chunk.reduce((s, x) => s + (Number(x.v) || 0), 0),
+    });
+  }
+  return out;
 }
 
 function computeSnapshot(candles) {
@@ -3739,6 +3837,70 @@ function stripHiddenModelOutput(text) {
   return out.trim();
 }
 
+function buildAdminReportLines(users, payments, withdrawals, tickets) {
+  const u = Array.isArray(users) ? users : [];
+  const p = Array.isArray(payments) ? payments : [];
+  const w = Array.isArray(withdrawals) ? withdrawals : [];
+  const t = Array.isArray(tickets) ? tickets : [];
+  const head = [
+    `Admin Report | ${new Date().toISOString()}`,
+    `users=${u.length} payments=${p.length} withdrawals=${w.length} tickets=${t.length}`,
+    "------------------------------------------------------------",
+  ];
+  const usersBlock = u.slice(0, 80).map((x) => {
+    const user = x?.profile?.username ? `@${String(x.profile.username).replace(/^@/, "")}` : x?.userId;
+    return `USER ${user || "-"} | analyses=${x?.stats?.successfulAnalyses || 0} | used=${x?.dailyUsed || 0}/${dailyLimit({}, x || {})} | sub=${x?.subscription?.type || "free"}`;
+  });
+  const payBlock = p.slice(0, 60).map((x) => `PAY ${x.username || x.userId || "-"} | amount=${x.amount || 0} | status=${x.status || "-"} | tx=${x.txHash || "-"}`);
+  const wdBlock = w.slice(0, 60).map((x) => `WD ${x.userId || "-"} | amount=${x.amount || 0} | status=${x.status || "pending"} | addr=${x.address || "-"}`);
+  const tkBlock = t.slice(0, 60).map((x) => `TICKET ${x.id || "-"} | ${x.username || x.userId || "-"} | ${x.status || "pending"} | ${String(x.text || "").slice(0, 80)}`);
+  return [
+    ...head,
+    "USERS", ...(usersBlock.length ? usersBlock : ["-"]),
+    "",
+    "PAYMENTS", ...(payBlock.length ? payBlock : ["-"]),
+    "",
+    "WITHDRAWALS", ...(wdBlock.length ? wdBlock : ["-"]),
+    "",
+    "TICKETS", ...(tkBlock.length ? tkBlock : ["-"]),
+  ];
+}
+
+function buildSimplePdfFromText(text) {
+  const content = String(text || "").replace(/\r/g, "");
+  const lines = content.split("\n").slice(0, 500);
+  const escaped = lines.map((l) => String(l || "").replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)").replace(/[^	\x20-\x7E]/g, " "));
+  const streamLines = ["BT", "/F1 10 Tf", "36 800 Td", "12 TL"];
+  for (let i = 0; i < escaped.length; i++) {
+    if (i === 0) streamLines.push(`(${escaped[i]}) Tj`);
+    else streamLines.push(`T* (${escaped[i]}) Tj`);
+  }
+  streamLines.push("ET");
+  const stream = streamLines.join("\n");
+
+  const objects = [];
+  objects.push("1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n");
+  objects.push("2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n");
+  objects.push("3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n");
+  objects.push("4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Courier >> endobj\n");
+  objects.push(`5 0 obj << /Length ${stream.length} >> stream\n${stream}\nendstream endobj\n`);
+
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const obj of objects) {
+    offsets.push(pdf.length);
+    pdf += obj;
+  }
+  const xrefStart = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n`;
+  pdf += "0000000000 65535 f \n";
+  for (let i = 1; i < offsets.length; i++) {
+    pdf += `${String(offsets[i]).padStart(10, "0")} 00000 n \n`;
+  }
+  pdf += `trailer << /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+  return new TextEncoder().encode(pdf);
+}
+
 async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
   await tgSendMessage(env, chatId, `⏳ جمع‌آوری داده و تحلیل ${symbol}...`, kb([[BTN.HOME]]));
 
@@ -4039,7 +4201,7 @@ function jsonResponse(obj, status = 200) {
 }
 
 /* ========================== TELEGRAM MINI APP initData verification ========================== */
-async function verifyTelegramInitData(initData, botToken) {
+async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw) {
   if (!initData || typeof initData !== "string") return { ok: false, reason: "initData_missing" };
   if (!botToken) return { ok: false, reason: "bot_token_missing" };
 
@@ -4051,7 +4213,8 @@ async function verifyTelegramInitData(initData, botToken) {
   const authDate = Number(params.get("auth_date") || "0");
   if (!Number.isFinite(authDate) || authDate <= 0) return { ok: false, reason: "auth_date_invalid" };
   const now = Math.floor(Date.now() / 1000);
-  if (now - authDate > 60 * 60) return { ok: false, reason: "initData_expired" };
+  const maxAgeSec = Math.max(60, Number(maxAgeSecRaw || 0) || 24 * 60 * 60);
+  if (now - authDate > maxAgeSec) return { ok: false, reason: "initData_expired" };
 
   const pairs = [];
   params.forEach((v, k) => pairs.push([k, v]));
@@ -4557,8 +4720,17 @@ const MINI_APP_HTML = `<!doctype html>
             <div class="label">مدیریت تیکت‌ها</div>
             <div class="actions">
               <button id="refreshTickets" class="btn">بروزرسانی</button>
+              <button id="ticketQuickPending" class="btn ghost">فقط pending</button>
+              <button id="ticketQuickAnswered" class="btn ghost">فقط answered</button>
             </div>
             <select id="ticketSelect" class="control"></select>
+            <select id="ticketReplyTemplate" class="control">
+              <option value="">تمپلیت پاسخ…</option>
+              <option value="درخواست شما ثبت شد و در حال بررسی تیم پشتیبانی است. نتیجه به‌زودی ارسال می‌شود.">در حال بررسی</option>
+              <option value="مشکل اتصال مینی‌اپ برطرف شد. لطفاً یک‌بار اپ را ببندید و دوباره باز کنید.">حل مشکل اتصال</option>
+              <option value="برای این مورد به اطلاعات بیشتری نیاز داریم. لطفاً اسکرین‌شات و زمان دقیق خطا را ارسال کنید.">نیاز به اطلاعات بیشتر</option>
+              <option value="درخواست شما انجام شد و تیکت بسته می‌شود. در صورت نیاز تیکت جدید ثبت کنید.">بستن با موفقیت</option>
+            </select>
             <textarea id="ticketReply" class="control" placeholder="پاسخ به کاربر (اختیاری)"></textarea>
             <div class="admin-row">
               <select id="ticketStatus" class="control">
@@ -4620,6 +4792,7 @@ const MINI_APP_HTML = `<!doctype html>
             <div class="label">گزارش کامل کاربران (فقط اونر)</div>
             <div class="actions">
               <button id="loadUsers" class="btn">دریافت گزارش</button>
+              <button id="downloadReportPdf" class="btn primary">دانلود PDF</button>
             </div>
             <div class="mini-list" id="usersReport">—</div>
           </div>
@@ -4661,8 +4834,11 @@ let INIT_DATA = "";
 let IS_STAFF = false;
 let IS_OWNER = false;
 let ADMIN_TICKETS = [];
+let ADMIN_TICKETS_ALL = [];
 let ADMIN_WITHDRAWALS = [];
 let ADMIN_PROMPT_REQS = [];
+
+const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
 
 function showToast(title, subline = "", badge = "", loading = false){
   toastT.textContent = title || "";
@@ -4760,8 +4936,30 @@ function prettyErr(j, status){
   const e = j?.error || "نامشخص";
   if (status === 429 && String(e).startsWith("quota_exceeded")) return "سهمیه امروز تمام شد.";
   if (status === 403 && String(e) === "onboarding_required") return "ابتدا نام و شماره را داخل ربات ثبت کنید.";
-  if (status === 401) return "احراز هویت تلگرام ناموفق است.";
+  if (status === 401) {
+    if (String(e).includes("initData")) return "اتصال مینی‌اپ منقضی شده؛ اپ را مجدد از داخل تلگرام باز کنید.";
+    return "احراز هویت تلگرام ناموفق است.";
+  }
   return "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.";
+}
+
+function renderChartFallbackSvg(svgText){
+  const chartCard = el("chartCard");
+  const chartImg = el("chartImg");
+  if (!chartCard || !chartImg || !svgText) return;
+  const svgUrl = "data:image/svg+xml;utf8," + encodeURIComponent(svgText);
+  chartImg.src = svgUrl;
+  chartCard.style.display = "block";
+  const cm = el("chartMeta");
+  if (cm) cm.textContent = "Internal Zones Renderer";
+}
+
+function pickTicketReplyTemplate(){
+  const tpl = el("ticketReplyTemplate")?.value || "";
+  if (!tpl) return;
+  const input = el("ticketReply");
+  if (!input) return;
+  if (!input.value.trim()) input.value = tpl;
 }
 
 function updateMeta(state, quota){
@@ -4801,8 +4999,9 @@ function shortText(s, n = 80){
   return s.length > n ? (s.slice(0, n) + "…") : s;
 }
 
-function renderTickets(list){
+function renderTickets(list, keepMaster = false){
   ADMIN_TICKETS = Array.isArray(list) ? list.slice() : [];
+  if (!keepMaster) ADMIN_TICKETS_ALL = ADMIN_TICKETS.slice();
   const sel = el("ticketSelect");
   const target = el("ticketsList");
   if (sel) sel.innerHTML = "";
@@ -4905,6 +5104,12 @@ async function refreshTickets(){
   if (json?.ok) renderTickets(json.tickets || []);
 }
 
+function applyTicketFilter(status){
+  if (!status) return renderTickets(ADMIN_TICKETS_ALL || [], true);
+  const filtered = (ADMIN_TICKETS_ALL || []).filter((x) => String(x?.status || "pending") === status);
+  renderTickets(filtered, true);
+}
+
 async function refreshWithdrawals(){
   const { json } = await adminApi("/api/admin/withdrawals/list", {});
   if (json?.ok) renderWithdrawals(json.withdrawals || []);
@@ -4972,6 +5177,12 @@ async function boot(){
   showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
 
   const initData = tg?.initData || "";
+  if (!initData) {
+    hideToast();
+    pillTxt.textContent = "Offline";
+    out.textContent = "⚠️ اتصال مینی‌اپ برقرار نیست. " + CONNECTION_HINT;
+    return;
+  }
   INIT_DATA = initData;
   const {status, json} = await api("/api/user", { initData });
 
@@ -5108,15 +5319,19 @@ el("analyze").addEventListener("click", async () => {
   const chartCard = el("chartCard");
   const chartImg = el("chartImg");
   if (chartCard && chartImg) {
-    const u = json.chartUrl || "";
-    if (u) {
-      chartImg.src = u;
-      chartCard.style.display = "block";
-    } else {
-      chartImg.removeAttribute("src");
-      chartCard.style.display = "none";
+      const u = json.chartUrl || "";
+      if (u) {
+        chartImg.src = u;
+        chartCard.style.display = "block";
+        const cm = el("chartMeta");
+        if (cm) cm.textContent = "QuickChart";
+      } else if (json.zonesSvg) {
+        renderChartFallbackSvg(json.zonesSvg);
+      } else {
+        chartImg.removeAttribute("src");
+        chartCard.style.display = "none";
+      }
     }
-  }
   updateMeta(json.state, json.quota);
   showToast("آماده ✅", "خروجی دریافت شد", "OK", false);
   setTimeout(hideToast, 1200);
@@ -5264,6 +5479,10 @@ el("ticketSelect")?.addEventListener("change", () => {
   if (t && el("ticketStatus")) el("ticketStatus").value = t.status || "pending";
 });
 
+el("ticketReplyTemplate")?.addEventListener("change", pickTicketReplyTemplate);
+el("ticketQuickPending")?.addEventListener("click", () => applyTicketFilter("pending"));
+el("ticketQuickAnswered")?.addEventListener("click", () => applyTicketFilter("answered"));
+
 el("refreshWithdrawals")?.addEventListener("click", async () => {
   showToast("در حال دریافت…", "لیست برداشت‌ها", "WD", true);
   await refreshWithdrawals();
@@ -5398,6 +5617,31 @@ el("loadUsers")?.addEventListener("click", async () => {
     renderFullAdminReport(usersJson.users || [], bootJson.payments || [], bootJson.withdrawals || [], bootJson.tickets || []);
   } else if (usersJson?.ok) {
     renderUsers(usersJson.users || []);
+  }
+});
+
+el("downloadReportPdf")?.addEventListener("click", async () => {
+  try {
+    showToast("در حال ساخت PDF…", "گزارش کامل", "PDF", true);
+    const r = await fetch("/api/admin/report/pdf", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ initData: INIT_DATA, limit: 250 }),
+    });
+    if (!r.ok) throw new Error(`http_${r.status}`);
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `admin-report-${Date.now()}.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    showToast("دانلود شد ✅", "گزارش PDF آماده است", "PDF", false);
+    setTimeout(hideToast, 1200);
+  } catch (e) {
+    showToast("خطا", "ساخت PDF ناموفق بود", "PDF", false);
   }
 });
 
