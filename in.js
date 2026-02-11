@@ -756,7 +756,11 @@ TxID: ${txid}
         const userPrompt = typeof body.userPrompt === "string" ? body.userPrompt : "";
 
         try {
-          const result = await runSignalTextFlowReturnText(env, v.fromLike, st, symbol, userPrompt);
+          const flowTimeoutMs = Math.max(15000, Number(env.SIGNAL_FLOW_TIMEOUT_MS || 70000));
+          const result = await Promise.race([
+            runSignalTextFlowReturnText(env, v.fromLike, st, symbol, userPrompt),
+            timeoutPromise(flowTimeoutMs, "api_analyze_timeout"),
+          ]);
           if (env.BOT_KV) {
             consumeDaily(st, v.fromLike, env);
             recordAnalysisSuccess(st);
@@ -4077,7 +4081,11 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
   const typingTask = typingLoop(env, chatId, t);
 
   try {
-    const result = await runSignalTextFlowReturnText(env, from, st, symbol, userPrompt);
+    const flowTimeoutMs = Math.max(15000, Number(env.SIGNAL_FLOW_TIMEOUT_MS || 70000));
+    const result = await Promise.race([
+      runSignalTextFlowReturnText(env, from, st, symbol, userPrompt),
+      timeoutPromise(flowTimeoutMs, "signal_text_flow_timeout"),
+    ]);
 
     // 📸 QuickChart candlestick image
     if (String(env.QUICKCHART || "1") !== "0") {
@@ -5085,7 +5093,14 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
       </div>
 
-      
+      <div class="toast" id="toast">
+        <div class="spin" id="spin" style="display:none"></div>
+        <div style="min-width:0; flex:1;">
+          <div class="t" id="toastT">—</div>
+          <div class="s" id="toastS">—</div>
+        </div>
+        <div class="badge" id="toastB">—</div>
+      </div>
 
       <script src="/app.js"></script>
 </body>
@@ -5131,13 +5146,14 @@ let QUOTE_BUSY = false;
 const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
 
 function showToast(title, subline = "", badge = "", loading = false){
+  if (!toast || !toastT || !toastS || !toastB || !spin) return;
   toastT.textContent = title || "";
   toastS.textContent = subline || "";
   toastB.textContent = badge || "";
   spin.style.display = loading ? "inline-block" : "none";
   toast.classList.add("show");
 }
-function hideToast(){ toast.classList.remove("show"); }
+function hideToast(){ if (toast) toast.classList.remove("show"); }
 
 function fillSymbols(list){
   ALL_SYMBOLS = Array.isArray(list) ? list.slice() : [];
