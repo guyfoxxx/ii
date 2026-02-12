@@ -1554,21 +1554,10 @@ async function getOfferBannerImage(env) {
   return (raw || env.SPECIAL_OFFER_IMAGE || "").toString().trim();
 }
 
-async function setOfferBannerImage(env, image) {
-  if (!env.BOT_KV) return;
-  await env.BOT_KV.put("settings:offer_banner_image", String(image || "").trim());
-}
 
-async function setOfferBanner(env, text) {
-  if (!env.BOT_KV) return;
-  await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
-}
 
-async function getOfferBannerImage(env) {
-  if (!env.BOT_KV) return "";
-  const raw = await env.BOT_KV.get("settings:offer_banner_image");
-  return String(raw || "").trim();
-}
+
+
 
 async function setOfferBannerImage(env, dataUrl) {
   if (!env.BOT_KV) return;
@@ -3093,6 +3082,7 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
       lastErr = e;
       markProviderFailure(p, env, "market");
       console.error("market provider failed:", p, e?.message || e);
+      markProviderFailure(p, env);
     }
   }
 
@@ -3166,7 +3156,7 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
       markProviderFailure(p, env, "market");
     } catch (e) {
       lastErr = e;
-      markProviderFailure(p, env, "market");
+      markProviderFailure(p, env);
     }
   }
   throw lastErr || new Error("market_data_alt_failed");
