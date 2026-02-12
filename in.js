@@ -53,6 +53,12 @@ export default {
           role,
           isStaff: role !== "user",
           wallet: (await getWallet(env)) || "",
+          locale: {
+            language: st.profile?.language || "fa",
+            countryCode: st.profile?.countryCode || "IR",
+            timezone: st.profile?.timezone || "Asia/Tehran",
+            entrySource: st.profile?.entrySource || "",
+          },
         });
       }
 
@@ -94,6 +100,8 @@ export default {
           const id = body.customPromptId.trim();
           st.customPromptId = prompts.find((p) => String(p?.id || "") === id) ? id : "";
         }
+        if (typeof body.language === "string") st.profile.language = String(body.language || "").trim() || st.profile.language;
+        if (typeof body.timezone === "string") st.profile.timezone = String(body.timezone || "").trim() || st.profile.timezone;
 
         if (env.BOT_KV) await saveUser(v.userId, st, env);
 
@@ -415,7 +423,8 @@ ${reply}`;
           if (st.referral?.referredBy) {
             const inviter = await ensureUser(String(st.referral.referredBy), env);
             const commission = await getCommissionSettings(env);
-            const pct = resolveCommissionPercent(inviter.profile?.username, commission);
+            const pctRaw = resolveCommissionPercent(inviter.profile?.username, commission);
+            const pct = Math.max(10, Number.isFinite(Number(pctRaw)) ? Number(pctRaw) : 0);
             const reward = pct > 0 ? Math.round((amount * pct) * 100) / 100 : 0;
             inviter.referral.commissionTotal = (inviter.referral.commissionTotal || 0) + reward;
             inviter.referral.commissionBalance = (inviter.referral.commissionBalance || 0) + reward;
@@ -988,6 +997,71 @@ function toInt(v, d) {
 function normHandle(h) {
   if (!h) return "";
   return "@" + String(h).replace(/^@/, "").toLowerCase();
+}
+
+function inferLocaleByPhone(phone) {
+  const p = String(phone || "").replace(/[^+\d]/g, "");
+  const map = [
+    { prefix: "+98", country: "IR", lang: "fa", tz: "Asia/Tehran" },
+    { prefix: "+971", country: "AE", lang: "ar", tz: "Asia/Dubai" },
+    { prefix: "+90", country: "TR", lang: "tr", tz: "Europe/Istanbul" },
+    { prefix: "+7", country: "RU", lang: "ru", tz: "Europe/Moscow" },
+    { prefix: "+44", country: "GB", lang: "en", tz: "Europe/London" },
+    { prefix: "+1", country: "US", lang: "en", tz: "America/New_York" },
+  ];
+  for (const x of map) if (p.startsWith(x.prefix)) return x;
+  if (p.startsWith("09") || p.startsWith("98")) return { country: "IR", lang: "fa", tz: "Asia/Tehran" };
+  return { country: "INT", lang: "en", tz: "UTC" };
+}
+
+function applyLocaleDefaults(st) {
+  const loc = inferLocaleByPhone(st?.profile?.phone || "");
+  st.profile = st.profile || {};
+  st.profile.language = st.profile.language || loc.lang;
+  st.profile.countryCode = st.profile.countryCode || loc.country;
+  st.profile.timezone = st.profile.timezone || loc.tz;
+
+  if (!st.timeframe) st.timeframe = (loc.country === "IR" ? "H1" : "H4");
+  if (!st.risk) st.risk = "متوسط";
+  if (!st.style) st.style = "پرایس اکشن";
+  if (st.profile.preferredStyle && ALLOWED_STYLE_LIST.includes(st.profile.preferredStyle)) {
+    st.style = st.profile.preferredStyle;
+  }
+  if (typeof st.newsEnabled !== "boolean") st.newsEnabled = true;
+  if (!st.promptMode) st.promptMode = "style_plus_custom";
+  return st;
+}
+
+async function finalizeOnboardingRewards(env, st) {
+  if (!st?.profile?.onboardingDone) return;
+  if (!st?.referral?.referredBy || !st?.referral?.referredByCode) return;
+  if (st?.referral?.onboardingRewardDone) return;
+
+  const phone = st.profile?.phone || "";
+  if (!phone) return;
+  const isNew = await isPhoneNew(env, phone);
+  await markPhoneSeen(env, phone, st.userId);
+  if (!isNew) {
+    st.referral.onboardingRewardDone = true;
+    st.referral.onboardingRewardAt = new Date().toISOString();
+    return;
+  }
+
+  const inviterId = String(st.referral.referredBy);
+  const inviter = await ensureUser(inviterId, env);
+  inviter.referral.successfulInvites = (inviter.referral.successfulInvites || 0) + 1;
+  inviter.referral.points = (inviter.referral.points || 0) + 3;
+  if (inviter.referral.points >= 500) {
+    inviter.referral.points -= 500;
+    inviter.subscription.active = true;
+    inviter.subscription.type = "gift";
+    inviter.subscription.dailyLimit = 50;
+    inviter.subscription.expiresAt = futureISO(30);
+  }
+  await saveUser(inviterId, inviter, env);
+
+  st.referral.onboardingRewardDone = true;
+  st.referral.onboardingRewardAt = new Date().toISOString();
 }
 
 function isStaff(from, env) {
@@ -1899,6 +1973,11 @@ function defaultUser(userId) {
       preferredMarket: "",
       level: "", // beginner/intermediate/pro
       levelNotes: "",
+      preferredStyle: "",
+      language: "fa",
+      countryCode: "IR",
+      timezone: "Asia/Tehran",
+      entrySource: "",
       onboardingDone: false,
       capital: 0,
       capitalCurrency: "USDT",
@@ -1919,6 +1998,8 @@ function defaultUser(userId) {
       points: 0,
       commissionTotal: 0,
       commissionBalance: 0,
+      onboardingRewardDone: false,
+      onboardingRewardAt: "",
     },
     subscription: {
       active: false,
@@ -1997,6 +2078,7 @@ async function ensureUser(userId, env, from) {
   if (from?.username) st.profile.username = String(from.username);
   if (from?.first_name) st.profile.firstName = String(from.first_name);
   if (from?.last_name) st.profile.lastName = String(from.last_name);
+  if (st.profile?.phone) applyLocaleDefaults(st);
 
   const today = kyivDateString();
   if (st.dailyDate !== today) {
@@ -3292,7 +3374,7 @@ ${customPrompt.text}
     `ASSET: ${symbol}
 ` +
 
-    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}, Capital=${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}
+    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}, Capital=${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}, Lang=${st.profile?.language || "fa"}, TZ=${st.profile?.timezone || "Asia/Tehran"}, Country=${st.profile?.countryCode || "IR"}
 
 ` +
     `MARKET_DATA:
@@ -3475,30 +3557,8 @@ async function markPhoneSeen(env, phone, userId) {
 }
 
 async function awardReferralIfEligible(env, newUserSt) {
-  if (!env.BOT_KV) return;
-  const phone = newUserSt.profile?.phone || "";
-  if (!phone) return;
-
-  const isNew = await isPhoneNew(env, phone);
-  await markPhoneSeen(env, phone, newUserSt.userId);
-
-  if (!newUserSt.referral?.referredBy || !newUserSt.referral?.referredByCode) return;
-  if (!isNew) return;
-
-  const inviterId = String(newUserSt.referral.referredBy);
-  const inviter = await ensureUser(inviterId, env);
-  inviter.referral.successfulInvites = (inviter.referral.successfulInvites || 0) + 1;
-  inviter.referral.points = (inviter.referral.points || 0) + 3;
-
-  if (inviter.referral.points >= 500) {
-    inviter.referral.points -= 500;
-    inviter.subscription.active = true;
-    inviter.subscription.type = "gift";
-    inviter.subscription.dailyLimit = 50;
-    inviter.subscription.expiresAt = futureISO(30);
-  }
-
-  await saveUser(inviterId, inviter, env);
+  // kept for backward compatibility; referral reward is finalized after full onboarding
+  return finalizeOnboardingRewards(env, newUserSt);
 }
 
 function futureISO(days) {
@@ -3825,8 +3885,17 @@ ${summary || "تحلیل خبری در دسترس نیست."}`, mainMenuKeyboard
 
     if (st.state === "onb_market") {
       st.profile.preferredMarket = text;
+      st.state = "onb_style";
       await saveUser(userId, st, env);
-      await startLeveling(env, chatId, from, st);
+      return tgSendMessage(env, chatId, "🎯 سبک ترجیحی‌ات را انتخاب کن:", optionsKeyboard(ALLOWED_STYLE_LIST));
+    }
+
+    if (st.state === "onb_style") {
+      const style = ALLOWED_STYLE_LIST.includes(text) ? text : "پرایس اکشن";
+      st.profile.preferredStyle = style;
+      st.style = style;
+      await saveUser(userId, st, env);
+      await startOnboarding(env, chatId, from, st);
       return;
     }
 
@@ -3859,6 +3928,8 @@ ${summary || "تحلیل خبری در دسترس نیست."}`, mainMenuKeyboard
       st.style = result.settings?.style || st.style;
       st.risk = result.settings?.risk || st.risk;
       st.profile.onboardingDone = true;
+      applyLocaleDefaults(st);
+      await finalizeOnboardingRewards(env, st);
 
       await saveUser(userId, st, env);
 
@@ -4143,7 +4214,10 @@ async function onStart(env, chatId, from, st, refArg) {
     if (ownerId && String(ownerId) !== String(st.userId)) {
       st.referral.referredBy = String(ownerId);
       st.referral.referredByCode = code;
+      st.profile.entrySource = `referral:${code}`;
     }
+  } else if (!st.profile.entrySource) {
+    st.profile.entrySource = refArg ? `start_arg:${refArg}` : "direct";
   }
 
   await saveUser(st.userId, st, env);
@@ -4179,6 +4253,11 @@ async function startOnboarding(env, chatId, from, st) {
     await saveUser(st.userId, st, env);
     return tgSendMessage(env, chatId, "بازار مورد علاقه‌ات کدام است؟", optionsKeyboard(["کریپتو", "فارکس", "فلزات", "سهام"]));
   }
+  if (!st.profile?.preferredStyle) {
+    st.state = "onb_style";
+    await saveUser(st.userId, st, env);
+    return tgSendMessage(env, chatId, "🎯 سبک ترجیحی‌ات را انتخاب کن:", optionsKeyboard(ALLOWED_STYLE_LIST));
+  }
   const flags = await getAdminFlags(env);
   if (flags.capitalModeEnabled && !Number(st.profile?.capital || 0)) {
     st.state = "onb_capital";
@@ -4195,9 +4274,8 @@ async function handleContact(env, chatId, from, st, contact) {
 
   const phone = String(contact.phone_number || "").trim();
   st.profile.phone = phone;
-  st.profile.onboardingDone = Boolean(st.profile.name && st.profile.phone);
-
-  await awardReferralIfEligible(env, st);
+  st.profile.onboardingDone = false;
+  applyLocaleDefaults(st);
 
   if (st.state === "onb_contact") st.state = "onb_experience";
   await saveUser(st.userId, st, env);
