@@ -25,7 +25,7 @@ export default {
       if (url.pathname === "/api/user" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await verifyMiniappAuth(body, env);
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
         if (!v.ok) {
           if (miniappGuestEnabled(env)) {
             return jsonResponse(await buildMiniappGuestPayload(env));
@@ -342,8 +342,9 @@ ${reply}`;
           return jsonResponse({ ok: true, capital: st.capital });
         }
 
+
         if (url.pathname === "/api/admin/withdrawals/list") {
-          const withdrawals = await listWithdrawals(env, 100);
+          const withdrawals = await listWithdrawals(env, 200);
           return jsonResponse({ ok: true, withdrawals });
         }
 
@@ -356,8 +357,6 @@ ${reply}`;
           return jsonResponse({ ok: true, withdrawal: updated });
         }
 
-
-
         if (url.pathname === "/api/admin/payments/decision") {
           const paymentId = String(body.paymentId || "").trim();
           const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
@@ -373,75 +372,18 @@ ${reply}`;
           return jsonResponse({ ok: true, payment });
         }
 
-        if (url.pathname === "/api/admin/withdrawals/list") {
-          return jsonResponse({ ok: true, withdrawals: await listWithdrawals(env, 200) });
-        }
-
+        // Backward-compat alias for older admin clients
         if (url.pathname === "/api/admin/withdrawals/decision") {
-          const id = String(body.withdrawalId || "").trim();
-          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
-          if (!id) return jsonResponse({ ok: false, error: "withdrawal_id_required" }, 400);
-
-          if (env.BOT_DB) {
-            await env.BOT_DB.prepare("UPDATE withdrawals SET status=?1 WHERE id=?2").bind(status, id).run();
-          }
-          if (env.BOT_KV) {
-            const raw = await env.BOT_KV.get(`withdraw:${id}`);
-            if (raw) {
-              try {
-                const w = JSON.parse(raw);
-                w.status = status;
-                w.reviewedAt = new Date().toISOString();
-                w.reviewedBy = normHandle(v.fromLike?.username);
-                await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(w));
-              } catch {}
-            }
-          }
-          return jsonResponse({ ok: true, status, withdrawalId: id });
+          const id = String(body.withdrawalId || body.id || "").trim();
+          const decisionRaw = String(body.status || body.decision || "").trim();
+          const decision = decisionRaw === "approved" ? "approved" : (decisionRaw === "rejected" ? "rejected" : "");
+          const txHash = String(body.txHash || "").trim();
+          if (!id || !decision) return jsonResponse({ ok: false, error: "bad_request" }, 400);
+          const updated = await reviewWithdrawal(env, id, decision, txHash, v.fromLike);
+          return jsonResponse({ ok: true, withdrawal: updated });
         }
 
 
-        if (url.pathname === "/api/admin/payments/decision") {
-          const paymentId = String(body.paymentId || "").trim();
-          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
-          const raw = env.BOT_KV ? await env.BOT_KV.get(`payment:${paymentId}`) : "";
-          if (!raw) return jsonResponse({ ok: false, error: "payment_not_found" }, 404);
-          let payment = null;
-          try { payment = JSON.parse(raw); } catch {}
-          if (!payment) return jsonResponse({ ok: false, error: "payment_bad_json" }, 500);
-          payment.status = status;
-          payment.reviewedAt = new Date().toISOString();
-          payment.reviewedBy = normHandle(v.fromLike?.username);
-          if (env.BOT_KV) await env.BOT_KV.put(`payment:${paymentId}`, JSON.stringify(payment));
-          return jsonResponse({ ok: true, payment });
-        }
-
-        if (url.pathname === "/api/admin/withdrawals/list") {
-          return jsonResponse({ ok: true, withdrawals: await listWithdrawals(env, 200) });
-        }
-
-        if (url.pathname === "/api/admin/withdrawals/decision") {
-          const id = String(body.withdrawalId || "").trim();
-          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
-          if (!id) return jsonResponse({ ok: false, error: "withdrawal_id_required" }, 400);
-
-          if (env.BOT_DB) {
-            await env.BOT_DB.prepare("UPDATE withdrawals SET status=?1 WHERE id=?2").bind(status, id).run();
-          }
-          if (env.BOT_KV) {
-            const raw = await env.BOT_KV.get(`withdraw:${id}`);
-            if (raw) {
-              try {
-                const w = JSON.parse(raw);
-                w.status = status;
-                w.reviewedAt = new Date().toISOString();
-                w.reviewedBy = normHandle(v.fromLike?.username);
-                await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(w));
-              } catch {}
-            }
-          }
-          return jsonResponse({ ok: true, status, withdrawalId: id });
-        }
 
         if (url.pathname === "/api/admin/payments/approve") {
           const username = String(body.username || "").trim();
@@ -721,7 +663,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
         const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
         if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
@@ -778,7 +720,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
         const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
         if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
@@ -803,7 +745,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
         const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
         if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
@@ -1185,6 +1127,7 @@ function randomCode(len = 10) {
 
 const MARKET_CACHE = new Map();
 const ANALYSIS_CACHE = new Map();
+const MARKET_PROVIDER_FAIL_UNTIL = new Map();
 
 function cacheGet(map, key) {
   const hit = map.get(key);
@@ -2408,6 +2351,7 @@ async function runTextProviders(prompt, env, orderOverride) {
   const chain = resolveTextProviderChain(env, orderOverride, prompt);
   let lastErr = null;
   for (const p of chain) {
+    if (providerInCooldown(p)) continue;
     try {
       const out = await Promise.race([
         textProvider(p, prompt, env),
@@ -2433,6 +2377,7 @@ async function runPolishProviders(draft, env, orderOverride) {
     `متن:\n${draft}`;
 
   for (const p of chain) {
+    if (providerInCooldown(p)) continue;
     try {
       const out = await Promise.race([
         textProvider(p, polishPrompt, env),
@@ -2743,6 +2688,26 @@ function resolveMarketProviderChain(env, symbol, timeframe = "H4") {
   return rotateBySeed(chain, `${symbol}|${timeframe}|${minuteBucket}`);
 }
 
+function rotateProviderChain(chain, symbol, env) {
+  const list = Array.isArray(chain) ? chain.slice() : [];
+  if (list.length <= 1) return list;
+  const rolling = String(env.MARKET_PROVIDER_ROLLING || "1").trim();
+  if (rolling === "0" || rolling.toLowerCase() === "false") return list;
+  const tick = Math.floor(Date.now() / Math.max(30, Number(env.MARKET_PROVIDER_ROLLING_SEC || 60)) / 1000);
+  const seed = (String(symbol || "").length * 7 + tick) % list.length;
+  return list.slice(seed).concat(list.slice(0, seed));
+}
+
+function markProviderFailure(provider, env) {
+  const coolSec = Math.max(5, Number(env.MARKET_PROVIDER_COOLDOWN_SEC || 45));
+  MARKET_PROVIDER_FAIL_UNTIL.set(String(provider || ""), Date.now() + coolSec * 1000);
+}
+
+function providerInCooldown(provider) {
+  const until = Number(MARKET_PROVIDER_FAIL_UNTIL.get(String(provider || "")) || 0);
+  return until > Date.now();
+}
+
 function mapTimeframeToBinance(tf) {
   const m = { M15: "15m", H1: "1h", H4: "4h", D1: "1d" };
   return m[tf] || "4h";
@@ -3045,10 +3010,11 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
   const cached = await getMarketCache(env, cacheKey);
   if (Array.isArray(cached) && cached.length >= Math.min(6, minNeed)) return cached;
 
-  const chain = resolveMarketProviderChain(env, symbol, tf);
+  const chain = rotateProviderChain(resolveMarketProviderChain(env, symbol), symbol, env);
   let lastErr = null;
 
   for (const p of chain) {
+    if (providerInCooldown(p)) continue;
     try {
       let candles = null;
       if (p === "binance") candles = await fetchBinanceCandles(symbol, tf, limit, timeoutMs);
@@ -3063,6 +3029,7 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
     } catch (e) {
       lastErr = e;
       console.error("market provider failed:", p, e?.message || e);
+      markProviderFailure(p, env);
     }
   }
 
@@ -3117,9 +3084,10 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
   const cacheKey = marketCacheKey(symbol, timeframe);
   const cached = await getMarketCache(env, cacheKey);
   if (Array.isArray(cached) && cached.length) return cached;
-  const chain = resolveMarketProviderChain(env, symbol, timeframe);
+  const chain = rotateProviderChain(resolveMarketProviderChain(env, symbol), symbol, env);
   let lastErr = null;
   for (const p of chain) {
+    if (providerInCooldown(p)) continue;
     try {
       let candles = null;
       if (p === "binance") candles = await fetchBinanceCandles(symbol, timeframe, limit, timeoutMs);
@@ -3133,6 +3101,7 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
       }
     } catch (e) {
       lastErr = e;
+      markProviderFailure(p, env);
     }
   }
   throw lastErr || new Error("market_data_alt_failed");
@@ -3155,13 +3124,18 @@ async function fetchSymbolNewsFa(symbol, env) {
   const timeoutMs = Number(env.NEWS_TIMEOUT_MS || 9000);
   const limit = Math.min(8, Math.max(3, Number(env.NEWS_ITEMS_LIMIT || 6)));
 
-  const urls = [
+  const urlsBase = [
     "https://news.google.com/rss/search?q=" + encodeURIComponent(query) + "&hl=fa&gl=IR&ceid=IR:fa",
     "https://news.google.com/rss/search?q=" + encodeURIComponent(symbol + " market") + "&hl=fa&gl=IR&ceid=IR:fa",
+    "https://www.bing.com/news/search?q=" + encodeURIComponent(query) + "&format=rss&setlang=fa",
   ];
+  const ext = String(env.NEWS_FEEDS_EXTRA || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const urls = urlsBase.concat(ext);
+  const shift = urls.length ? (Math.floor(Date.now() / 60000) + String(symbol || "").length) % urls.length : 0;
+  const rolledUrls = urls.slice(shift).concat(urls.slice(0, shift));
 
   let lastErr = null;
-  for (const u of urls) {
+  for (const u of rolledUrls) {
     try {
       const r = await fetchWithTimeout(u, { headers: { "User-Agent": "Mozilla/5.0" } }, timeoutMs);
       if (!r.ok) throw new Error("news_http_" + r.status);
@@ -4944,44 +4918,6 @@ async function buildMiniappGuestPayload(env) {
   };
 }
 
-async function issueMiniappToken(env, userId, fromLike = {}) {
-  if (!env.BOT_KV) return "";
-  const raw = crypto.getRandomValues(new Uint8Array(24));
-  const token = Array.from(raw).map((b) => b.toString(16).padStart(2, "0")).join("");
-  const payload = {
-    userId: String(userId || ""),
-    username: String(fromLike?.username || ""),
-    createdAt: Date.now(),
-  };
-  await env.BOT_KV.put(`miniapp_token:${token}`, JSON.stringify(payload), { expirationTtl: Math.max(300, Number(env.MINIAPP_TOKEN_TTL_SEC || 86400)) });
-  return token;
-}
-
-async function verifyMiniappToken(token, env) {
-  if (!env.BOT_KV || !token) return { ok: false, reason: "token_missing" };
-  const raw = await env.BOT_KV.get(`miniapp_token:${String(token).trim()}`);
-  if (!raw) return { ok: false, reason: "token_invalid" };
-  try {
-    const j = JSON.parse(raw);
-    const userId = String(j?.userId || "").trim();
-    if (!userId) return { ok: false, reason: "token_user_missing" };
-    return { ok: true, userId, fromLike: { username: String(j?.username || "") }, via: "mini_token" };
-  } catch {
-    return { ok: false, reason: "token_bad_json" };
-  }
-}
-
-async function verifyMiniappAuth(body, env) {
-  const initData = body?.initData;
-  const v = await verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
-  if (v.ok) return v;
-  const token = String(body?.miniToken || "").trim();
-  if (!token) return v;
-  const tv = await verifyMiniappToken(token, env);
-  if (tv.ok) return tv;
-  return v;
-}
-
 /* ========================== TELEGRAM MINI APP initData verification ========================== */
 async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientRaw) {
   if (!initData || typeof initData !== "string") return { ok: false, reason: "initData_missing" };
@@ -5689,12 +5625,10 @@ let INIT_DATA = "";
 let MINI_TOKEN = "";
 let IS_STAFF = false;
 let IS_OWNER = false;
-let IS_GUEST = false;
 let OFFLINE_MODE = false;
 
 const LOCAL_KEYS = {
   initData: "miniapp_init_data",
-  miniToken: "miniapp_auth_token",
   userState: "miniapp_cached_user_state_v1",
   quoteCache: "miniapp_quote_cache_v1",
   newsCache: "miniapp_news_cache_v1",
@@ -5721,7 +5655,7 @@ function getFreshInitData() {
 }
 
 function buildAuthBody(extra = {}) {
-  return { initData: getFreshInitData(), miniToken: MINI_TOKEN || localStorage.getItem(LOCAL_KEYS.miniToken) || "", ...extra };
+  return { initData: getFreshInitData(), ...extra };
 }
 
 function showToast(title, subline = "", badge = "", loading = false){
@@ -5805,12 +5739,12 @@ function setTf(tf){
 async function api(path, body){
   let lastErr = null;
   const quickBoot = path === "/api/user" && !!body?.allowGuest;
-  const attempts = quickBoot ? 2 : 2;
+  const attempts = quickBoot ? 1 : 2;
   for (let i = 0; i < attempts; i++) {
     try {
       const ac = new AbortController();
-      const quickMs = i === 0 ? 4500 : 9000;
-      const tm = setTimeout(() => ac.abort("timeout"), quickBoot ? quickMs : (12000 + (i * 4000)));
+      const isBootUser = String(path || "") === "/api/user";
+      const tm = setTimeout(() => ac.abort("timeout"), (isBootUser ? 7000 : 12000) + (i * 2500));
       const r = await fetch(API_BASE + path, {        method: "POST",
         headers: {"content-type":"application/json"},
         body: JSON.stringify(body),
@@ -5887,13 +5821,13 @@ async function refreshLiveQuote(force = false){
     if (!symbol) return;
     const ck = quoteCacheKey(symbol, timeframe);
 
-    if (OFFLINE_MODE) {
+    if (OFFLINE_MODE || !getFreshInitData()) {
       const cached = readByKey(LOCAL_KEYS.quoteCache, ck);
       setQuoteUi(cached, "قیمت لحظه‌ای از کش محلی");
       return;
     }
 
-    const { json } = await api("/api/quote", buildAuthBody({ symbol, timeframe, allowGuest: true }));
+    const { json } = await api("/api/quote", buildAuthBody({ symbol, timeframe }));
     if (json?.ok) {
       cacheByKey(LOCAL_KEYS.quoteCache, ck, json);
       setQuoteUi(json, "");
@@ -5948,13 +5882,13 @@ async function refreshSymbolNews(force = false){
   if (target && force) target.textContent = "در حال دریافت خبر…";
   const ck = newsCacheKey(symbol);
 
-  if (OFFLINE_MODE) {
+  if (OFFLINE_MODE || !getFreshInitData()) {
     const cached = readByKey(LOCAL_KEYS.newsCache, ck);
     renderNewsList(cached || { ok: false, articles: [] });
     return;
   }
 
-  const { json } = await api("/api/news", buildAuthBody({ symbol, allowGuest: true }));
+  const { json } = await api("/api/news", buildAuthBody({ symbol }));
   if (json?.ok) {
     cacheByKey(LOCAL_KEYS.newsCache, ck, json);
     renderNewsList(json);
@@ -5972,13 +5906,13 @@ async function refreshNewsAnalysis(force = false){
   if (target && force) target.textContent = "در حال تحلیل خبر…";
   const ck = newsCacheKey(symbol);
 
-  if (OFFLINE_MODE) {
+  if (OFFLINE_MODE || !getFreshInitData()) {
     const cached = readByKey(LOCAL_KEYS.newsAnalysisCache, ck);
     if (target) target.textContent = cached?.summary || "تحلیل خبری آفلاین موجود نیست.";
     return;
   }
 
-  const { json } = await api("/api/news/analyze", buildAuthBody({ symbol, allowGuest: true }));
+  const { json } = await api("/api/news/analyze", buildAuthBody({ symbol }));
   if (!target) return;
   if (json?.ok) {
     cacheByKey(LOCAL_KEYS.newsAnalysisCache, ck, json);
@@ -6319,13 +6253,18 @@ async function boot(){
   pillTxt.textContent = "Connecting…";
   showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
 
+  const preCached = readCachedUserSnapshot();
+  if (preCached) {
+    applyUserState(preCached);
+    out.textContent = "⏳ در حال همگام‌سازی با سرور…";
+    pillTxt.textContent = "Syncing…";
+    setupLiveQuotePolling();
+    setupNewsPolling();
+  }
+
   const isTelegramRuntime = !!window.Telegram?.WebApp;
   const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
   const savedInitData = localStorage.getItem(LOCAL_KEYS.initData) || "";
-  const qsMiniToken = new URLSearchParams(window.location.search).get("miniToken") || "";
-  const savedMiniToken = localStorage.getItem(LOCAL_KEYS.miniToken) || "";
-  if (qsMiniToken) { MINI_TOKEN = qsMiniToken; try { localStorage.setItem(LOCAL_KEYS.miniToken, qsMiniToken); } catch {} }
-  else if (savedMiniToken) { MINI_TOKEN = savedMiniToken; }
   let initData = (tg?.initData || "").trim();
 
   // Telegram WebApp may populate initData with a slight delay.
@@ -6351,7 +6290,7 @@ async function boot(){
     INIT_DATA = "";
     showToast("حالت مهمان", "اتصال احراز نشده؛ اجرای محدود با داده عمومی", "GUEST", false);
   }
-  const {status, json} = await api("/api/user", buildAuthBody({ allowGuest: true }));
+  const {status, json} = await api("/api/user", buildAuthBody());
 
   if (!json?.ok) {
     if (status === 401) {
@@ -6359,38 +6298,18 @@ async function boot(){
     }
     const cached = readCachedUserSnapshot();
     if (!cached) {
-      const fallback = {
-        welcome: "نسخه محدود مینی‌اپ فعال شد.",
-        state: { timeframe: "H4", style: "پرایس اکشن", risk: "متوسط", newsEnabled: true, promptMode: "style_plus_custom", selectedSymbol: "BTCUSDT" },
-        quota: "guest",
-        symbols: ["BTCUSDT","ETHUSDT","XAUUSD","EURUSD"],
-        styles: ["پرایس اکشن","ICT","ATR","ترکیبی"],
-        offerBanner: "اتصال محدود؛ برخی امکانات نیازمند احراز تلگرام است.",
-        role: "user",
-        isStaff: false,
-        customPrompts: [],
-      };
-      OFFLINE_MODE = true;
-      IS_GUEST = true;
-      applyUserState(fallback);
-      pillTxt.textContent = "Offline (Guest)";
-      out.textContent = "حالت محدود فعال شد ✅ داده‌های پایه بارگذاری شدند.";
-      showToast("حالت محدود", "برای همه امکانات، مینی‌اپ را از داخل تلگرام باز کنید.", "GUEST", false);
-      setupLiveQuotePolling();
-      setupNewsPolling();
+      hideToast();
+      pillTxt.textContent = "Offline";
+      out.textContent = "⚠️ خطا: " + prettyErr(json, status);
+      showToast("خطا", prettyErr(json, status), "API", false);
       return;
     }
-    OFFLINE_MODE = !navigator.onLine;
-    IS_GUEST = true;
+    OFFLINE_MODE = true;
     applyUserState(cached);
-    out.textContent = OFFLINE_MODE
-      ? "حالت آفلاین فعال شد ✅ امکانات از کش محلی بارگذاری می‌شود."
-      : "حالت محدود فعال شد ✅ داده‌های ذخیره‌شده بارگذاری شد و اتصال خواندنی در حال تلاش است.";
-    pillTxt.textContent = OFFLINE_MODE ? "Offline (Cached)" : "Limited (Guest)";
+    out.textContent = "حالت آفلاین فعال شد ✅ امکانات از کش محلی بارگذاری می‌شود.";
+    pillTxt.textContent = "Offline (Cached)";
     hideToast();
-    showToast(OFFLINE_MODE ? "آفلاین" : "حالت محدود", OFFLINE_MODE ? "داده‌های ذخیره‌شده بارگذاری شد" : "اتصال خواندنی مهمان فعال شد", OFFLINE_MODE ? "CACHE" : "GUEST", false);
-    setupLiveQuotePolling();
-    setupNewsPolling();
+    showToast("آفلاین", "داده‌های ذخیره‌شده بارگذاری شد", "CACHE", false);
     return;
   }
 
@@ -6463,8 +6382,8 @@ el("tfChips").addEventListener("click", (e) => {
 });
 
 el("save").addEventListener("click", async () => {
-  if (OFFLINE_MODE || IS_GUEST) {
-    showToast("محدود", "در حالت آفلاین/مهمان ذخیره روی سرور ممکن نیست.", "SET", false);
+  if (OFFLINE_MODE) {
+    showToast("آفلاین", "در حالت آفلاین ذخیره روی سرور ممکن نیست.", "SET", false);
     return;
   }
   showToast("در حال ذخیره…", "تنظیمات ذخیره می‌شود", "SET", true);
@@ -6494,7 +6413,7 @@ el("save").addEventListener("click", async () => {
 });
 
 el("analyze").addEventListener("click", async () => {
-  if (OFFLINE_MODE || IS_GUEST) {
+  if (OFFLINE_MODE) {
     const symbol = val("symbol") || "";
     const cached = readByKey(LOCAL_KEYS.analyzeCache, analyzeCacheKey(symbol));
     if (cached?.result) {
@@ -6502,8 +6421,8 @@ el("analyze").addEventListener("click", async () => {
       if (cached?.zonesSvg) renderChartFallbackSvg(cached.zonesSvg);
       showToast("آفلاین", "آخرین تحلیل ذخیره‌شده نمایش داده شد.", "AI", false);
     } else {
-      out.textContent = "⚠️ تحلیل آنلاین در حالت آفلاین/مهمان غیرفعال است. برای ادامه از داخل تلگرام متصل شوید.";
-      showToast("محدود", "تحلیل نیاز به اتصال و احراز تلگرام دارد.", "AI", false);
+      out.textContent = "⚠️ تحلیل آنلاین در حالت آفلاین غیرفعال است. برای ادامه دکمه اتصال مجدد را بزنید.";
+      showToast("آفلاین", "تحلیل نیاز به اتصال دارد.", "AI", false);
     }
     return;
   }
@@ -6563,8 +6482,8 @@ el("analyze").addEventListener("click", async () => {
 });
 
 el("sendSupportTicket")?.addEventListener("click", async () => {
-  if (OFFLINE_MODE || IS_GUEST) {
-    showToast("محدود", "ارسال تیکت در حالت آفلاین/مهمان ممکن نیست.", "SUP", false);
+  if (OFFLINE_MODE) {
+    showToast("آفلاین", "ارسال تیکت در حالت آفلاین ممکن نیست.", "SUP", false);
     return;
   }
   const text = (el("supportTicketText")?.value || "").trim();
