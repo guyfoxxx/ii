@@ -26,7 +26,12 @@ export default {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
         const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+        if (!v.ok) {
+          if (miniappGuestEnabled(env)) {
+            return jsonResponse(await buildMiniappGuestPayload(env));
+          }
+          return jsonResponse({ ok: false, error: v.reason }, 401);
+        }
 
         const st = await ensureUser(v.userId, env);
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
@@ -646,9 +651,10 @@ TxID: ${txid}
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
         const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+        const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
+        if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
-        const st = await ensureUser(v.userId, env);
+        const st = v.ok ? await ensureUser(v.userId, env) : defaultUser("guest");
         const symbol = String(body.symbol || "").trim();
         const tf = String(body.timeframe || st.timeframe || "H4").toUpperCase();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
@@ -696,7 +702,8 @@ TxID: ${txid}
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
         const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+        const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
+        if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const symbol = String(body.symbol || "").trim().toUpperCase();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
@@ -715,7 +722,8 @@ TxID: ${txid}
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
         const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+        const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
+        if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const symbol = String(body.symbol || "").trim().toUpperCase();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
@@ -4600,6 +4608,32 @@ function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json; charset=utf-8" } });
 }
 
+
+function miniappGuestEnabled(env) {
+  const v = String(env.MINIAPP_GUEST_READONLY || "1").trim().toLowerCase();
+  return !(v === "0" || v === "false" || v === "no");
+}
+
+async function buildMiniappGuestPayload(env) {
+  const st = defaultUser("guest");
+  const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
+  const styles = await getStyleList(env);
+  return {
+    ok: true,
+    guest: true,
+    welcome: await getMiniappWelcomeText(env),
+    state: st,
+    quota: "guest",
+    symbols,
+    styles,
+    offerBanner: await getOfferBanner(env),
+    customPrompts: await getCustomPrompts(env),
+    role: "user",
+    isStaff: false,
+    wallet: "",
+  };
+}
+
 /* ========================== TELEGRAM MINI APP initData verification ========================== */
 async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientRaw) {
   if (!initData || typeof initData !== "string") return { ok: false, reason: "initData_missing" };
@@ -5956,10 +5990,8 @@ async function boot(){
     localStorage.setItem(LOCAL_KEYS.initData, devInit);
     showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
   } else {
-    hideToast();
-    pillTxt.textContent = "Offline";
-    out.textContent = "⚠️ اتصال مینی‌اپ برقرار نیست. " + CONNECTION_HINT;
-    return;
+    INIT_DATA = "";
+    showToast("حالت مهمان", "اتصال احراز نشده؛ اجرای محدود با داده عمومی", "GUEST", false);
   }
   const {status, json} = await api("/api/user", buildAuthBody());
 
@@ -5994,6 +6026,7 @@ async function boot(){
   setupNewsPolling();
   IS_STAFF = !!json.isStaff;
   IS_OWNER = json.role === "owner";
+  IS_GUEST = !!json.guest;
 
   if (IS_STAFF && adminCard) {
     adminCard.classList.add("show");
