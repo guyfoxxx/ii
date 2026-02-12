@@ -5853,7 +5853,6 @@ async function boot(){
     out.textContent = "⚠️ اتصال مینی‌اپ برقرار نیست. " + CONNECTION_HINT;
     return;
   }
-
   const {status, json} = await api("/api/user", { initData: INIT_DATA });
 
   if (!json?.ok) {
