@@ -6,11 +6,19 @@ export default {
       if (url.pathname === "/health") return new Response("ok", { status: 200 });
 
       // ===== MINI APP (inline) =====
-      if (request.method === "GET" && (url.pathname === "/" || url.pathname === "")) {
-        return htmlResponse(MINI_APP_HTML);
-      }
-      if (request.method === "GET" && url.pathname === "/app.js") {
+      // Serve app.js from root and nested miniapp paths (e.g. /miniapp/app.js)
+      if (request.method === "GET" && (url.pathname === "/app.js" || url.pathname.endsWith("/app.js"))) {
         return jsResponse(MINI_APP_JS);
+      }
+      // Serve Mini App shell on root and non-API clean paths (e.g. /miniapp)
+      if (
+        request.method === "GET" &&
+        url.pathname !== "/health" &&
+        !url.pathname.startsWith("/api/") &&
+        !url.pathname.startsWith("/telegram/") &&
+        !url.pathname.endsWith(".js")
+      ) {
+        return htmlResponse(MINI_APP_HTML);
       }
 
       // ===== MINI APP APIs =====
@@ -5312,7 +5320,7 @@ const MINI_APP_HTML = `<!doctype html>
         <div class="badge" id="toastB">—</div>
       </div>
 
-      <script src="/app.js"></script>
+      <script src="app.js"></script>
 </body>
 </html>`;
 
@@ -5815,17 +5823,35 @@ async function boot(){
   pillTxt.textContent = "Connecting…";
   showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
 
+  const isTelegramRuntime = !!window.Telegram?.WebApp;
   const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
   const savedInitData = localStorage.getItem("miniapp_init_data") || "";
-  const initData = tg?.initData || qsInitData || savedInitData;
-  if (!initData) {
+  let initData = (tg?.initData || "").trim();
+
+  // Telegram WebApp may populate initData with a slight delay.
+  if (isTelegramRuntime && !initData) {
+    await new Promise((r) => setTimeout(r, 350));
+    initData = (tg?.initData || "").trim();
+  }
+
+  if (initData) {
+    INIT_DATA = initData;
+    localStorage.setItem("miniapp_init_data", initData);
+  } else if (qsInitData) {
+    INIT_DATA = qsInitData;
+    localStorage.setItem("miniapp_init_data", qsInitData);
+  } else if (savedInitData && !isTelegramRuntime) {
+    INIT_DATA = savedInitData;
+  } else if (!isTelegramRuntime) {
     const devInit = "dev:999001";
     INIT_DATA = devInit;
     localStorage.setItem("miniapp_init_data", devInit);
     showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
   } else {
-    INIT_DATA = initData;
-    localStorage.setItem("miniapp_init_data", initData);
+    hideToast();
+    pillTxt.textContent = "Offline";
+    out.textContent = "⚠️ اتصال مینی‌اپ برقرار نیست. " + CONNECTION_HINT;
+    return;
   }
   const {status, json} = await api("/api/user", { initData: INIT_DATA });
 
