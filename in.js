@@ -1513,6 +1513,17 @@ async function getOfferBanner(env) {
   return (raw || env.SPECIAL_OFFER_TEXT || "").toString().trim();
 }
 
+async function getOfferBannerImage(env) {
+  if (!env.BOT_KV) return (env.SPECIAL_OFFER_IMAGE || "").toString().trim();
+  const raw = await env.BOT_KV.get("settings:offer_banner_image");
+  return (raw || env.SPECIAL_OFFER_IMAGE || "").toString().trim();
+}
+
+async function setOfferBannerImage(env, image) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put("settings:offer_banner_image", String(image || "").trim());
+}
+
 async function setOfferBanner(env, text) {
   if (!env.BOT_KV) return;
   await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
@@ -5221,6 +5232,17 @@ const MINI_APP_HTML = `<!doctype html>
     .q-up{ color: var(--good); }
     .q-down{ color: var(--bad); }
     .q-flat{ color: var(--warn); }
+    .tabs{ display:flex; gap:8px; overflow:auto; padding-bottom:4px; margin-bottom:10px; }
+    .tab-btn{ border:1px solid rgba(255,255,255,.14); background:rgba(255,255,255,.06); color:var(--text); border-radius:999px; padding:8px 12px; font-size:12px; cursor:pointer; white-space:nowrap; }
+    .tab-btn.active{ background:linear-gradient(135deg,var(--primary),var(--accent)); border-color:transparent; color:#fff; }
+    .tab-panel{ display:none; }
+    .tab-panel.active{ display:block; }
+    .energy{ display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:12px; color:var(--muted); margin-top:8px; }
+    .energy-bar{ height:8px; width:100%; border-radius:999px; background:rgba(255,255,255,.08); overflow:hidden; }
+    .energy-fill{ height:100%; width:0%; background:linear-gradient(90deg,var(--accent),var(--primary)); transition:width .25s ease; }
+    .offer-media{ margin-top:10px; border-radius:16px; overflow:hidden; border:1px solid rgba(255,255,255,.12); display:none; }
+    .offer-media.show{ display:block; }
+    .offer-media img{ width:100%; display:block; }
   </style>
 </head>
 <body>
@@ -5250,7 +5272,7 @@ const MINI_APP_HTML = `<!doctype html>
     </div>
 
     <div class="grid">
-      <div class="card">
+      <div class="card tab-panel active" data-panel="dashboard">
         <div class="card-b offer" id="offerCard">
           <div>
             <h3>🎁 پیشنهاد ویژه</h3>
@@ -5258,9 +5280,10 @@ const MINI_APP_HTML = `<!doctype html>
             <div class="offer-media" id="offerMedia"><img id="offerImg" alt="offer" /></div>
           </div>
           <div class="tag" id="offerTag">Special</div>
+          <div class="offer-media" id="offerMedia"><img id="offerImg" alt="offer" /></div>
         </div>
       </div>
-      <div class="card" id="quoteCard">
+      <div class="card tab-panel active" id="quoteCard" data-panel="dashboard">
         <div class="card-h">
           <strong>داشبورد قیمت لحظه‌ای</strong>
           <span id="quoteStamp">—</span>
@@ -5276,7 +5299,7 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
       </div>
 
-      <div class="card" id="newsCard">
+      <div class="card tab-panel active" id="newsCard" data-panel="dashboard">
         <div class="card-h">
           <strong>📰 اخبار فارسی نماد</strong>
           <button id="refreshNews" class="btn ghost" style="min-width:unset; padding:6px 10px;">بروزرسانی</button>
@@ -5287,7 +5310,7 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="mini-list" id="newsAnalysis">در حال تولید تحلیل خبری…</div>
         </div>
       </div>
-      <div class="card">
+      <div class="card tab-panel" data-panel="analyze">
         <div class="card-h">
           <strong>تحلیل سریع</strong>
           <span id="meta">—</span>
@@ -5367,6 +5390,11 @@ const MINI_APP_HTML = `<!doctype html>
 
           <div style="height:10px"></div>
           <div class="muted" style="font-size:12px; line-height:1.6;" id="welcome"></div>
+          <div class="energy">
+            <span id="energyText">انرژی: —</span>
+            <span id="remainingText">تحلیل باقی‌مانده: —</span>
+          </div>
+          <div class="energy-bar"><div class="energy-fill" id="energyFill"></div></div>
         </div>
 
         <div class="out" id="out">آماده…</div>
@@ -5382,7 +5410,7 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
       </div>
 
-      <div class="card" id="supportCard">
+      <div class="card tab-panel" id="supportCard" data-panel="support">
         <div class="card-h">
           <strong>پشتیبانی</strong>
           <span>ارسال تیکت</span>
@@ -5406,7 +5434,7 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
       </div>
 
-      <div class="card admin-card" id="adminCard">
+      <div class="card admin-card tab-panel" id="adminCard" data-panel="admin">
         <div class="card-h">
           <strong id="adminTitle">پنل ادمین</strong>
           <span>مدیریت پرامپت، سبک‌ها، پرداخت، برداشت و تیکت‌ها</span>
@@ -5507,6 +5535,11 @@ const MINI_APP_HTML = `<!doctype html>
             <div class="actions">
               <button id="saveOfferBanner" class="btn">ذخیره بنر</button>
             </div>
+            <div class="admin-row">
+              <input id="offerImageFile" type="file" accept="image/*" class="control" />
+              <button id="clearOfferImage" class="btn ghost">حذف تصویر</button>
+            </div>
+            <input id="offerBannerImageInput" class="control" placeholder="یا لینک تصویر بنر..." />
           </div>
 
           <div class="field admin-tab" data-tab="content">
@@ -5999,6 +6032,19 @@ function pickTicketReplyTemplate(){
 function updateMeta(state, quota){
   meta.textContent = "سهمیه: " + (quota || "-");
   sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
+  const q = String(quota || "");
+  const m = q.match(/(\d+)\s*\/\s*(\d+)/);
+  let used = 0;
+  let limit = 0;
+  if (m) {
+    used = Number(m[1] || 0);
+    limit = Number(m[2] || 0);
+  }
+  const remaining = Math.max(0, limit - used);
+  const pct = limit > 0 ? Math.max(0, Math.min(100, Math.round((remaining / limit) * 100))) : 100;
+  if (remainingText) remainingText.textContent = "تحلیل باقی‌مانده: " + (limit > 0 ? String(remaining) : "∞");
+  if (energyText) energyText.textContent = "انرژی: " + (limit > 0 ? (pct + "%") : "نامحدود");
+  if (energyFill) energyFill.style.width = (limit > 0 ? pct : 100) + "%";
 }
 
 function updateDashboardStats(role, quota){
@@ -6662,6 +6708,33 @@ el("saveOfferBanner")?.addEventListener("click", async () => {
   } else {
     showToast("خطا", "ذخیره بنر ناموفق بود", "ADM", false);
   }
+});
+
+el("offerImageFile")?.addEventListener("change", async (ev) => {
+  const file = ev?.target?.files?.[0];
+  if (!file) return;
+  if (file.size > 1024 * 1024) {
+    showToast("خطا", "حجم تصویر باید کمتر از 1MB باشد", "ADM", false);
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const dataUrl = typeof reader.result === "string" ? reader.result : "";
+    if (el("offerBannerImageInput")) el("offerBannerImageInput").value = dataUrl;
+    if (offerImg) offerImg.src = dataUrl;
+    if (offerMedia) offerMedia.classList.toggle("show", !!dataUrl);
+  };
+  reader.readAsDataURL(file);
+});
+
+el("clearOfferImage")?.addEventListener("click", async () => {
+  const offerBanner = el("offerBannerInput")?.value || "";
+  const { json } = await adminApi("/api/admin/offer", { offerBanner, clearOfferBannerImage: true });
+  if (el("offerBannerImageInput")) el("offerBannerImageInput").value = "";
+  if (el("offerImageFile")) el("offerImageFile").value = "";
+  if (offerImg) offerImg.src = "";
+  if (offerMedia) offerMedia.classList.remove("show");
+  if (json?.ok) showToast("انجام شد ✅", "تصویر بنر حذف شد", "ADM", false);
 });
 
 el("saveWelcomeTexts")?.addEventListener("click", async () => {
