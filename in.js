@@ -5062,6 +5062,7 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="actions">
             <button id="save" class="btn">💾 ذخیره</button>
             <button id="analyze" class="btn primary">⚡ تحلیل</button>
+            <button id="reconnect" class="btn ghost">🔄 اتصال مجدد</button>
             <button id="close" class="btn ghost">✖ بستن</button>
           </div>
 
@@ -5182,6 +5183,12 @@ const MINI_APP_HTML = `<!doctype html>
               <button id="approvePayment" class="btn primary">تأیید و فعال‌سازی</button>
               <button id="checkPayment" class="btn ghost">چک بلاک‌چین</button>
               <button id="activateSubscription" class="btn">فعال‌سازی دستی</button>
+            </div>
+            <div class="muted" style="font-size:12px; line-height:1.8;">برای استفاده ساده: فقط یوزرنیم + مبلغ + یکی از پلن‌ها را انتخاب کنید. TxHash اختیاری است.</div>
+            <div class="chips" id="paymentPresets">
+              <button type="button" class="chip" data-days="7" data-amount="9">پلن شروع ۷ روزه</button>
+              <button type="button" class="chip" data-days="30" data-amount="19">پلن ماهانه</button>
+              <button type="button" class="chip" data-days="90" data-amount="49">پلن حرفه‌ای ۹۰ روزه</button>
             </div>
             <div class="mini-list" id="paymentList">—</div>
           </div>
@@ -5353,6 +5360,12 @@ let ALL_SYMBOLS = [];
 let INIT_DATA = "";
 let IS_STAFF = false;
 let IS_OWNER = false;
+let OFFLINE_MODE = false;
+
+const LOCAL_KEYS = {
+  initData: "miniapp_init_data",
+  userState: "miniapp_cached_user_state_v1",
+};
 const API_BASE = window.location.origin;
 let ADMIN_TICKETS = [];
 let ADMIN_TICKETS_ALL = [];
@@ -5818,54 +5831,34 @@ function safeJsonParse(text, fallback) {
   try { return JSON.parse(text); } catch { return fallback; }
 }
 
-async function boot(){
-  out.textContent = "⏳ در حال آماده‌سازی…";
-  pillTxt.textContent = "Connecting…";
-  showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
+function cacheUserSnapshot(json) {
+  try {
+    const data = {
+      welcome: json?.welcome || "",
+      state: json?.state || {},
+      quota: json?.quota || "",
+      symbols: json?.symbols || [],
+      styles: json?.styles || [],
+      customPrompts: json?.customPrompts || [],
+      offerBanner: json?.offerBanner || "",
+      role: json?.role || "user",
+      isStaff: !!json?.isStaff,
+      wallet: json?.wallet || "",
+      cachedAt: Date.now(),
+    };
+    localStorage.setItem(LOCAL_KEYS.userState, JSON.stringify(data));
+  } catch {}
+}
 
-  const isTelegramRuntime = !!window.Telegram?.WebApp;
-  const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
-  const savedInitData = localStorage.getItem("miniapp_init_data") || "";
-  let initData = (tg?.initData || "").trim();
-
-  // Telegram WebApp may populate initData with a slight delay.
-  if (isTelegramRuntime && !initData) {
-    await new Promise((r) => setTimeout(r, 350));
-    initData = (tg?.initData || "").trim();
+function readCachedUserSnapshot() {
+  try {
+    return safeJsonParse(localStorage.getItem(LOCAL_KEYS.userState) || "", null);
+  } catch {
+    return null;
   }
+}
 
-  if (initData) {
-    INIT_DATA = initData;
-    localStorage.setItem("miniapp_init_data", initData);
-  } else if (qsInitData) {
-    INIT_DATA = qsInitData;
-    localStorage.setItem("miniapp_init_data", qsInitData);
-  } else if (savedInitData && !isTelegramRuntime) {
-    INIT_DATA = savedInitData;
-  } else if (!isTelegramRuntime) {
-    const devInit = "dev:999001";
-    INIT_DATA = devInit;
-    localStorage.setItem("miniapp_init_data", devInit);
-    showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
-  } else {
-    hideToast();
-    pillTxt.textContent = "Offline";
-    out.textContent = "⚠️ اتصال مینی‌اپ برقرار نیست. " + CONNECTION_HINT;
-    return;
-  }
-  const {status, json} = await api("/api/user", { initData: INIT_DATA });
-
-  if (!json?.ok) {
-    if (status === 401) {
-      try { localStorage.removeItem("miniapp_init_data"); } catch {}
-    }
-    hideToast();
-    pillTxt.textContent = "Offline";
-    out.textContent = "⚠️ خطا: " + prettyErr(json, status);
-    showToast("خطا", prettyErr(json, status), "API", false);
-    return;
-  }
-
+function applyUserState(json) {
   welcome.textContent = json.welcome || "";
   fillSymbols(json.symbols || []);
   const styleList = json.styles || [];
@@ -5889,6 +5882,70 @@ async function boot(){
   if (offerTag) offerTag.textContent = json.role === "owner" ? "Owner" : "Special";
 
   updateMeta(json.state, json.quota);
+}
+
+
+async function boot(){
+  out.textContent = "⏳ در حال آماده‌سازی…";
+  pillTxt.textContent = "Connecting…";
+  showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
+
+  const isTelegramRuntime = !!window.Telegram?.WebApp;
+  const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
+  const savedInitData = localStorage.getItem(LOCAL_KEYS.initData) || "";
+  let initData = (tg?.initData || "").trim();
+
+  // Telegram WebApp may populate initData with a slight delay.
+  if (isTelegramRuntime && !initData) {
+    await new Promise((r) => setTimeout(r, 350));
+    initData = (tg?.initData || "").trim();
+  }
+
+  if (initData) {
+    INIT_DATA = initData;
+    localStorage.setItem(LOCAL_KEYS.initData, initData);
+  } else if (qsInitData) {
+    INIT_DATA = qsInitData;
+    localStorage.setItem(LOCAL_KEYS.initData, qsInitData);
+  } else if (savedInitData && !isTelegramRuntime) {
+    INIT_DATA = savedInitData;
+  } else if (!isTelegramRuntime) {
+    const devInit = "dev:999001";
+    INIT_DATA = devInit;
+    localStorage.setItem(LOCAL_KEYS.initData, devInit);
+    showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
+  } else {
+    hideToast();
+    pillTxt.textContent = "Offline";
+    out.textContent = "⚠️ اتصال مینی‌اپ برقرار نیست. " + CONNECTION_HINT;
+    return;
+  }
+  const {status, json} = await api("/api/user", { initData: INIT_DATA });
+
+  if (!json?.ok) {
+    if (status === 401) {
+      try { localStorage.removeItem(LOCAL_KEYS.initData); } catch {}
+    }
+    const cached = readCachedUserSnapshot();
+    if (!cached) {
+      hideToast();
+      pillTxt.textContent = "Offline";
+      out.textContent = "⚠️ خطا: " + prettyErr(json, status);
+      showToast("خطا", prettyErr(json, status), "API", false);
+      return;
+    }
+    OFFLINE_MODE = true;
+    applyUserState(cached);
+    out.textContent = "حالت آفلاین فعال شد ✅ برخی امکانات محدود هستند.";
+    pillTxt.textContent = "Offline (Cached)";
+    hideToast();
+    showToast("آفلاین", "داده‌های ذخیره‌شده بارگذاری شد", "CACHE", false);
+    return;
+  }
+
+  OFFLINE_MODE = false;
+  cacheUserSnapshot(json);
+  applyUserState(json);
   out.textContent = "آماده ✅";
   pillTxt.textContent = "Online";
   hideToast();
@@ -5954,6 +6011,10 @@ el("tfChips").addEventListener("click", (e) => {
 });
 
 el("save").addEventListener("click", async () => {
+  if (OFFLINE_MODE) {
+    showToast("آفلاین", "در حالت آفلاین ذخیره روی سرور ممکن نیست.", "SET", false);
+    return;
+  }
   showToast("در حال ذخیره…", "تنظیمات ذخیره می‌شود", "SET", true);
   out.textContent = "⏳ ذخیره تنظیمات…";
 
@@ -5983,6 +6044,11 @@ el("save").addEventListener("click", async () => {
 });
 
 el("analyze").addEventListener("click", async () => {
+  if (OFFLINE_MODE) {
+    out.textContent = "⚠️ تحلیل آنلاین در حالت آفلاین غیرفعال است. برای ادامه دکمه اتصال مجدد را بزنید.";
+    showToast("آفلاین", "تحلیل نیاز به اتصال دارد.", "AI", false);
+    return;
+  }
   showToast("در حال تحلیل…", "جمع‌آوری دیتا + تولید خروجی", "AI", true);
   out.textContent = "⏳ در حال تحلیل…";
 
@@ -6023,6 +6089,10 @@ el("analyze").addEventListener("click", async () => {
 });
 
 el("sendSupportTicket")?.addEventListener("click", async () => {
+  if (OFFLINE_MODE) {
+    showToast("آفلاین", "ارسال تیکت در حالت آفلاین ممکن نیست.", "SUP", false);
+    return;
+  }
   const text = (el("supportTicketText")?.value || "").trim();
   if (!text || text.length < 4) {
     showToast("خطا", "متن تیکت خیلی کوتاه است.", "SUP", false);
@@ -6342,6 +6412,30 @@ el("downloadReportPdf")?.addEventListener("click", async () => {
   } catch (e) {
     showToast("خطا", "ساخت PDF ناموفق بود", "PDF", false);
   }
+});
+
+
+el("reconnect")?.addEventListener("click", async () => {
+  OFFLINE_MODE = false;
+  await boot();
+});
+
+window.addEventListener("online", () => {
+  if (pillTxt && pillTxt.textContent.toLowerCase().includes("offline")) pillTxt.textContent = "Online";
+});
+
+window.addEventListener("offline", () => {
+  if (pillTxt) pillTxt.textContent = "Offline";
+});
+
+el("paymentPresets")?.addEventListener("click", (e) => {
+  const btn = e.target?.closest?.("[data-days]");
+  if (!btn) return;
+  const days = Number(btn.getAttribute("data-days") || 30);
+  const amount = Number(btn.getAttribute("data-amount") || 0);
+  if (el("payDays")) el("payDays").value = String(days);
+  if (el("payAmount")) el("payAmount").value = String(amount);
+  showToast("پلن انتخاب شد ✅", "روز: " + days + " | مبلغ: " + amount, "PAY", false);
 });
 
 boot();`;
