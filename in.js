@@ -667,7 +667,18 @@ TxID: ${txid}
           });
         } catch (e) {
           console.error("api/chart quickchart render failed:", e?.message || e);
-          return jsonResponse({ ok: false, error: "chart_render_failed" }, 502);
+          const autoLevels = (Array.isArray(levels) && levels.length)
+            ? levels
+            : extractLevelsFromCandles(candles);
+          const svg = buildLevelsOnlySvg(symbol, tf, autoLevels);
+          return new Response(svg, {
+            status: 200,
+            headers: {
+              "Content-Type": "image/svg+xml; charset=utf-8",
+              "Cache-Control": "public, max-age=30",
+              "X-Chart-Fallback": "internal_svg",
+            },
+          });
         }
       }
 
@@ -739,7 +750,6 @@ TxID: ${txid}
           return jsonResponse({ ok: false, error: "news_unavailable", symbol, articles: [] }, 502);
         }
       }
-
       if (url.pathname === "/api/analyze" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
@@ -2842,7 +2852,27 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
     }
   }
 
+  // final fallback: try stale cache from any timeframe and remap
+  const remapped = await getAnyTimeframeMarketCache(env, symbol, tf, limit);
+  if (Array.isArray(remapped) && remapped.length) {
+    await setMarketCache(env, cacheKey, remapped.slice(-limit));
+    return remapped.slice(-limit);
+  }
+
   throw lastErr || new Error("market_data_all_failed");
+}
+
+async function getAnyTimeframeMarketCache(env, symbol, targetTf, limit) {
+  const tfs = ["M15", "H1", "H4", "D1"];
+  for (const sourceTf of tfs) {
+    const cacheKey = marketCacheKey(symbol, sourceTf);
+    const cached = await getMarketCacheStale(env, cacheKey);
+    if (!Array.isArray(cached) || !cached.length) continue;
+    const mapped = aggregateCandlesToTimeframe(cached, sourceTf, targetTf);
+    if (Array.isArray(mapped) && mapped.length) return mapped.slice(-limit);
+    if (String(sourceTf) === String(targetTf)) return cached.slice(-limit);
+  }
+  return [];
 }
 
 async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs, limit) {
@@ -2942,8 +2972,7 @@ async function buildNewsBlockForSymbol(symbol, env, maxItems = 4) {
       const src = x?.source ? (" | " + x.source) : "";
       const dt = x?.publishedAt ? (" | " + x.publishedAt) : "";
       return (i + 1) + ") " + String(x?.title || "") + src + dt;
-    }).join("
-");
+    }).join("\n");
   } catch {
     return "";
   }
@@ -3021,28 +3050,32 @@ function minCandlesForTimeframe(tf) {
   return m[String(tf || "").toUpperCase()] || 24;
 }
 
-function buildLocalFallbackAnalysis(symbol, timeframe, candles, reason) {
+function buildLocalFallbackAnalysis(symbol, st, candles, reason = "") {
+  const tf = st?.timeframe || "H4";
   const snap = computeSnapshot(Array.isArray(candles) ? candles : []);
-  const levels = extractLevelsFromCandles(candles, 8);
+  const levels = extractLevelsFromCandles(Array.isArray(candles) ? candles : []);
   const levelTxt = levels.length ? levels.join(" | ") : "داده کافی نیست";
-  const risk = snap ? (Math.abs(Number(snap.changePct || 0)) > 2 ? "بالا" : "متوسط") : "نامشخص";
   const bias = snap?.trend || "نامشخص";
+  const risk =
+    String(st?.risk || "").trim() ||
+    (snap ? (Math.abs(Number(snap.changePct || 0)) > 2 ? "بالا" : "متوسط") : "نامشخص");
+
   return [
-    `۱) وضعیت کلی`,
-    `نماد ${symbol} در تایم‌فریم ${timeframe} با بایاس ${bias} ارزیابی شد.`,
+    "۱) وضعیت کلی",
+    `نماد ${symbol} در تایم‌فریم ${tf} با بایاس ${bias} ارزیابی شد.`,
     snap ? `قیمت آخر: ${snap.lastPrice} | تغییر: ${snap.changePct}%` : "قیمت لحظه‌ای معتبر در دسترس نیست.",
-    ``,
-    `۲) زون‌ها و سطوح`,
+    "",
+    "۲) زون‌ها و سطوح",
     `سطوح پیشنهادی (auto): ${levelTxt}`,
-    ``,
-    `۳) سناریوها`,
+    "",
+    "۳) سناریوها",
     `سناریوی اصلی: ادامه ${bias === "صعودی" ? "حرکت رو به بالا" : (bias === "نزولی" ? "فشار فروش" : "نوسانی")}.`,
-    `سناریوی جایگزین: شکست ساختار خلاف جهت و بازگشت به محدوده‌های میانی.`,
-    ``,
-    `۴) مدیریت ریسک`,
-    `ریسک بازار: ${risk}. ورود پله‌ای، حدضرر اجباری و کاهش اهرم توصیه می‌شود.`,
-    ``,
-    `۵) وضعیت سرویس`,
+    "سناریوی جایگزین: شکست ساختار خلاف جهت و بازگشت به محدوده‌های میانی.",
+    "",
+    "۴) مدیریت ریسک",
+    `ریسک پیشنهادی: ${risk}. ورود پله‌ای، حدضرر اجباری و کاهش اهرم توصیه می‌شود.`,
+    "",
+    "۵) وضعیت سرویس",
     `تحلیل با فالبک داخلی تولید شد (${reason || "text_provider_unavailable"}).`,
   ].join("\n");
 }
@@ -4293,11 +4326,10 @@ async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
     console.error("text providers failed (retry compact):", e?.message || e);
     try {
       const compactBlock = buildMarketBlock(candles, 40);
-      const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env, newsBlock);
-      draft = await runTextProviders(compactPrompt, env, st.textOrder);
+      const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env, newsBlock);      draft = await runTextProviders(compactPrompt, env, st.textOrder);
     } catch (e2) {
       console.error("text providers failed (fallback local):", e2?.message || e2);
-      draft = buildLocalFallbackAnalysis(symbol, st.timeframe || "H4", candles, e2?.message || "text_provider_timeout");
+      draft = buildLocalFallbackAnalysis(symbol, st, candles, e2?.message || "text_provider_timeout");
     }
   }
   const polished = await runPolishProviders(draft, env, st.polishOrder);
@@ -4305,6 +4337,7 @@ async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
   if (useCache && clean) await setAnalysisCache(env, cacheKey, clean);
   return clean;
 }
+
 
 async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
   if (env.BOT_KV && !canAnalyzeToday(st, from, env)) {
@@ -4371,12 +4404,52 @@ async function renderQuickChartPng(env, candles, symbol, tf, levels = []) {
   return await r.arrayBuffer();
 }
 
+function buildLevelsOnlySvg(symbol, timeframe, levels = []) {
+  const clean = (Array.isArray(levels) ? levels : []).filter((x) => Number.isFinite(Number(x))).map(Number).slice(0, 8);
+  const rows = clean.length ? clean : [0, 1, 2];
+  const width = 1200;
+  const height = 700;
+  const pad = 70;
+  const innerH = height - pad * 2;
+  const sorted = [...rows].sort((a, b) => b - a);
+  const max = Math.max(...sorted, 1);
+  const min = Math.min(...sorted, 0);
+  const den = Math.max(1e-9, max - min);
+  const yFor = (p) => pad + ((max - p) / den) * innerH;
+  const lines = sorted.map((p, i) => {
+    const y = yFor(p);
+    const c = i % 2 === 0 ? "#2FE3A5" : "#FFB020";
+    return `<line x1="${pad}" y1="${y}" x2="${width-pad}" y2="${y}" stroke="${c}" stroke-width="2" stroke-dasharray="6 6"/><text x="${width-pad-8}" y="${y-6}" fill="${c}" font-size="22" text-anchor="end">${p}</text>`;
+  }).join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+  <rect width="100%" height="100%" fill="#0B0F17"/>
+  <text x="${pad}" y="42" fill="#E6F0FF" font-size="30" font-family="Arial">${escapeXml(symbol)} - ${escapeXml(timeframe)} (Internal Fallback)</text>
+  <rect x="${pad}" y="${pad}" width="${width-pad*2}" height="${innerH}" rx="14" fill="#101827" stroke="#223047"/>
+  ${lines}
+</svg>`;
+}
+
 function extractLevels(text) {
   const nums = (String(text || "").match(/\b\d{1,6}(?:\.\d{1,6})?\b/g) || [])
     .map(Number)
     .filter(n => Number.isFinite(n));
   const uniq = [...new Set(nums)].sort((a,b)=>a-b);
   return uniq.slice(0, 6);
+}
+
+function extractLevelsFromCandles(candles) {
+  if (!Array.isArray(candles) || !candles.length) return [];
+  const tail = candles.slice(-60);
+  const highs = tail.map((x) => Number(x?.h)).filter((n) => Number.isFinite(n));
+  const lows = tail.map((x) => Number(x?.l)).filter((n) => Number.isFinite(n));
+  if (!highs.length || !lows.length) return [];
+  const hi = Math.max(...highs);
+  const lo = Math.min(...lows);
+  const mid = (hi + lo) / 2;
+  const q1 = lo + (hi - lo) * 0.25;
+  const q3 = lo + (hi - lo) * 0.75;
+  return [lo, q1, mid, q3, hi].map((n) => Number(n.toFixed(6)));
 }
 
 function buildZonesSvgFromAnalysis(analysisText, symbol, timeframe) {
@@ -4796,7 +4869,6 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="mini-list" id="newsList">در حال دریافت خبر…</div>
         </div>
       </div>
-
       <div class="card">
         <div class="card-h">
           <strong>تحلیل سریع</strong>
@@ -5126,6 +5198,7 @@ const MINI_APP_HTML = `<!doctype html>
 
 const MINI_APP_JS = `const tg = window.Telegram?.WebApp;
 if (tg) tg.ready();
+if (tg?.expand) tg.expand();
 
 const out = document.getElementById("out");
 const meta = document.getElementById("meta");
@@ -5160,7 +5233,6 @@ let ADMIN_PROMPT_REQS = [];
 let QUOTE_TIMER = null;
 let QUOTE_BUSY = false;
 let NEWS_TIMER = null;
-
 const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
 
 function showToast(title, subline = "", badge = "", loading = false){
@@ -5247,8 +5319,7 @@ async function api(path, body){
     try {
       const ac = new AbortController();
       const tm = setTimeout(() => ac.abort("timeout"), 12000 + (i * 4000));
-      const r = await fetch(API_BASE + path, {
-        method: "POST",
+      const r = await fetch(API_BASE + path, {        method: "POST",
         headers: {"content-type":"application/json"},
         body: JSON.stringify(body),
         signal: ac.signal,
@@ -5305,15 +5376,13 @@ function setQuoteUi(data, errMsg = ""){
   const cp = Number(data.changePct || 0);
   qSym.textContent = data.symbol || "—";
   qPrice.textContent = fmtPrice(data.price);
-  qChange.textContent = (cp > 0 ? "+" : "") + cp.toFixed(3) + "%";
-  qTrend.textContent = data.trend || "نامشخص";
+  qChange.textContent = (cp > 0 ? "+" : "") + cp.toFixed(3) + "%";  qTrend.textContent = data.trend || "نامشخص";
 
   qChange.classList.remove("q-up","q-down","q-flat");
   qChange.classList.add(data.status === "up" ? "q-up" : (data.status === "down" ? "q-down" : "q-flat"));
   const dt = data.lastTs ? new Date(Number(data.lastTs)) : new Date();
   qStamp.textContent = dt.toLocaleTimeString("fa-IR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  qMeta.textContent = "TF: " + (data.timeframe || "-") + " | candles: " + (data.candles || 0) + " | کیفیت: " + (data.quality === "full" ? "کامل" : "محدود");
-}
+  qMeta.textContent = "TF: " + (data.timeframe || "-") + " | candles: " + (data.candles || 0) + " | کیفیت: " + (data.quality === "full" ? "کامل" : "محدود");}
 
 async function refreshLiveQuote(force = false){
   if (!INIT_DATA || QUOTE_BUSY) return;
@@ -5380,7 +5449,6 @@ function setupNewsPolling(){
   refreshSymbolNews(true);
   NEWS_TIMER = setInterval(() => { refreshSymbolNews(false); }, 60000);
 }
-
 function renderChartFallbackSvg(svgText){
   const chartCard = el("chartCard");
   const chartImg = el("chartImg");
@@ -5628,6 +5696,9 @@ async function boot(){
   const {status, json} = await api("/api/user", { initData });
 
   if (!json?.ok) {
+    if (status === 401) {
+      try { localStorage.removeItem("miniapp_init_data"); } catch {}
+    }
     hideToast();
     pillTxt.textContent = "Offline";
     out.textContent = "⚠️ خطا: " + prettyErr(json, status);
@@ -5660,7 +5731,6 @@ async function boot(){
   hideToast();
   setupLiveQuotePolling();
   setupNewsPolling();
-
   IS_STAFF = !!json.isStaff;
   IS_OWNER = json.role === "owner";
 
@@ -5712,7 +5782,6 @@ el("q").addEventListener("input", (e) => filterSymbols(e.target.value));
 el("symbol")?.addEventListener("change", () => { refreshLiveQuote(true); refreshSymbolNews(true); });
 el("timeframe")?.addEventListener("change", () => refreshLiveQuote(true));
 el("refreshNews")?.addEventListener("click", () => refreshSymbolNews(true));
-
 el("tfChips").addEventListener("click", (e) => {
   const chip = e.target?.closest?.(".chip");
   const tf = chip?.dataset?.tf;
@@ -5766,7 +5835,6 @@ el("analyze").addEventListener("click", async () => {
   out.textContent = json.result || "⚠️ بدون خروجی";
   await refreshLiveQuote(true);
   await refreshSymbolNews(true);
-
   // Render chart if available
   const chartCard = el("chartCard");
   const chartImg = el("chartImg");
@@ -6090,8 +6158,7 @@ el("loadUsers")?.addEventListener("click", async () => {
 el("downloadReportPdf")?.addEventListener("click", async () => {
   try {
     showToast("در حال ساخت PDF…", "گزارش کامل", "PDF", true);
-    const r = await fetch(API_BASE + "/api/admin/report/pdf", {
-      method: "POST",
+    const r = await fetch(API_BASE + "/api/admin/report/pdf", {      method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ initData: INIT_DATA, limit: 250 }),
     });
