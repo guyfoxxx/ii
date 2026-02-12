@@ -38,7 +38,6 @@ export default {
         const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
         const styles = await getStyleList(env);
         const offerBanner = await getOfferBanner(env);
-        const offerBannerImage = await getOfferBannerImage(env);
         const customPrompts = await getCustomPrompts(env);
         const role = isOwner(v.fromLike, env) ? "owner" : (isAdmin(v.fromLike, env) ? "admin" : "user");
 
@@ -50,7 +49,6 @@ export default {
           symbols,
           styles,
           offerBanner,
-          offerBannerImage,
           customPrompts,
           role,
           isStaff: role !== "user",
@@ -120,12 +118,11 @@ export default {
         if (!isStaff(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
 
         if (url.pathname === "/api/admin/bootstrap") {
-          const [prompt, styles, commission, offerBanner, offerBannerImage, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals, tickets, adminFlags, welcomeBot, welcomeMiniapp] = await Promise.all([
+          const [prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals, tickets, adminFlags, welcomeBot, welcomeMiniapp] = await Promise.all([
             getAnalysisPrompt(env),
             getStyleList(env),
             getCommissionSettings(env),
             getOfferBanner(env),
-            getOfferBannerImage(env),
             listPayments(env, 25),
             getStylePromptMap(env),
             getCustomPrompts(env),
@@ -136,7 +133,7 @@ export default {
             getBotWelcomeText(env),
             getMiniappWelcomeText(env),
           ]);
-          return jsonResponse({ ok: true, prompt, styles, commission, offerBanner, offerBannerImage, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals, tickets, adminFlags, welcomeBot, welcomeMiniapp });
+          return jsonResponse({ ok: true, prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals, tickets, adminFlags, welcomeBot, welcomeMiniapp });
         }
 
         if (url.pathname === "/api/admin/welcome") {
@@ -258,10 +255,7 @@ ${reply}`;
           if (typeof body.offerBanner === "string" && env.BOT_KV) {
             await setOfferBanner(env, body.offerBanner);
           }
-          if (typeof body.offerBannerImage === "string" && env.BOT_KV) {
-            await setOfferBannerImage(env, body.offerBannerImage);
-          }
-          return jsonResponse({ ok: true, offerBanner: await getOfferBanner(env), offerBannerImage: await getOfferBannerImage(env) });
+          return jsonResponse({ ok: true, offerBanner: await getOfferBanner(env) });
         }
 
         if (url.pathname === "/api/admin/commissions") {
@@ -1513,31 +1507,9 @@ async function getOfferBanner(env) {
   return (raw || env.SPECIAL_OFFER_TEXT || "").toString().trim();
 }
 
-async function getOfferBannerImage(env) {
-  if (!env.BOT_KV) return (env.SPECIAL_OFFER_IMAGE || "").toString().trim();
-  const raw = await env.BOT_KV.get("settings:offer_banner_image");
-  return (raw || env.SPECIAL_OFFER_IMAGE || "").toString().trim();
-}
-
-async function setOfferBannerImage(env, image) {
-  if (!env.BOT_KV) return;
-  await env.BOT_KV.put("settings:offer_banner_image", String(image || "").trim());
-}
-
 async function setOfferBanner(env, text) {
   if (!env.BOT_KV) return;
   await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
-}
-
-async function getOfferBannerImage(env) {
-  if (!env.BOT_KV) return String(env.SPECIAL_OFFER_IMAGE || "").trim();
-  const raw = await env.BOT_KV.get("settings:offer_banner_image");
-  return String(raw || env.SPECIAL_OFFER_IMAGE || "").trim();
-}
-
-async function setOfferBannerImage(env, imageUrl) {
-  if (!env.BOT_KV) return;
-  await env.BOT_KV.put("settings:offer_banner_image", String(imageUrl || "").trim());
 }
 
 async function getCommissionSettings(env) {
@@ -5204,9 +5176,6 @@ const MINI_APP_HTML = `<!doctype html>
     }
     .offer h3{ margin:0; font-size: 15px; }
     .offer p{ margin:6px 0 0; font-size: 12px; color: var(--muted); }
-    .offer-media{ margin-top:10px; border-radius:14px; overflow:hidden; border:1px solid rgba(255,255,255,.12); display:none; }
-    .offer-media.show{ display:block; }
-    .offer-media img{ display:block; width:100%; max-height:160px; object-fit:cover; }
     .offer .tag{
       padding: 6px 10px;
       border-radius: 999px;
@@ -5218,7 +5187,6 @@ const MINI_APP_HTML = `<!doctype html>
     .admin-card.show{ display:block; }
     .owner-hide.hidden{ display:none; }
     .admin-grid{ display:grid; gap: 10px; }
-    .admin-tab.hidden{ display:none !important; }
     .admin-row{ display:flex; gap:8px; flex-wrap:wrap; }
     .admin-row .control{ flex:1; min-width: 140px; }
     .toggle{ display:flex; align-items:center; gap:8px; padding: 8px 10px; border: 1px solid rgba(255,255,255,.12); border-radius: 12px; }
@@ -5232,17 +5200,6 @@ const MINI_APP_HTML = `<!doctype html>
     .q-up{ color: var(--good); }
     .q-down{ color: var(--bad); }
     .q-flat{ color: var(--warn); }
-    .tabs{ display:flex; gap:8px; overflow:auto; padding-bottom:4px; margin-bottom:10px; }
-    .tab-btn{ border:1px solid rgba(255,255,255,.14); background:rgba(255,255,255,.06); color:var(--text); border-radius:999px; padding:8px 12px; font-size:12px; cursor:pointer; white-space:nowrap; }
-    .tab-btn.active{ background:linear-gradient(135deg,var(--primary),var(--accent)); border-color:transparent; color:#fff; }
-    .tab-panel{ display:none; }
-    .tab-panel.active{ display:block; }
-    .energy{ display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:12px; color:var(--muted); margin-top:8px; }
-    .energy-bar{ height:8px; width:100%; border-radius:999px; background:rgba(255,255,255,.08); overflow:hidden; }
-    .energy-fill{ height:100%; width:0%; background:linear-gradient(90deg,var(--accent),var(--primary)); transition:width .25s ease; }
-    .offer-media{ margin-top:10px; border-radius:16px; overflow:hidden; border:1px solid rgba(255,255,255,.12); display:none; }
-    .offer-media.show{ display:block; }
-    .offer-media img{ width:100%; display:block; }
   </style>
 </head>
 <body>
@@ -5258,32 +5215,17 @@ const MINI_APP_HTML = `<!doctype html>
       <div class="pill"><span class="dot"></span><span id="pillTxt">Online</span></div>
     </div>
 
-    <div class="card">
-      <div class="card-h">
-        <strong>وضعیت حساب</strong>
-      </div>
-      <div class="card-b">
-        <div class="quote-grid">
-          <div class="quote-item"><div class="k">نقش</div><div class="v" id="roleLabel">user</div></div>
-          <div class="quote-item"><div class="k">انرژی امروز</div><div class="v" id="energyToday">—</div></div>
-          <div class="quote-item"><div class="k">باقی‌مانده تحلیل</div><div class="v" id="remainingAnalyses">—</div></div>
-        </div>
-      </div>
-    </div>
-
     <div class="grid">
-      <div class="card tab-panel active" data-panel="dashboard">
+      <div class="card">
         <div class="card-b offer" id="offerCard">
           <div>
             <h3>🎁 پیشنهاد ویژه</h3>
             <p id="offerText">فعال‌سازی اشتراک ویژه با تخفیف محدود.</p>
-            <div class="offer-media" id="offerMedia"><img id="offerImg" alt="offer" /></div>
           </div>
           <div class="tag" id="offerTag">Special</div>
-          <div class="offer-media" id="offerMedia"><img id="offerImg" alt="offer" /></div>
         </div>
       </div>
-      <div class="card tab-panel active" id="quoteCard" data-panel="dashboard">
+      <div class="card" id="quoteCard">
         <div class="card-h">
           <strong>داشبورد قیمت لحظه‌ای</strong>
           <span id="quoteStamp">—</span>
@@ -5299,7 +5241,7 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
       </div>
 
-      <div class="card tab-panel active" id="newsCard" data-panel="dashboard">
+      <div class="card" id="newsCard">
         <div class="card-h">
           <strong>📰 اخبار فارسی نماد</strong>
           <button id="refreshNews" class="btn ghost" style="min-width:unset; padding:6px 10px;">بروزرسانی</button>
@@ -5310,7 +5252,7 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="mini-list" id="newsAnalysis">در حال تولید تحلیل خبری…</div>
         </div>
       </div>
-      <div class="card tab-panel" data-panel="analyze">
+      <div class="card">
         <div class="card-h">
           <strong>تحلیل سریع</strong>
           <span id="meta">—</span>
@@ -5390,11 +5332,6 @@ const MINI_APP_HTML = `<!doctype html>
 
           <div style="height:10px"></div>
           <div class="muted" style="font-size:12px; line-height:1.6;" id="welcome"></div>
-          <div class="energy">
-            <span id="energyText">انرژی: —</span>
-            <span id="remainingText">تحلیل باقی‌مانده: —</span>
-          </div>
-          <div class="energy-bar"><div class="energy-fill" id="energyFill"></div></div>
         </div>
 
         <div class="out" id="out">آماده…</div>
@@ -5410,20 +5347,13 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
       </div>
 
-      <div class="card tab-panel" id="supportCard" data-panel="support">
+      <div class="card" id="supportCard">
         <div class="card-h">
           <strong>پشتیبانی</strong>
           <span>ارسال تیکت</span>
         </div>
         <div class="card-b">
-          <div class="chips" id="adminTabs">
-            <button type="button" class="chip on" data-tab="overview">مرور</button>
-            <button type="button" class="chip" data-tab="content">محتوا</button>
-            <button type="button" class="chip" data-tab="operations">عملیات</button>
-            <button type="button" class="chip" data-tab="support">پشتیبانی</button>
-            <button type="button" class="chip" data-tab="reports">گزارش</button>
-          </div>
-          <div class="field admin-tab" data-tab="overview">
+          <div class="field">
             <div class="label">متن تیکت</div>
             <textarea id="supportTicketText" class="control" placeholder="مشکل یا درخواست خود را بنویسید..." maxlength="300"></textarea>
           </div>
@@ -5434,7 +5364,7 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
       </div>
 
-      <div class="card admin-card tab-panel" id="adminCard" data-panel="admin">
+      <div class="card admin-card" id="adminCard">
         <div class="card-h">
           <strong id="adminTitle">پنل ادمین</strong>
           <span>مدیریت پرامپت، سبک‌ها، پرداخت، برداشت و تیکت‌ها</span>
@@ -5528,21 +5458,15 @@ const MINI_APP_HTML = `<!doctype html>
           </div>
 
           
-          <div class="field admin-tab" data-tab="content">
+          <div class="field">
             <div class="label">بنر پیشنهاد (نمایش داخل مینی‌اپ)</div>
             <textarea id="offerBannerInput" class="control" placeholder="متن بنر پیشنهاد..."></textarea>
-            <input id="offerBannerImageInput" class="control" placeholder="آدرس تصویر بنر (https://...)" />
             <div class="actions">
               <button id="saveOfferBanner" class="btn">ذخیره بنر</button>
             </div>
-            <div class="admin-row">
-              <input id="offerImageFile" type="file" accept="image/*" class="control" />
-              <button id="clearOfferImage" class="btn ghost">حذف تصویر</button>
-            </div>
-            <input id="offerBannerImageInput" class="control" placeholder="یا لینک تصویر بنر..." />
           </div>
 
-          <div class="field admin-tab" data-tab="content">
+          <div class="field">
             <div class="label">متن خوش‌آمدگویی (قابل تنظیم از پنل)</div>
             <textarea id="welcomeBotInput" class="control" placeholder="متن خوش‌آمدگویی بات..."></textarea>
             <textarea id="welcomeMiniappInput" class="control" placeholder="متن خوش‌آمدگویی مینی‌اپ..."></textarea>
@@ -5551,7 +5475,7 @@ const MINI_APP_HTML = `<!doctype html>
             </div>
           </div>
 
-          <div class="field owner-hide admin-tab" data-tab="operations" id="featureFlagsBlock">
+          <div class="field owner-hide" id="featureFlagsBlock">
             <div class="label">ویژگی‌ها (فقط اونر)</div>
             <div class="admin-row">
               <label class="toggle">
@@ -5567,7 +5491,7 @@ const MINI_APP_HTML = `<!doctype html>
             <div class="muted" style="font-size:12px; line-height:1.6;">این تنظیمات روی همه کاربران اثر دارد.</div>
           </div>
 
-          <div class="field owner-hide admin-tab" data-tab="operations" id="walletSettingsBlock">
+          <div class="field owner-hide" id="walletSettingsBlock">
             <div class="label">تنظیم آدرس ولت (فقط اونر)</div>
             <textarea id="walletAddressInput" class="control" placeholder="آدرس ولت جهت پرداخت (مثلاً TRC20)..."></textarea>
             <div class="actions">
@@ -5575,7 +5499,7 @@ const MINI_APP_HTML = `<!doctype html>
             </div>
           </div>
 
-          <div class="field admin-tab" data-tab="support">
+          <div class="field">
             <div class="label">مدیریت تیکت‌ها</div>
             <div class="actions">
               <button id="refreshTickets" class="btn">بروزرسانی</button>
@@ -5602,7 +5526,7 @@ const MINI_APP_HTML = `<!doctype html>
             <div class="mini-list" id="ticketsList">—</div>
           </div>
 
-          <div class="field admin-tab" data-tab="operations">
+          <div class="field">
             <div class="label">مدیریت برداشت‌ها</div>
             <div class="actions">
               <button id="refreshWithdrawals" class="btn">بروزرسانی</button>
@@ -5619,7 +5543,7 @@ const MINI_APP_HTML = `<!doctype html>
             <div class="mini-list" id="withdrawalsList">—</div>
           </div>
 
-          <div class="field admin-tab" data-tab="operations">
+          <div class="field">
             <div class="label">درخواست‌های پرامپت اختصاصی</div>
             <div class="actions">
               <button id="refreshPromptReqs" class="btn">بروزرسانی</button>
@@ -5636,7 +5560,7 @@ const MINI_APP_HTML = `<!doctype html>
             <div class="mini-list" id="promptReqList">—</div>
           </div>
 
-          <div class="field admin-tab" data-tab="operations">
+          <div class="field">
             <div class="label">فعال/غیرفعال کردن سرمایه برای کاربر</div>
             <div class="admin-row">
               <input id="capitalToggleUser" class="control" placeholder="یوزرنیم (@user)" />
@@ -5647,7 +5571,7 @@ const MINI_APP_HTML = `<!doctype html>
               <button id="saveCapitalToggle" class="btn">ثبت</button>
             </div>
           </div>
-<div class="field owner-hide admin-tab" data-tab="reports" id="reportBlock">
+<div class="field owner-hide" id="reportBlock">
             <div class="label">گزارش کامل کاربران (فقط اونر)</div>
             <div class="actions">
               <button id="loadUsers" class="btn">دریافت گزارش</button>
@@ -5682,14 +5606,9 @@ const pillTxt = document.getElementById("pillTxt");
 const welcome = document.getElementById("welcome");
 const offerText = document.getElementById("offerText");
 const offerTag = document.getElementById("offerTag");
-const offerMedia = document.getElementById("offerMedia");
-const offerImg = document.getElementById("offerImg");
 const adminCard = document.getElementById("adminCard");
 const adminTitle = document.getElementById("adminTitle");
 const reportBlock = document.getElementById("reportBlock");
-const roleLabel = document.getElementById("roleLabel");
-const energyToday = document.getElementById("energyToday");
-const remainingAnalyses = document.getElementById("remainingAnalyses");
 
 function el(id){ return document.getElementById(id); }
 function val(id){ return el(id).value; }
@@ -6032,45 +5951,6 @@ function pickTicketReplyTemplate(){
 function updateMeta(state, quota){
   meta.textContent = "سهمیه: " + (quota || "-");
   sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
-  const q = String(quota || "");
-  const m = q.match(/(\d+)\s*\/\s*(\d+)/);
-  let used = 0;
-  let limit = 0;
-  if (m) {
-    used = Number(m[1] || 0);
-    limit = Number(m[2] || 0);
-  }
-  const remaining = Math.max(0, limit - used);
-  const pct = limit > 0 ? Math.max(0, Math.min(100, Math.round((remaining / limit) * 100))) : 100;
-  if (remainingText) remainingText.textContent = "تحلیل باقی‌مانده: " + (limit > 0 ? String(remaining) : "∞");
-  if (energyText) energyText.textContent = "انرژی: " + (limit > 0 ? (pct + "%") : "نامحدود");
-  if (energyFill) energyFill.style.width = (limit > 0 ? pct : 100) + "%";
-}
-
-function updateDashboardStats(role, quota){
-  const raw = String(quota || "0/0");
-  let used = 0, limit = 0;
-  if (raw.includes("/")) {
-    const [u, l] = raw.split("/");
-    used = Number(u) || 0;
-    limit = Number(l) || 0;
-  }
-  const remain = (Number.isFinite(limit) && limit > 0) ? Math.max(0, limit - used) : (raw === "∞" ? "∞" : 0);
-  if (roleLabel) roleLabel.textContent = role || "user";
-  if (energyToday) energyToday.textContent = raw === "∞" ? "نامحدود" : String(used);
-  if (remainingAnalyses) remainingAnalyses.textContent = String(remain);
-}
-
-function setOfferImage(url){
-  const clean = String(url || "").trim();
-  if (!offerMedia || !offerImg) return;
-  if (!clean) {
-    offerImg.removeAttribute("src");
-    offerMedia.classList.remove("show");
-    return;
-  }
-  offerImg.src = clean;
-  offerMedia.classList.add("show");
 }
 
 function renderStyleList(styles){
@@ -6214,16 +6094,6 @@ function applyTicketFilter(status){
   if (!status) return renderTickets(ADMIN_TICKETS_ALL || [], true);
   const filtered = (ADMIN_TICKETS_ALL || []).filter((x) => String(x?.status || "pending") === status);
   renderTickets(filtered, true);
-}
-
-function setAdminTab(tab){
-  const tabs = Array.from(document.querySelectorAll('#adminTabs .chip'));
-  const panes = Array.from(document.querySelectorAll('.admin-tab'));
-  for (const t of tabs) t.classList.toggle('on', t.dataset.tab === tab);
-  for (const p of panes) {
-    const pt = p.dataset.tab || 'overview';
-    p.classList.toggle('hidden', pt !== tab);
-  }
 }
 
 async function refreshWithdrawals(){
@@ -6457,7 +6327,6 @@ async function boot(){
 
   if (IS_STAFF && adminCard) {
     adminCard.classList.add("show");
-    setAdminTab("overview");
     if (adminTitle) adminTitle.textContent = IS_OWNER ? "پنل اونر" : "پنل ادمین";
 
     // Owner-only blocks
@@ -6466,7 +6335,6 @@ async function boot(){
     });
 
     if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
-    if (el("offerBannerImageInput")) el("offerBannerImageInput").value = json.offerBannerImage || "";
     if (IS_OWNER && el("walletAddressInput")) el("walletAddressInput").value = json.wallet || "";
 
     await loadAdminBootstrap();
@@ -6482,7 +6350,6 @@ async function loadAdminBootstrap(){
   if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(json.customPrompts || [], null, 2);
   if (el("freeDailyLimit")) el("freeDailyLimit").value = String(json.freeDailyLimit ?? "");
   if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
-  if (el("offerBannerImageInput")) el("offerBannerImageInput").value = json.offerBannerImage || "";
   if (el("welcomeBotInput")) el("welcomeBotInput").value = json.welcomeBot || "";
   if (el("welcomeMiniappInput")) el("welcomeMiniappInput").value = json.welcomeMiniapp || "";
 
@@ -6497,7 +6364,6 @@ async function loadAdminBootstrap(){
   renderTickets(json.tickets || []);
   renderWithdrawals(json.withdrawals || []);
   if (offerText) offerText.textContent = json.offerBanner || (offerText.textContent || "");
-  setOfferImage(json.offerBannerImage || "");
 
   // load prompt requests
   if (el("promptReqSelect")) await refreshPromptReqs();
@@ -6698,43 +6564,14 @@ el("saveFreeLimit")?.addEventListener("click", async () => {
 
 el("saveOfferBanner")?.addEventListener("click", async () => {
   const offerBanner = el("offerBannerInput")?.value || "";
-  const offerBannerImage = el("offerBannerImageInput")?.value || "";
-  const { json } = await adminApi("/api/admin/offer", { offerBanner, offerBannerImage });
+  const { json } = await adminApi("/api/admin/offer", { offerBanner });
   if (json?.ok) {
     if (offerText) offerText.textContent = json.offerBanner || offerBanner;
-    setOfferImage(json.offerBannerImage || offerBannerImage);
     showToast("ذخیره شد ✅", "بنر بروزرسانی شد", "ADM", false);
     setTimeout(hideToast, 1200);
   } else {
     showToast("خطا", "ذخیره بنر ناموفق بود", "ADM", false);
   }
-});
-
-el("offerImageFile")?.addEventListener("change", async (ev) => {
-  const file = ev?.target?.files?.[0];
-  if (!file) return;
-  if (file.size > 1024 * 1024) {
-    showToast("خطا", "حجم تصویر باید کمتر از 1MB باشد", "ADM", false);
-    return;
-  }
-  const reader = new FileReader();
-  reader.onload = () => {
-    const dataUrl = typeof reader.result === "string" ? reader.result : "";
-    if (el("offerBannerImageInput")) el("offerBannerImageInput").value = dataUrl;
-    if (offerImg) offerImg.src = dataUrl;
-    if (offerMedia) offerMedia.classList.toggle("show", !!dataUrl);
-  };
-  reader.readAsDataURL(file);
-});
-
-el("clearOfferImage")?.addEventListener("click", async () => {
-  const offerBanner = el("offerBannerInput")?.value || "";
-  const { json } = await adminApi("/api/admin/offer", { offerBanner, clearOfferBannerImage: true });
-  if (el("offerBannerImageInput")) el("offerBannerImageInput").value = "";
-  if (el("offerImageFile")) el("offerImageFile").value = "";
-  if (offerImg) offerImg.src = "";
-  if (offerMedia) offerMedia.classList.remove("show");
-  if (json?.ok) showToast("انجام شد ✅", "تصویر بنر حذف شد", "ADM", false);
 });
 
 el("saveWelcomeTexts")?.addEventListener("click", async () => {
