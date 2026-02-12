@@ -60,7 +60,7 @@ export default {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+        const v = await verifyMiniappAuth(body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -520,7 +520,7 @@ ${reply}`;
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+        const v = await verifyMiniappAuth(body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -761,7 +761,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+        const v = await verifyMiniappAuth(body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -929,6 +929,9 @@ const BTN = {
   BACK: "⬅️ برگشت",
   HOME: "🏠 منوی اصلی",
   MINIAPP: "🧩 مینی‌اپ",
+  QUOTE: "💹 قیمت لحظه‌ای",
+  NEWS: "📰 اخبار نماد",
+  NEWS_ANALYSIS: "🧠 تحلیل خبر",
 
   WALLET: "💳 ولت",
   WALLET_BALANCE: "💰 موجودی",
@@ -1730,6 +1733,8 @@ function kb(rows) {
 function mainMenuKeyboard(env) {
   return kb([
     [BTN.SIGNAL, BTN.SETTINGS],
+    [BTN.QUOTE, BTN.NEWS],
+    [BTN.NEWS_ANALYSIS, BTN.MINIAPP],
     [BTN.WALLET, BTN.PROFILE],
     [BTN.INVITE, BTN.SUPPORT],
     [BTN.EDUCATION, BTN.LEVELING],
@@ -1738,7 +1743,7 @@ function mainMenuKeyboard(env) {
 }
 
 function signalMenuKeyboard() {
-  return kb([[BTN.CAT_MAJORS, BTN.CAT_METALS], [BTN.CAT_INDICES, BTN.CAT_CRYPTO], [BTN.BACK, BTN.HOME]]);
+  return kb([[BTN.CAT_MAJORS, BTN.CAT_METALS], [BTN.CAT_INDICES, BTN.CAT_CRYPTO], [BTN.QUOTE, BTN.NEWS], [BTN.BACK, BTN.HOME]]);
 }
 
 function settingsMenuKeyboard() {
@@ -1781,10 +1786,22 @@ function getMiniappUrl(env) {
   const u = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || "").toString().trim();
   return u;
 }
-function miniappInlineKeyboard(env) {
+async function miniappInlineKeyboard(env, st, from) {
   const url = getMiniappUrl(env);
   if (!url) return null;
-  return { inline_keyboard: [[{ text: BTN.MINIAPP, web_app: { url } }]] };
+  const token = await issueMiniappToken(env, st?.userId, from || {});
+  const finalUrl = token ? appendQuery(url, { miniToken: token }) : url;
+  return { inline_keyboard: [[{ text: BTN.MINIAPP, web_app: { url: finalUrl } }]] };
+}
+
+function appendQuery(url, params) {
+  try {
+    const u = new URL(url);
+    Object.entries(params || {}).forEach(([k,v]) => { if (v != null && String(v) !== "") u.searchParams.set(k, String(v)); });
+    return u.toString();
+  } catch {
+    return url;
+  }
 }
 
 
@@ -3666,6 +3683,54 @@ Memo/Tag: ${memo}
       );
     }
 
+
+    if (text === "/quote" || text === BTN.QUOTE) {
+      const symbol = String(st.selectedSymbol || "BTCUSDT").toUpperCase();
+      const tf = String(st.timeframe || "H4").toUpperCase();
+      try {
+        const candles = await getMarketCandlesWithFallback(env, symbol, tf);
+        const snap = computeSnapshot(candles || []);
+        if (!snap) throw new Error("quote_unavailable");
+        const msgQ = `💹 قیمت لحظه‌ای
+
+نماد: ${symbol}
+TF: ${tf}
+قیمت: ${snap.lastPrice}
+تغییر: ${snap.changePct}%
+روند: ${snap.trend || "نامشخص"}`;
+        return tgSendMessage(env, chatId, msgQ, mainMenuKeyboard(env));
+      } catch (e) {
+        return tgSendMessage(env, chatId, "⚠️ قیمت لحظه‌ای در دسترس نیست. کمی بعد دوباره تلاش کن.", mainMenuKeyboard(env));
+      }
+    }
+
+    if (text === "/news" || text === BTN.NEWS) {
+      const symbol = String(st.selectedSymbol || "BTCUSDT").toUpperCase();
+      try {
+        const rows = await fetchSymbolNewsFa(symbol, env);
+        const lines = (rows || []).slice(0, 5).map((x, i) => `${i + 1}) ${x.title || "-"}`).join("
+");
+        return tgSendMessage(env, chatId, `📰 اخبار ${symbol}
+
+${lines || "خبری پیدا نشد."}`, mainMenuKeyboard(env));
+      } catch (e) {
+        return tgSendMessage(env, chatId, "⚠️ خبر مرتبط در دسترس نیست.", mainMenuKeyboard(env));
+      }
+    }
+
+    if (text === "/newsanalyze" || text === BTN.NEWS_ANALYSIS) {
+      const symbol = String(st.selectedSymbol || "BTCUSDT").toUpperCase();
+      try {
+        const rows = await fetchSymbolNewsFa(symbol, env);
+        const summary = await buildNewsAnalysisSummary(symbol, rows || [], env);
+        return tgSendMessage(env, chatId, `🧠 تحلیل خبر ${symbol}
+
+${summary || "تحلیل خبری در دسترس نیست."}`, mainMenuKeyboard(env));
+      } catch (e) {
+        return tgSendMessage(env, chatId, "⚠️ تحلیل خبر در دسترس نیست.", mainMenuKeyboard(env));
+      }
+    }
+
     if (text === "/miniapp" || text === BTN.MINIAPP) {
       const url = getMiniappUrl(env);
       if (!url) {
@@ -3673,8 +3738,10 @@ Memo/Tag: ${memo}
 
 در Wrangler / داشبورد یک متغیر ENV به نام MINIAPP_URL یا PUBLIC_BASE_URL بگذار (مثلاً https://<your-worker-domain>/ ) و دوباره Deploy کن.`, mainMenuKeyboard(env));
       }
-      return tgSendMessage(env, chatId, `🧩 لینک مینی‌اپ:
-${url}`, mainMenuKeyboard(env));
+      const token = await issueMiniappToken(env, st.userId, from);
+      const finalUrl = token ? appendQuery(url, { miniToken: token }) : url;
+      const kbInline = { inline_keyboard: [[{ text: BTN.MINIAPP, web_app: { url: finalUrl } }]] };
+      return tgSendMessage(env, chatId, `🧩 مینی‌اپ فعال شد. از دکمه زیر وارد شو:`, kbInline);
     }
 
 
@@ -4082,6 +4149,9 @@ async function onStart(env, chatId, from, st, refArg) {
   await saveUser(st.userId, st, env);
 
   await tgSendMessage(env, chatId, await getBotWelcomeText(env), mainMenuKeyboard(env));
+
+  const mkb = await miniappInlineKeyboard(env, st, from);
+  if (mkb) await tgSendMessage(env, chatId, "🧩 ورود سریع به مینی‌اپ:", mkb);
 
   if (!st.profile?.name || !st.profile?.phone) {
     await startOnboarding(env, chatId, from, st);
@@ -5474,6 +5544,7 @@ const spin = el("spin");
 
 let ALL_SYMBOLS = [];
 let INIT_DATA = "";
+let MINI_TOKEN = "";
 let IS_STAFF = false;
 let IS_OWNER = false;
 let OFFLINE_MODE = false;
