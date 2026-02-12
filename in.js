@@ -798,8 +798,9 @@ TxID: ${txid}
         const symbol = String(body.symbol || "").trim();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
 
-        // must complete onboarding before using AI analysis (name+contact at least)
-        if (!st.profile?.name || !st.profile?.phone) {
+        // lightweight onboarding gate for mini-app: block only if absolutely no identity fields exist
+        const hasAnyIdentity = !!(st.profile?.name || st.profile?.phone || st.profile?.username || v.fromLike?.username);
+        if (!hasAnyIdentity) {
           return jsonResponse({ ok: false, error: "onboarding_required" }, 403);
         }
 
@@ -3207,8 +3208,11 @@ ${newsAnalysisBlock}
 ` +
     `- خروجی فقط فارسی و دقیقاً بخش‌های ۱ تا ۵
 ` +
-    `- از ترکیب سبک‌ها (پرایس اکشن، اسمارت‌مانی، ساختار بازار، حجم، سناریو) استفاده کن
-` +
+    (st.style === "ترکیبی" || promptMode === "combined_all"
+      ? `- از ترکیب سبک‌ها (پرایس اکشن، اسمارت‌مانی، ساختار بازار، حجم، سناریو) استفاده کن
+`
+      : `- فقط بر اساس سبک انتخابی (${st.style || "مشخص نشده"}) تحلیل کن و سبک‌های دیگر را دخیل نکن
+`) +
     `- مدیریت سرمایه متناسب با Capital را لحاظ کن و سایز پوزیشن پیشنهادی بده
 ` +
     `- quickchart_config را به شکل JSON داخلی بساز اما به کاربر نمایش نده
@@ -5062,6 +5066,7 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="actions">
             <button id="save" class="btn">💾 ذخیره</button>
             <button id="analyze" class="btn primary">⚡ تحلیل</button>
+            <button id="reconnect" class="btn ghost">🔄 اتصال مجدد</button>
             <button id="close" class="btn ghost">✖ بستن</button>
           </div>
 
@@ -5182,6 +5187,12 @@ const MINI_APP_HTML = `<!doctype html>
               <button id="approvePayment" class="btn primary">تأیید و فعال‌سازی</button>
               <button id="checkPayment" class="btn ghost">چک بلاک‌چین</button>
               <button id="activateSubscription" class="btn">فعال‌سازی دستی</button>
+            </div>
+            <div class="muted" style="font-size:12px; line-height:1.8;">برای استفاده ساده: فقط یوزرنیم + مبلغ + یکی از پلن‌ها را انتخاب کنید. TxHash اختیاری است.</div>
+            <div class="chips" id="paymentPresets">
+              <button type="button" class="chip" data-days="7" data-amount="9">پلن شروع ۷ روزه</button>
+              <button type="button" class="chip" data-days="30" data-amount="19">پلن ماهانه</button>
+              <button type="button" class="chip" data-days="90" data-amount="49">پلن حرفه‌ای ۹۰ روزه</button>
             </div>
             <div class="mini-list" id="paymentList">—</div>
           </div>
@@ -5353,6 +5364,16 @@ let ALL_SYMBOLS = [];
 let INIT_DATA = "";
 let IS_STAFF = false;
 let IS_OWNER = false;
+let OFFLINE_MODE = false;
+
+const LOCAL_KEYS = {
+  initData: "miniapp_init_data",
+  userState: "miniapp_cached_user_state_v1",
+  quoteCache: "miniapp_quote_cache_v1",
+  newsCache: "miniapp_news_cache_v1",
+  newsAnalysisCache: "miniapp_news_analysis_cache_v1",
+  analyzeCache: "miniapp_analyze_cache_v1",
+};
 const API_BASE = window.location.origin;
 let ADMIN_TICKETS = [];
 let ADMIN_TICKETS_ALL = [];
@@ -5362,6 +5383,19 @@ let QUOTE_TIMER = null;
 let QUOTE_BUSY = false;
 let NEWS_TIMER = null;
 const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
+
+function getFreshInitData() {
+  const latestTg = (tg?.initData || "").trim();
+  if (latestTg) {
+    INIT_DATA = latestTg;
+    try { localStorage.setItem(LOCAL_KEYS.initData, latestTg); } catch {}
+  }
+  return INIT_DATA || latestTg || "";
+}
+
+function buildAuthBody(extra = {}) {
+  return { initData: getFreshInitData(), ...extra };
+}
 
 function showToast(title, subline = "", badge = "", loading = false){
   if (!toast || !toastT || !toastS || !toastB || !spin) return;
@@ -5465,13 +5499,14 @@ async function api(path, body){
 
 async function adminApi(path, body){
   if (!IS_STAFF) return { status: 403, json: { ok: false, error: "forbidden" } };
-  return api(path, { initData: INIT_DATA, ...body });
+  return api(path, buildAuthBody(body));
 }
 
 function prettyErr(j, status){
   const e = j?.error || "نامشخص";
   if (status === 429 && String(e).startsWith("quota_exceeded")) return "سهمیه امروز تمام شد.";
-  if (status === 403 && String(e) === "onboarding_required") return "ابتدا نام و شماره را داخل ربات ثبت کنید.";
+  if (status === 403 && String(e) === "onboarding_required") return "ابتدا حداقل نام یا یوزرنیم خود را تکمیل کنید.";
+  if (status === 403 && String(e) === "forbidden") return "دسترسی این بخش برای نقش فعلی شما مجاز نیست.";
   if (status === 401) {
     if (String(e).includes("initData")) return "اتصال مینی‌اپ منقضی شده؛ اپ را مجدد از داخل تلگرام باز کنید.";
     return "احراز هویت تلگرام ناموفق است.";
@@ -5513,15 +5548,29 @@ function setQuoteUi(data, errMsg = ""){
   qMeta.textContent = "TF: " + (data.timeframe || "-") + " | candles: " + (data.candles || 0) + " | کیفیت: " + (data.quality === "full" ? "کامل" : "محدود");}
 
 async function refreshLiveQuote(force = false){
-  if (!INIT_DATA || QUOTE_BUSY) return;
+  if (QUOTE_BUSY) return;
   if (!force && document.hidden) return;
   QUOTE_BUSY = true;
   try {
     const symbol = val("symbol") || "";
     const timeframe = val("timeframe") || "H4";
     if (!symbol) return;
-    const { json } = await api("/api/quote", { initData: INIT_DATA, symbol, timeframe });
-    setQuoteUi(json, "خطا در دریافت قیمت لحظه‌ای");
+    const ck = quoteCacheKey(symbol, timeframe);
+
+    if (OFFLINE_MODE || !getFreshInitData()) {
+      const cached = readByKey(LOCAL_KEYS.quoteCache, ck);
+      setQuoteUi(cached, "قیمت لحظه‌ای از کش محلی");
+      return;
+    }
+
+    const { json } = await api("/api/quote", buildAuthBody({ symbol, timeframe }));
+    if (json?.ok) {
+      cacheByKey(LOCAL_KEYS.quoteCache, ck, json);
+      setQuoteUi(json, "");
+      return;
+    }
+    const cached = readByKey(LOCAL_KEYS.quoteCache, ck);
+    setQuoteUi(cached || json, cached ? "قیمت از کش نمایش داده شد" : "خطا در دریافت قیمت لحظه‌ای");
   } finally {
     QUOTE_BUSY = false;
   }
@@ -5562,26 +5611,52 @@ function renderNewsList(json){
 }
 
 async function refreshSymbolNews(force = false){
-  if (!INIT_DATA) return;
   if (!force && document.hidden) return;
   const symbol = val("symbol") || "";
   if (!symbol) return;
   const target = el("newsList");
   if (target && force) target.textContent = "در حال دریافت خبر…";
-  const { json } = await api("/api/news", { initData: INIT_DATA, symbol });
-  renderNewsList(json);
+  const ck = newsCacheKey(symbol);
+
+  if (OFFLINE_MODE || !getFreshInitData()) {
+    const cached = readByKey(LOCAL_KEYS.newsCache, ck);
+    renderNewsList(cached || { ok: false, articles: [] });
+    return;
+  }
+
+  const { json } = await api("/api/news", buildAuthBody({ symbol }));
+  if (json?.ok) {
+    cacheByKey(LOCAL_KEYS.newsCache, ck, json);
+    renderNewsList(json);
+    return;
+  }
+  const cached = readByKey(LOCAL_KEYS.newsCache, ck);
+  renderNewsList(cached || json);
 }
 
 async function refreshNewsAnalysis(force = false){
-  if (!INIT_DATA) return;
   if (!force && document.hidden) return;
   const symbol = val("symbol") || "";
   if (!symbol) return;
   const target = el("newsAnalysis");
   if (target && force) target.textContent = "در حال تحلیل خبر…";
-  const { json } = await api("/api/news/analyze", { initData: INIT_DATA, symbol });
+  const ck = newsCacheKey(symbol);
+
+  if (OFFLINE_MODE || !getFreshInitData()) {
+    const cached = readByKey(LOCAL_KEYS.newsAnalysisCache, ck);
+    if (target) target.textContent = cached?.summary || "تحلیل خبری آفلاین موجود نیست.";
+    return;
+  }
+
+  const { json } = await api("/api/news/analyze", buildAuthBody({ symbol }));
   if (!target) return;
-  target.textContent = json?.ok ? (json.summary || "—") : "تحلیل خبری در دسترس نیست.";
+  if (json?.ok) {
+    cacheByKey(LOCAL_KEYS.newsAnalysisCache, ck, json);
+    target.textContent = json.summary || "—";
+    return;
+  }
+  const cached = readByKey(LOCAL_KEYS.newsAnalysisCache, ck);
+  target.textContent = cached?.summary || "تحلیل خبری در دسترس نیست.";
 }
 
 function setupNewsPolling(){
@@ -5818,54 +5893,34 @@ function safeJsonParse(text, fallback) {
   try { return JSON.parse(text); } catch { return fallback; }
 }
 
-async function boot(){
-  out.textContent = "⏳ در حال آماده‌سازی…";
-  pillTxt.textContent = "Connecting…";
-  showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
+function cacheUserSnapshot(json) {
+  try {
+    const data = {
+      welcome: json?.welcome || "",
+      state: json?.state || {},
+      quota: json?.quota || "",
+      symbols: json?.symbols || [],
+      styles: json?.styles || [],
+      customPrompts: json?.customPrompts || [],
+      offerBanner: json?.offerBanner || "",
+      role: json?.role || "user",
+      isStaff: !!json?.isStaff,
+      wallet: json?.wallet || "",
+      cachedAt: Date.now(),
+    };
+    localStorage.setItem(LOCAL_KEYS.userState, JSON.stringify(data));
+  } catch {}
+}
 
-  const isTelegramRuntime = !!window.Telegram?.WebApp;
-  const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
-  const savedInitData = localStorage.getItem("miniapp_init_data") || "";
-  let initData = (tg?.initData || "").trim();
-
-  // Telegram WebApp may populate initData with a slight delay.
-  if (isTelegramRuntime && !initData) {
-    await new Promise((r) => setTimeout(r, 350));
-    initData = (tg?.initData || "").trim();
+function readCachedUserSnapshot() {
+  try {
+    return safeJsonParse(localStorage.getItem(LOCAL_KEYS.userState) || "", null);
+  } catch {
+    return null;
   }
+}
 
-  if (initData) {
-    INIT_DATA = initData;
-    localStorage.setItem("miniapp_init_data", initData);
-  } else if (qsInitData) {
-    INIT_DATA = qsInitData;
-    localStorage.setItem("miniapp_init_data", qsInitData);
-  } else if (savedInitData && !isTelegramRuntime) {
-    INIT_DATA = savedInitData;
-  } else if (!isTelegramRuntime) {
-    const devInit = "dev:999001";
-    INIT_DATA = devInit;
-    localStorage.setItem("miniapp_init_data", devInit);
-    showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
-  } else {
-    hideToast();
-    pillTxt.textContent = "Offline";
-    out.textContent = "⚠️ اتصال مینی‌اپ برقرار نیست. " + CONNECTION_HINT;
-    return;
-  }
-  const {status, json} = await api("/api/user", { initData: INIT_DATA });
-
-  if (!json?.ok) {
-    if (status === 401) {
-      try { localStorage.removeItem("miniapp_init_data"); } catch {}
-    }
-    hideToast();
-    pillTxt.textContent = "Offline";
-    out.textContent = "⚠️ خطا: " + prettyErr(json, status);
-    showToast("خطا", prettyErr(json, status), "API", false);
-    return;
-  }
-
+function applyUserState(json) {
   welcome.textContent = json.welcome || "";
   fillSymbols(json.symbols || []);
   const styleList = json.styles || [];
@@ -5889,6 +5944,107 @@ async function boot(){
   if (offerTag) offerTag.textContent = json.role === "owner" ? "Owner" : "Special";
 
   updateMeta(json.state, json.quota);
+}
+
+
+function storageGetObj(key, fallback = {}) {
+  try {
+    const raw = localStorage.getItem(key);
+    const parsed = raw ? JSON.parse(raw) : fallback;
+    return parsed && typeof parsed === "object" ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function storageSetObj(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value || {})); } catch {}
+}
+
+function cacheByKey(key, itemKey, value) {
+  const bag = storageGetObj(key, {});
+  bag[itemKey] = { ...(value || {}), cachedAt: Date.now() };
+  storageSetObj(key, bag);
+}
+
+function readByKey(key, itemKey) {
+  const bag = storageGetObj(key, {});
+  return bag[itemKey] || null;
+}
+
+function quoteCacheKey(symbol, timeframe) {
+  return String(symbol || "").toUpperCase() + "|" + String(timeframe || "H4").toUpperCase();
+}
+
+function newsCacheKey(symbol) {
+  return String(symbol || "").toUpperCase();
+}
+
+function analyzeCacheKey(symbol) {
+  return String(symbol || "").toUpperCase();
+}
+
+async function boot(){
+  out.textContent = "⏳ در حال آماده‌سازی…";
+  pillTxt.textContent = "Connecting…";
+  showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
+
+  const isTelegramRuntime = !!window.Telegram?.WebApp;
+  const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
+  const savedInitData = localStorage.getItem(LOCAL_KEYS.initData) || "";
+  let initData = (tg?.initData || "").trim();
+
+  // Telegram WebApp may populate initData with a slight delay.
+  if (isTelegramRuntime && !initData) {
+    await new Promise((r) => setTimeout(r, 350));
+    initData = (tg?.initData || "").trim();
+  }
+
+  if (initData) {
+    INIT_DATA = initData;
+    localStorage.setItem(LOCAL_KEYS.initData, initData);
+  } else if (qsInitData) {
+    INIT_DATA = qsInitData;
+    localStorage.setItem(LOCAL_KEYS.initData, qsInitData);
+  } else if (savedInitData) {
+    INIT_DATA = savedInitData;
+  } else if (!isTelegramRuntime) {
+    const devInit = "dev:999001";
+    INIT_DATA = devInit;
+    localStorage.setItem(LOCAL_KEYS.initData, devInit);
+    showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
+  } else {
+    hideToast();
+    pillTxt.textContent = "Offline";
+    out.textContent = "⚠️ اتصال مینی‌اپ برقرار نیست. " + CONNECTION_HINT;
+    return;
+  }
+  const {status, json} = await api("/api/user", buildAuthBody());
+
+  if (!json?.ok) {
+    if (status === 401) {
+      try { localStorage.removeItem(LOCAL_KEYS.initData); } catch {}
+    }
+    const cached = readCachedUserSnapshot();
+    if (!cached) {
+      hideToast();
+      pillTxt.textContent = "Offline";
+      out.textContent = "⚠️ خطا: " + prettyErr(json, status);
+      showToast("خطا", prettyErr(json, status), "API", false);
+      return;
+    }
+    OFFLINE_MODE = true;
+    applyUserState(cached);
+    out.textContent = "حالت آفلاین فعال شد ✅ امکانات از کش محلی بارگذاری می‌شود.";
+    pillTxt.textContent = "Offline (Cached)";
+    hideToast();
+    showToast("آفلاین", "داده‌های ذخیره‌شده بارگذاری شد", "CACHE", false);
+    return;
+  }
+
+  OFFLINE_MODE = false;
+  cacheUserSnapshot(json);
+  applyUserState(json);
   out.textContent = "آماده ✅";
   pillTxt.textContent = "Online";
   hideToast();
@@ -5954,12 +6110,14 @@ el("tfChips").addEventListener("click", (e) => {
 });
 
 el("save").addEventListener("click", async () => {
+  if (OFFLINE_MODE) {
+    showToast("آفلاین", "در حالت آفلاین ذخیره روی سرور ممکن نیست.", "SET", false);
+    return;
+  }
   showToast("در حال ذخیره…", "تنظیمات ذخیره می‌شود", "SET", true);
   out.textContent = "⏳ ذخیره تنظیمات…";
 
-  const initData = INIT_DATA || tg?.initData || "";
-  const payload = {
-    initData,
+  const payload = buildAuthBody({
     timeframe: val("timeframe"),
     style: val("style"),
     risk: val("risk"),
@@ -5983,11 +6141,23 @@ el("save").addEventListener("click", async () => {
 });
 
 el("analyze").addEventListener("click", async () => {
+  if (OFFLINE_MODE) {
+    const symbol = val("symbol") || "";
+    const cached = readByKey(LOCAL_KEYS.analyzeCache, analyzeCacheKey(symbol));
+    if (cached?.result) {
+      out.textContent = cached.result;
+      if (cached?.zonesSvg) renderChartFallbackSvg(cached.zonesSvg);
+      showToast("آفلاین", "آخرین تحلیل ذخیره‌شده نمایش داده شد.", "AI", false);
+    } else {
+      out.textContent = "⚠️ تحلیل آنلاین در حالت آفلاین غیرفعال است. برای ادامه دکمه اتصال مجدد را بزنید.";
+      showToast("آفلاین", "تحلیل نیاز به اتصال دارد.", "AI", false);
+    }
+    return;
+  }
   showToast("در حال تحلیل…", "جمع‌آوری دیتا + تولید خروجی", "AI", true);
   out.textContent = "⏳ در حال تحلیل…";
 
-  const initData = INIT_DATA || tg?.initData || "";
-  const payload = { initData, symbol: val("symbol"), userPrompt: "" };
+  const payload = buildAuthBody({ symbol: val("symbol"), userPrompt: "" });
 
   const {status, json} = await api("/api/analyze", payload);
   if (!json?.ok) {
@@ -5998,6 +6168,13 @@ el("analyze").addEventListener("click", async () => {
   }
 
   out.textContent = json.result || "⚠️ بدون خروجی";
+  cacheByKey(LOCAL_KEYS.analyzeCache, analyzeCacheKey(val("symbol") || ""), {
+    result: json.result || "",
+    chartUrl: json.chartUrl || "",
+    zonesSvg: json.zonesSvg || "",
+    state: json.state || {},
+    quota: json.quota || "",
+  });
   await refreshLiveQuote(true);
   await refreshSymbolNews(true);
   // Render chart if available
@@ -6005,13 +6182,23 @@ el("analyze").addEventListener("click", async () => {
   const chartImg = el("chartImg");
   if (chartCard && chartImg) {
       const u = json.chartUrl || "";
+      const fallbackSvg = json.zonesSvg || "";
       if (u) {
+        chartImg.onerror = () => {
+          chartImg.onerror = null;
+          if (fallbackSvg) {
+            renderChartFallbackSvg(fallbackSvg);
+          } else {
+            chartImg.removeAttribute("src");
+            chartCard.style.display = "none";
+          }
+        };
         chartImg.src = u;
         chartCard.style.display = "block";
         const cm = el("chartMeta");
         if (cm) cm.textContent = "QuickChart";
-      } else if (json.zonesSvg) {
-        renderChartFallbackSvg(json.zonesSvg);
+      } else if (fallbackSvg) {
+        renderChartFallbackSvg(fallbackSvg);
       } else {
         chartImg.removeAttribute("src");
         chartCard.style.display = "none";
@@ -6023,6 +6210,10 @@ el("analyze").addEventListener("click", async () => {
 });
 
 el("sendSupportTicket")?.addEventListener("click", async () => {
+  if (OFFLINE_MODE) {
+    showToast("آفلاین", "ارسال تیکت در حالت آفلاین ممکن نیست.", "SUP", false);
+    return;
+  }
   const text = (el("supportTicketText")?.value || "").trim();
   if (!text || text.length < 4) {
     showToast("خطا", "متن تیکت خیلی کوتاه است.", "SUP", false);
@@ -6033,7 +6224,7 @@ el("sendSupportTicket")?.addEventListener("click", async () => {
     return;
   }
   showToast("در حال ارسال…", "تیکت در حال ثبت است", "SUP", true);
-  const { status, json } = await api("/api/support/ticket", { initData: INIT_DATA, text });
+  const { status, json } = await api("/api/support/ticket", buildAuthBody({ text }));
   if (!json?.ok) {
     const msg = json?.error === "support_unavailable"
       ? "پشتیبانی در دسترس نیست."
@@ -6274,11 +6465,16 @@ el("sendCustomPrompt")?.addEventListener("click", async () => {
 
 el("approvePayment")?.addEventListener("click", async () => {
   const payload = {
-    username: el("payUsername")?.value || "",
+    username: (el("payUsername")?.value || "").trim(),
     amount: Number(el("payAmount")?.value || 0),
     days: Number(el("payDays")?.value || 30),
-    txHash: el("payTx")?.value || "",
+    txHash: (el("payTx")?.value || "").trim(),
   };
+  if (!payload.username || !Number.isFinite(payload.amount) || payload.amount <= 0) {
+    showToast("خطا", "یوزرنیم و مبلغ معتبر را وارد کنید.", "PAY", false);
+    return;
+  }
+  if (!Number.isFinite(payload.days) || payload.days <= 0) payload.days = 30;
   const { json } = await adminApi("/api/admin/payments/approve", payload);
   if (json?.ok) {
     showToast("پرداخت تایید شد ✅", "اشتراک فعال شد", "PAY", false);
@@ -6342,6 +6538,31 @@ el("downloadReportPdf")?.addEventListener("click", async () => {
   } catch (e) {
     showToast("خطا", "ساخت PDF ناموفق بود", "PDF", false);
   }
+});
+
+
+el("reconnect")?.addEventListener("click", async () => {
+  OFFLINE_MODE = false;
+  await boot();
+});
+
+window.addEventListener("online", () => {
+  if (pillTxt && pillTxt.textContent.toLowerCase().includes("offline")) pillTxt.textContent = "Online";
+});
+
+window.addEventListener("offline", () => {
+  if (pillTxt) pillTxt.textContent = "Offline";
+});
+
+el("paymentPresets")?.addEventListener("click", (e) => {
+  const btn = e.target?.closest?.("[data-days]");
+  if (!btn) return;
+  const days = Number(btn.getAttribute("data-days") || 30);
+  const amount = Number(btn.getAttribute("data-amount") || 0);
+  if (el("payDays")) el("payDays").value = String(days);
+  if (el("payAmount")) el("payAmount").value = String(amount);
+  if (el("payDailyLimit") && !el("payDailyLimit").value) el("payDailyLimit").value = "50";
+  showToast("پلن انتخاب شد ✅", "روز: " + days + " | مبلغ: " + amount, "PAY", false);
 });
 
 boot();`;
