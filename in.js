@@ -2274,8 +2274,39 @@ function extractImageFileId(msg, env) {
 }
 
 /* ========================== PROVIDER CHAINS ========================== */
+
+function resolveTextProviderChain(env, orderOverride, prompt = "") {
+  const raw = orderOverride || env.TEXT_PROVIDER_ORDER;
+  const base = [...new Set(parseOrder(raw, ["cf","openai","openrouter","deepseek","gemini"]))];
+  if (base.length <= 1) return base;
+  const minuteBucket = Math.floor(Date.now() / 60000);
+  const promptSeed = String(prompt || "").slice(0, 64);
+  return rotateBySeed(base, `text|${promptSeed}|${minuteBucket}`);
+}
+
+function providerApiKey(name, env, seed = "") {
+  const key = String(name || "").toLowerCase();
+  if (key === "openai") {
+    const pool = parseApiKeyPool(env.OPENAI_API_KEY, env.OPENAI_API_KEYS);
+    return pickApiKey(pool, `openai|${seed}`);
+  }
+  if (key === "openrouter") {
+    const pool = parseApiKeyPool(env.OPENROUTER_API_KEY, env.OPENROUTER_API_KEYS);
+    return pickApiKey(pool, `openrouter|${seed}`);
+  }
+  if (key === "deepseek") {
+    const pool = parseApiKeyPool(env.DEEPSEEK_API_KEY, env.DEEPSEEK_API_KEYS);
+    return pickApiKey(pool, `deepseek|${seed}`);
+  }
+  if (key === "gemini") {
+    const pool = parseApiKeyPool(env.GEMINI_API_KEY, env.GEMINI_API_KEYS);
+    return pickApiKey(pool, `gemini|${seed}`);
+  }
+  return "";
+}
+
 async function runTextProviders(prompt, env, orderOverride) {
-  const chain = [...new Set(parseOrder(orderOverride || env.TEXT_PROVIDER_ORDER, ["cf","openai","openrouter","deepseek","gemini"]))];
+  const chain = resolveTextProviderChain(env, orderOverride, prompt);
   let lastErr = null;
   for (const p of chain) {
     try {
@@ -2359,11 +2390,12 @@ async function textProvider(name, prompt, env) {
   }
 
   if (name === "openai") {
-    if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY_missing");
+    const apiKey = providerApiKey("openai", env, prompt);
+    if (!apiKey) throw new Error("OPENAI_API_KEY_missing");
     const r = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -2377,11 +2409,12 @@ async function textProvider(name, prompt, env) {
   }
 
   if (name === "openrouter") {
-    if (!env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY_missing");
+    const apiKey = providerApiKey("openrouter", env, prompt);
+    if (!apiKey) throw new Error("OPENROUTER_API_KEY_missing");
     const r = await fetchWithTimeout("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -2395,11 +2428,12 @@ async function textProvider(name, prompt, env) {
   }
 
   if (name === "deepseek") {
-    if (!env.DEEPSEEK_API_KEY) throw new Error("DEEPSEEK_API_KEY_missing");
+    const apiKey = providerApiKey("deepseek", env, prompt);
+    if (!apiKey) throw new Error("DEEPSEEK_API_KEY_missing");
     const r = await fetchWithTimeout("https://api.deepseek.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${env.DEEPSEEK_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -2413,9 +2447,10 @@ async function textProvider(name, prompt, env) {
   }
 
   if (name === "gemini") {
-    if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY_missing");
+    const apiKey = providerApiKey("gemini", env, prompt);
+    if (!apiKey) throw new Error("GEMINI_API_KEY_missing");
     const r = await fetchWithTimeout(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2470,7 +2505,7 @@ async function visionProvider(name, imageUrl, visionPrompt, env, getCache, setCa
   name = String(name || "").toLowerCase();
 
   if (name === "openai") {
-    if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY_missing");
+    if (!providerApiKey("openai", env, imageUrl) && !env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY_missing");
     const body = {
       model: env.OPENAI_MODEL || "gpt-4o-mini",
       messages: [{
@@ -2485,7 +2520,7 @@ async function visionProvider(name, imageUrl, visionPrompt, env, getCache, setCa
     const r = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${providerApiKey("openai", env, imageUrl) || env.OPENAI_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
@@ -2503,11 +2538,11 @@ async function visionProvider(name, imageUrl, visionPrompt, env, getCache, setCa
   }
 
   if (name === "gemini") {
-    if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY_missing");
+    if (!providerApiKey("gemini", env, imageUrl) && !env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY_missing");
     const c = await ensureImageCache(imageUrl, env, getCache, setCache);
     if (c.tooLarge) return "";
     const r = await fetchWithTimeout(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(providerApiKey("gemini", env, imageUrl) || env.GEMINI_API_KEY || "")}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
