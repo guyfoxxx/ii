@@ -329,8 +329,9 @@ ${reply}`;
           return jsonResponse({ ok: true, capital: st.capital });
         }
 
+
         if (url.pathname === "/api/admin/withdrawals/list") {
-          const withdrawals = await listWithdrawals(env, 100);
+          const withdrawals = await listWithdrawals(env, 200);
           return jsonResponse({ ok: true, withdrawals });
         }
 
@@ -343,8 +344,6 @@ ${reply}`;
           return jsonResponse({ ok: true, withdrawal: updated });
         }
 
-
-
         if (url.pathname === "/api/admin/payments/decision") {
           const paymentId = String(body.paymentId || "").trim();
           const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
@@ -360,75 +359,18 @@ ${reply}`;
           return jsonResponse({ ok: true, payment });
         }
 
-        if (url.pathname === "/api/admin/withdrawals/list") {
-          return jsonResponse({ ok: true, withdrawals: await listWithdrawals(env, 200) });
-        }
-
+        // Backward-compat alias for older admin clients
         if (url.pathname === "/api/admin/withdrawals/decision") {
-          const id = String(body.withdrawalId || "").trim();
-          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
-          if (!id) return jsonResponse({ ok: false, error: "withdrawal_id_required" }, 400);
-
-          if (env.BOT_DB) {
-            await env.BOT_DB.prepare("UPDATE withdrawals SET status=?1 WHERE id=?2").bind(status, id).run();
-          }
-          if (env.BOT_KV) {
-            const raw = await env.BOT_KV.get(`withdraw:${id}`);
-            if (raw) {
-              try {
-                const w = JSON.parse(raw);
-                w.status = status;
-                w.reviewedAt = new Date().toISOString();
-                w.reviewedBy = normHandle(v.fromLike?.username);
-                await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(w));
-              } catch {}
-            }
-          }
-          return jsonResponse({ ok: true, status, withdrawalId: id });
+          const id = String(body.withdrawalId || body.id || "").trim();
+          const decisionRaw = String(body.status || body.decision || "").trim();
+          const decision = decisionRaw === "approved" ? "approved" : (decisionRaw === "rejected" ? "rejected" : "");
+          const txHash = String(body.txHash || "").trim();
+          if (!id || !decision) return jsonResponse({ ok: false, error: "bad_request" }, 400);
+          const updated = await reviewWithdrawal(env, id, decision, txHash, v.fromLike);
+          return jsonResponse({ ok: true, withdrawal: updated });
         }
 
 
-        if (url.pathname === "/api/admin/payments/decision") {
-          const paymentId = String(body.paymentId || "").trim();
-          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
-          const raw = env.BOT_KV ? await env.BOT_KV.get(`payment:${paymentId}`) : "";
-          if (!raw) return jsonResponse({ ok: false, error: "payment_not_found" }, 404);
-          let payment = null;
-          try { payment = JSON.parse(raw); } catch {}
-          if (!payment) return jsonResponse({ ok: false, error: "payment_bad_json" }, 500);
-          payment.status = status;
-          payment.reviewedAt = new Date().toISOString();
-          payment.reviewedBy = normHandle(v.fromLike?.username);
-          if (env.BOT_KV) await env.BOT_KV.put(`payment:${paymentId}`, JSON.stringify(payment));
-          return jsonResponse({ ok: true, payment });
-        }
-
-        if (url.pathname === "/api/admin/withdrawals/list") {
-          return jsonResponse({ ok: true, withdrawals: await listWithdrawals(env, 200) });
-        }
-
-        if (url.pathname === "/api/admin/withdrawals/decision") {
-          const id = String(body.withdrawalId || "").trim();
-          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
-          if (!id) return jsonResponse({ ok: false, error: "withdrawal_id_required" }, 400);
-
-          if (env.BOT_DB) {
-            await env.BOT_DB.prepare("UPDATE withdrawals SET status=?1 WHERE id=?2").bind(status, id).run();
-          }
-          if (env.BOT_KV) {
-            const raw = await env.BOT_KV.get(`withdraw:${id}`);
-            if (raw) {
-              try {
-                const w = JSON.parse(raw);
-                w.status = status;
-                w.reviewedAt = new Date().toISOString();
-                w.reviewedBy = normHandle(v.fromLike?.username);
-                await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(w));
-              } catch {}
-            }
-          }
-          return jsonResponse({ ok: true, status, withdrawalId: id });
-        }
 
         if (url.pathname === "/api/admin/payments/approve") {
           const username = String(body.username || "").trim();
@@ -5062,6 +5004,7 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="actions">
             <button id="save" class="btn">💾 ذخیره</button>
             <button id="analyze" class="btn primary">⚡ تحلیل</button>
+            <button id="reconnect" class="btn ghost">🔄 اتصال مجدد</button>
             <button id="close" class="btn ghost">✖ بستن</button>
           </div>
 
@@ -5182,6 +5125,12 @@ const MINI_APP_HTML = `<!doctype html>
               <button id="approvePayment" class="btn primary">تأیید و فعال‌سازی</button>
               <button id="checkPayment" class="btn ghost">چک بلاک‌چین</button>
               <button id="activateSubscription" class="btn">فعال‌سازی دستی</button>
+            </div>
+            <div class="muted" style="font-size:12px; line-height:1.8;">برای استفاده ساده: فقط یوزرنیم + مبلغ + یکی از پلن‌ها را انتخاب کنید. TxHash اختیاری است.</div>
+            <div class="chips" id="paymentPresets">
+              <button type="button" class="chip" data-days="7" data-amount="9">پلن شروع ۷ روزه</button>
+              <button type="button" class="chip" data-days="30" data-amount="19">پلن ماهانه</button>
+              <button type="button" class="chip" data-days="90" data-amount="49">پلن حرفه‌ای ۹۰ روزه</button>
             </div>
             <div class="mini-list" id="paymentList">—</div>
           </div>
@@ -5353,6 +5302,12 @@ let ALL_SYMBOLS = [];
 let INIT_DATA = "";
 let IS_STAFF = false;
 let IS_OWNER = false;
+let OFFLINE_MODE = false;
+
+const LOCAL_KEYS = {
+  initData: "miniapp_init_data",
+  userState: "miniapp_cached_user_state_v1",
+};
 const API_BASE = window.location.origin;
 let ADMIN_TICKETS = [];
 let ADMIN_TICKETS_ALL = [];
@@ -5847,55 +5802,34 @@ function safeJsonParse(text, fallback) {
   try { return JSON.parse(text); } catch { return fallback; }
 }
 
-async function boot(){
-  out.textContent = "⏳ در حال آماده‌سازی…";
-  pillTxt.textContent = "Connecting…";
-  showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
+function cacheUserSnapshot(json) {
+  try {
+    const data = {
+      welcome: json?.welcome || "",
+      state: json?.state || {},
+      quota: json?.quota || "",
+      symbols: json?.symbols || [],
+      styles: json?.styles || [],
+      customPrompts: json?.customPrompts || [],
+      offerBanner: json?.offerBanner || "",
+      role: json?.role || "user",
+      isStaff: !!json?.isStaff,
+      wallet: json?.wallet || "",
+      cachedAt: Date.now(),
+    };
+    localStorage.setItem(LOCAL_KEYS.userState, JSON.stringify(data));
+  } catch {}
+}
 
-  const isTelegramRuntime = !!window.Telegram?.WebApp;
-  const qsInitData = extractInitDataFromLocation();
-  const savedInitData = storageGet("miniapp_init_data");
-  let initData = (tg?.initData || "").trim();
-
-  // Telegram WebApp may populate initData with a slight delay.
-  if (isTelegramRuntime && !initData) {
-    await new Promise((r) => setTimeout(r, 350));
-    initData = (tg?.initData || "").trim();
+function readCachedUserSnapshot() {
+  try {
+    return safeJsonParse(localStorage.getItem(LOCAL_KEYS.userState) || "", null);
+  } catch {
+    return null;
   }
+}
 
-  if (initData) {
-    INIT_DATA = initData;
-    storageSet("miniapp_init_data", initData);
-  } else if (qsInitData) {
-    INIT_DATA = qsInitData;
-    storageSet("miniapp_init_data", qsInitData);
-  } else if (savedInitData && !isTelegramRuntime) {
-    INIT_DATA = savedInitData;
-  } else if (!isTelegramRuntime) {
-    const devInit = "dev:999001";
-    INIT_DATA = devInit;
-    storageSet("miniapp_init_data", devInit);
-    showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
-  } else {
-    hideToast();
-    pillTxt.textContent = "Offline";
-    out.textContent = "⚠️ اتصال مینی‌اپ برقرار نیست. " + CONNECTION_HINT;
-    return;
-  }
-
-  const {status, json} = await api("/api/user", { initData: INIT_DATA });
-
-  if (!json?.ok) {
-    if (status === 401) {
-      storageRemove("miniapp_init_data");
-    }
-    hideToast();
-    pillTxt.textContent = "Offline";
-    out.textContent = "⚠️ خطا: " + prettyErr(json, status);
-    showToast("خطا", prettyErr(json, status), "API", false);
-    return;
-  }
-
+function applyUserState(json) {
   welcome.textContent = json.welcome || "";
   fillSymbols(json.symbols || []);
   const styleList = json.styles || [];
@@ -5919,6 +5853,75 @@ async function boot(){
   if (offerTag) offerTag.textContent = json.role === "owner" ? "Owner" : "Special";
 
   updateMeta(json.state, json.quota);
+}
+
+
+async function boot(){
+  out.textContent = "⏳ در حال آماده‌سازی…";
+  pillTxt.textContent = "Connecting…";
+  showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
+
+  const isTelegramRuntime = !!window.Telegram?.WebApp;
+  const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
+  const savedInitData = localStorage.getItem(LOCAL_KEYS.initData) || "";
+
+  let initData = (tg?.initData || "").trim();
+
+  // Telegram WebApp may populate initData with a slight delay.
+  if (isTelegramRuntime && !initData) {
+    await new Promise((r) => setTimeout(r, 350));
+    initData = (tg?.initData || "").trim();
+  }
+
+  if (initData) {
+    INIT_DATA = initData;<<<<<<< codex/fix-payment-system-and-mini-app-functions
+    localStorage.setItem(LOCAL_KEYS.initData, initData);
+  } else if (qsInitData) {
+    INIT_DATA = qsInitData;
+    localStorage.setItem(LOCAL_KEYS.initData, qsInitData);
+
+  } else if (savedInitData && !isTelegramRuntime) {
+    INIT_DATA = savedInitData;
+  } else if (!isTelegramRuntime) {
+    const devInit = "dev:999001";
+    INIT_DATA = devInit;
+    localStorage.setItem(LOCAL_KEYS.initData, devInit);
+
+    showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
+  } else {
+    hideToast();
+    pillTxt.textContent = "Offline";
+    out.textContent = "⚠️ اتصال مینی‌اپ برقرار نیست. " + CONNECTION_HINT;
+    return;
+  }
+
+  const {status, json} = await api("/api/user", { initData: INIT_DATA });
+
+  if (!json?.ok) {
+    if (status === 401) {
+      try { localStorage.removeItem(LOCAL_KEYS.initData); } catch {}
+    }
+    const cached = readCachedUserSnapshot();
+    if (!cached) {
+      hideToast();
+      pillTxt.textContent = "Offline";
+      out.textContent = "⚠️ خطا: " + prettyErr(json, status);
+      showToast("خطا", prettyErr(json, status), "API", false);
+      return;
+
+    }
+    OFFLINE_MODE = true;
+    applyUserState(cached);
+    out.textContent = "حالت آفلاین فعال شد ✅ برخی امکانات محدود هستند.";
+    pillTxt.textContent = "Offline (Cached)";
+    hideToast();
+    showToast("آفلاین", "داده‌های ذخیره‌شده بارگذاری شد", "CACHE", false);
+    return;
+  }
+
+  OFFLINE_MODE = false;
+  cacheUserSnapshot(json);
+  applyUserState(json);
   out.textContent = "آماده ✅";
   pillTxt.textContent = "Online";
   hideToast();
@@ -5984,6 +5987,10 @@ el("tfChips").addEventListener("click", (e) => {
 });
 
 el("save").addEventListener("click", async () => {
+  if (OFFLINE_MODE) {
+    showToast("آفلاین", "در حالت آفلاین ذخیره روی سرور ممکن نیست.", "SET", false);
+    return;
+  }
   showToast("در حال ذخیره…", "تنظیمات ذخیره می‌شود", "SET", true);
   out.textContent = "⏳ ذخیره تنظیمات…";
 
@@ -6013,6 +6020,11 @@ el("save").addEventListener("click", async () => {
 });
 
 el("analyze").addEventListener("click", async () => {
+  if (OFFLINE_MODE) {
+    out.textContent = "⚠️ تحلیل آنلاین در حالت آفلاین غیرفعال است. برای ادامه دکمه اتصال مجدد را بزنید.";
+    showToast("آفلاین", "تحلیل نیاز به اتصال دارد.", "AI", false);
+    return;
+  }
   showToast("در حال تحلیل…", "جمع‌آوری دیتا + تولید خروجی", "AI", true);
   out.textContent = "⏳ در حال تحلیل…";
 
@@ -6053,6 +6065,10 @@ el("analyze").addEventListener("click", async () => {
 });
 
 el("sendSupportTicket")?.addEventListener("click", async () => {
+  if (OFFLINE_MODE) {
+    showToast("آفلاین", "ارسال تیکت در حالت آفلاین ممکن نیست.", "SUP", false);
+    return;
+  }
   const text = (el("supportTicketText")?.value || "").trim();
   if (!text || text.length < 4) {
     showToast("خطا", "متن تیکت خیلی کوتاه است.", "SUP", false);
@@ -6374,12 +6390,31 @@ el("downloadReportPdf")?.addEventListener("click", async () => {
   }
 });
 
-boot().catch((e) => {
-  console.error("miniapp boot failed:", e);
-  if (out) out.textContent = "⚠️ خطای داخلی مینی‌اپ. یک‌بار رفرش کنید.";
+
+el("reconnect")?.addEventListener("click", async () => {
+  OFFLINE_MODE = false;
+  await boot();
+});
+
+window.addEventListener("online", () => {
+  if (pillTxt && pillTxt.textContent.toLowerCase().includes("offline")) pillTxt.textContent = "Online";
+});
+
+window.addEventListener("offline", () => {
   if (pillTxt) pillTxt.textContent = "Offline";
-  showToast("خطا", "اجرای مینی‌اپ با خطا متوقف شد", "JS", false);
-});`;
+});
+
+el("paymentPresets")?.addEventListener("click", (e) => {
+  const btn = e.target?.closest?.("[data-days]");
+  if (!btn) return;
+  const days = Number(btn.getAttribute("data-days") || 30);
+  const amount = Number(btn.getAttribute("data-amount") || 0);
+  if (el("payDays")) el("payDays").value = String(days);
+  if (el("payAmount")) el("payAmount").value = String(amount);
+  showToast("پلن انتخاب شد ✅", "روز: " + days + " | مبلغ: " + amount, "PAY", false);
+});
+
+boot();`;
 
 
 async function runDailySuggestions(env) {
