@@ -603,6 +603,10 @@ TxID: ${txid}
           return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
         }
 
+        const quoteRespKey = `quote|${symbol}|${tf}`;
+        const quoteCachedResp = apiRespCacheGet(quoteRespKey);
+        if (quoteCachedResp) return jsonResponse(quoteCachedResp);
+
         let candles = [];
         try {
           candles = await getMarketCandlesWithFallback(env, symbol, tf);
@@ -659,6 +663,10 @@ TxID: ${txid}
         const tf = String(body.timeframe || st.timeframe || "H4").toUpperCase();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
 
+        const quoteRespKey = `quote|${symbol}|${tf}`;
+        const quoteCachedResp = apiRespCacheGet(quoteRespKey);
+        if (quoteCachedResp) return jsonResponse(quoteCachedResp);
+
         let candles = [];
         try {
           candles = await getMarketCandlesWithFallback(env, symbol, tf);
@@ -681,7 +689,7 @@ TxID: ${txid}
         const status = cp > 0.08 ? "up" : (cp < -0.08 ? "down" : "flat");
         const quality = candles.length >= minCandlesForTimeframe(tf) ? "full" : "limited";
 
-        return jsonResponse({
+        const quotePayload = {
           ok: true,
           symbol,
           timeframe: tf,
@@ -694,7 +702,9 @@ TxID: ${txid}
           candles: candles.length,
           quality,
           status,
-        });
+        };
+        apiRespCacheSet(quoteRespKey, quotePayload, Number(env.QUOTE_RESPONSE_CACHE_MS || 10000));
+        return jsonResponse(quotePayload);
       }
 
       if (url.pathname === "/api/news" && request.method === "POST") {
@@ -708,9 +718,14 @@ TxID: ${txid}
         const symbol = String(body.symbol || "").trim().toUpperCase();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
 
+        const newsRespKey = `news|${symbol}`;
+        const newsCachedResp = apiRespCacheGet(newsRespKey);
+        if (newsCachedResp) return jsonResponse(newsCachedResp);
         try {
           const articles = await fetchSymbolNewsFa(symbol, env);
-          return jsonResponse({ ok: true, symbol, articles, count: articles.length });
+          const payload = { ok: true, symbol, articles, count: articles.length };
+          apiRespCacheSet(newsRespKey, payload, Number(env.NEWS_RESPONSE_CACHE_MS || 30000));
+          return jsonResponse(payload);
         } catch (e) {
           console.error("api/news failed:", e?.message || e);
           return jsonResponse({ ok: false, error: "news_unavailable", symbol, articles: [] }, 502);
@@ -728,10 +743,15 @@ TxID: ${txid}
         const symbol = String(body.symbol || "").trim().toUpperCase();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
 
+        const newsAnRespKey = `news_an|${symbol}`;
+        const newsAnCachedResp = apiRespCacheGet(newsAnRespKey);
+        if (newsAnCachedResp) return jsonResponse(newsAnCachedResp);
         try {
           const articles = await fetchSymbolNewsFa(symbol, env);
           const summary = await buildNewsAnalysisSummary(symbol, articles, env);
-          return jsonResponse({ ok: true, symbol, summary, articles, count: articles.length });
+          const payload = { ok: true, symbol, summary, articles, count: articles.length };
+          apiRespCacheSet(newsAnRespKey, payload, Number(env.NEWS_ANALYSIS_RESPONSE_CACHE_MS || 45000));
+          return jsonResponse(payload);
         } catch (e) {
           console.error("api/news/analyze failed:", e?.message || e);
           return jsonResponse({ ok: false, error: "news_analysis_unavailable", symbol, summary: "", articles: [] }, 502);
@@ -2197,8 +2217,39 @@ function extractImageFileId(msg, env) {
 }
 
 /* ========================== PROVIDER CHAINS ========================== */
+
+function resolveTextProviderChain(env, orderOverride, prompt = "") {
+  const raw = orderOverride || env.TEXT_PROVIDER_ORDER;
+  const base = [...new Set(parseOrder(raw, ["cf","openai","openrouter","deepseek","gemini"]))];
+  if (base.length <= 1) return base;
+  const minuteBucket = Math.floor(Date.now() / 60000);
+  const promptSeed = String(prompt || "").slice(0, 64);
+  return rotateBySeed(base, `text|${promptSeed}|${minuteBucket}`);
+}
+
+function providerApiKey(name, env, seed = "") {
+  const key = String(name || "").toLowerCase();
+  if (key === "openai") {
+    const pool = parseApiKeyPool(env.OPENAI_API_KEY, env.OPENAI_API_KEYS);
+    return pickApiKey(pool, `openai|${seed}`);
+  }
+  if (key === "openrouter") {
+    const pool = parseApiKeyPool(env.OPENROUTER_API_KEY, env.OPENROUTER_API_KEYS);
+    return pickApiKey(pool, `openrouter|${seed}`);
+  }
+  if (key === "deepseek") {
+    const pool = parseApiKeyPool(env.DEEPSEEK_API_KEY, env.DEEPSEEK_API_KEYS);
+    return pickApiKey(pool, `deepseek|${seed}`);
+  }
+  if (key === "gemini") {
+    const pool = parseApiKeyPool(env.GEMINI_API_KEY, env.GEMINI_API_KEYS);
+    return pickApiKey(pool, `gemini|${seed}`);
+  }
+  return "";
+}
+
 async function runTextProviders(prompt, env, orderOverride) {
-  const chain = [...new Set(parseOrder(orderOverride || env.TEXT_PROVIDER_ORDER, ["cf","openai","openrouter","deepseek","gemini"]))];
+  const chain = resolveTextProviderChain(env, orderOverride, prompt);
   let lastErr = null;
   for (const p of chain) {
     if (providerInCooldown(p)) continue;
@@ -2284,11 +2335,12 @@ async function textProvider(name, prompt, env) {
   }
 
   if (name === "openai") {
-    if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY_missing");
+    const apiKey = providerApiKey("openai", env, prompt);
+    if (!apiKey) throw new Error("OPENAI_API_KEY_missing");
     const r = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -2302,11 +2354,12 @@ async function textProvider(name, prompt, env) {
   }
 
   if (name === "openrouter") {
-    if (!env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY_missing");
+    const apiKey = providerApiKey("openrouter", env, prompt);
+    if (!apiKey) throw new Error("OPENROUTER_API_KEY_missing");
     const r = await fetchWithTimeout("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -2320,11 +2373,12 @@ async function textProvider(name, prompt, env) {
   }
 
   if (name === "deepseek") {
-    if (!env.DEEPSEEK_API_KEY) throw new Error("DEEPSEEK_API_KEY_missing");
+    const apiKey = providerApiKey("deepseek", env, prompt);
+    if (!apiKey) throw new Error("DEEPSEEK_API_KEY_missing");
     const r = await fetchWithTimeout("https://api.deepseek.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${env.DEEPSEEK_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -2338,9 +2392,10 @@ async function textProvider(name, prompt, env) {
   }
 
   if (name === "gemini") {
-    if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY_missing");
+    const apiKey = providerApiKey("gemini", env, prompt);
+    if (!apiKey) throw new Error("GEMINI_API_KEY_missing");
     const r = await fetchWithTimeout(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2395,7 +2450,7 @@ async function visionProvider(name, imageUrl, visionPrompt, env, getCache, setCa
   name = String(name || "").toLowerCase();
 
   if (name === "openai") {
-    if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY_missing");
+    if (!providerApiKey("openai", env, imageUrl) && !env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY_missing");
     const body = {
       model: env.OPENAI_MODEL || "gpt-4o-mini",
       messages: [{
@@ -2410,7 +2465,7 @@ async function visionProvider(name, imageUrl, visionPrompt, env, getCache, setCa
     const r = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${providerApiKey("openai", env, imageUrl) || env.OPENAI_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
@@ -2428,11 +2483,11 @@ async function visionProvider(name, imageUrl, visionPrompt, env, getCache, setCa
   }
 
   if (name === "gemini") {
-    if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY_missing");
+    if (!providerApiKey("gemini", env, imageUrl) && !env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY_missing");
     const c = await ensureImageCache(imageUrl, env, getCache, setCache);
     if (c.tooLarge) return "";
     const r = await fetchWithTimeout(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(providerApiKey("gemini", env, imageUrl) || env.GEMINI_API_KEY || "")}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2489,18 +2544,49 @@ function assetKind(symbol) {
 function providerSupportsSymbol(provider, symbol, env) {
   const kind = assetKind(symbol);
   if (provider === "binance") return kind === "crypto";
-  if (provider === "twelvedata") return !!env.TWELVEDATA_API_KEY && ["crypto", "forex", "metal"].includes(kind);
-  if (provider === "alphavantage") return !!env.ALPHAVANTAGE_API_KEY && ["forex", "metal"].includes(kind);
-  if (provider === "finnhub") return !!env.FINNHUB_API_KEY && kind === "forex";
+  if (provider === "twelvedata") return !!(env.TWELVEDATA_API_KEY || env.TWELVEDATA_API_KEYS) && ["crypto", "forex", "metal"].includes(kind);
+  if (provider === "alphavantage") return !!(env.ALPHAVANTAGE_API_KEY || env.ALPHAVANTAGE_API_KEYS) && ["forex", "metal"].includes(kind);
+  if (provider === "finnhub") return !!(env.FINNHUB_API_KEY || env.FINNHUB_API_KEYS) && kind === "forex";
   if (provider === "yahoo") return true;
   return true;
 }
 
-function resolveMarketProviderChain(env, symbol) {
+function parseApiKeyPool(primary, many) {
+  const arr = [];
+  const one = String(primary || "").trim();
+  if (one) arr.push(one);
+  const list = String(many || "").split(",").map((x) => x.trim()).filter(Boolean);
+  for (const k of list) if (!arr.includes(k)) arr.push(k);
+  return arr;
+}
+
+function stableHashInt(s) {
+  const str = String(s || "");
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0);
+}
+
+function rotateBySeed(arr, seed) {
+  if (!Array.isArray(arr) || arr.length <= 1) return Array.isArray(arr) ? arr.slice() : [];
+  const i = stableHashInt(seed) % arr.length;
+  return arr.slice(i).concat(arr.slice(0, i));
+}
+
+function pickApiKey(pool, seed) {
+  if (!Array.isArray(pool) || !pool.length) return "";
+  return pool[stableHashInt(seed) % pool.length];
+}
+
+function resolveMarketProviderChain(env, symbol, timeframe = "H4") {
   const desired = parseOrder(env.MARKET_DATA_PROVIDER_ORDER, ["binance","twelvedata","alphavantage","finnhub","yahoo"]);
   const filtered = desired.filter((p) => providerSupportsSymbol(p, symbol, env));
-  if (filtered.length) return filtered;
-  return ["yahoo"];
+  const chain = filtered.length ? filtered : ["yahoo"];
+  const minuteBucket = Math.floor(Date.now() / 60000);
+  return rotateBySeed(chain, `${symbol}|${timeframe}|${minuteBucket}`);
 }
 
 function rotateProviderChain(chain, symbol, env) {
@@ -2608,13 +2694,15 @@ async function fetchBinanceCandles(symbol, timeframe, limit, timeoutMs) {
 }
 
 async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) {
-  if (!env.TWELVEDATA_API_KEY) throw new Error("twelvedata_key_missing");
+  const tdPool = parseApiKeyPool(env.TWELVEDATA_API_KEY, env.TWELVEDATA_API_KEYS);
+  if (!tdPool.length) throw new Error("twelvedata_key_missing");
   const kind = assetKind(symbol);
   if (kind === "unknown") throw new Error("twelvedata_unknown_symbol");
 
   const interval = mapTimeframeToTwelve(timeframe);
   const sym = mapForexSymbolForTwelve(symbol);
-  const base = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${encodeURIComponent(env.TWELVEDATA_API_KEY)}`;
+  const tdKey = pickApiKey(tdPool, `${symbol}|${timeframe}|${Math.floor(Date.now() / 60000)}`);
+  const base = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${encodeURIComponent(tdKey)}`;
   const sources = [];
   if (kind === "crypto") sources.push("binance");
   if (kind === "forex" || kind === "metal") sources.push("fx");
@@ -2648,20 +2736,22 @@ async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) 
 }
 
 async function fetchAlphaVantageFxIntraday(symbol, timeframe, limit, timeoutMs, env) {
-  if (!env.ALPHAVANTAGE_API_KEY) throw new Error("alphavantage_key_missing");
+  const avPool = parseApiKeyPool(env.ALPHAVANTAGE_API_KEY, env.ALPHAVANTAGE_API_KEYS);
+  if (!avPool.length) throw new Error("alphavantage_key_missing");
   if (!/^[A-Z]{6}$/.test(symbol) && symbol !== "XAUUSD" && symbol !== "XAGUSD") throw new Error("alphavantage_only_fx_like");
 
   const from = symbol.slice(0,3);
   const to = symbol.slice(3,6);
   const interval = mapTimeframeToAlphaVantage(timeframe);
 
+  const avKey = pickApiKey(avPool, `${symbol}|${timeframe}|${Math.floor(Date.now() / 60000)}`);
   const url =
     `https://www.alphavantage.co/query?function=FX_INTRADAY` +
     `&from_symbol=${encodeURIComponent(from)}` +
     `&to_symbol=${encodeURIComponent(to)}` +
     `&interval=${encodeURIComponent(interval)}` +
     `&outputsize=compact` +
-    `&apikey=${encodeURIComponent(env.ALPHAVANTAGE_API_KEY)}`;
+    `&apikey=${encodeURIComponent(avKey)}`;
 
   const r = await fetchWithTimeout(url, {}, timeoutMs);
   if (!r.ok) throw new Error(`alphavantage_http_${r.status}`);
@@ -2691,7 +2781,8 @@ function mapTimeframeToFinnhubResolution(tf) {
   return m[tf] || "240";
 }
 async function fetchFinnhubForexCandles(symbol, timeframe, limit, timeoutMs, env) {
-  if (!env.FINNHUB_API_KEY) throw new Error("finnhub_key_missing");
+  const fhPool = parseApiKeyPool(env.FINNHUB_API_KEY, env.FINNHUB_API_KEYS);
+  if (!fhPool.length) throw new Error("finnhub_key_missing");
   if (!/^[A-Z]{6}$/.test(symbol)) throw new Error("finnhub_only_forex");
 
   const res = mapTimeframeToFinnhubResolution(timeframe);
@@ -2701,7 +2792,8 @@ async function fetchFinnhubForexCandles(symbol, timeframe, limit, timeoutMs, env
   const lookbackSec = 60 * 60 * 24 * 10;
   const from = now - lookbackSec;
 
-  const url = `https://finnhub.io/api/v1/forex/candle?symbol=${encodeURIComponent(inst)}&resolution=${encodeURIComponent(res)}&from=${from}&to=${now}&token=${encodeURIComponent(env.FINNHUB_API_KEY)}`;
+  const fhKey = pickApiKey(fhPool, `${symbol}|${timeframe}|${Math.floor(Date.now() / 60000)}`);
+  const url = `https://finnhub.io/api/v1/forex/candle?symbol=${encodeURIComponent(inst)}&resolution=${encodeURIComponent(res)}&from=${from}&to=${now}&token=${encodeURIComponent(fhKey)}`;
 
   const r = await fetchWithTimeout(url, {}, timeoutMs);
   if (!r.ok) throw new Error(`finnhub_http_${r.status}`);
@@ -2914,6 +3006,18 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
     }
   }
   throw lastErr || new Error("market_data_alt_failed");
+}
+
+const API_RESP_CACHE = new Map();
+
+function apiRespCacheGet(key) {
+  const it = API_RESP_CACHE.get(key);
+  if (!it) return null;
+  if (Date.now() > it.exp) { API_RESP_CACHE.delete(key); return null; }
+  return it.val;
+}
+function apiRespCacheSet(key, val, ttlMs) {
+  API_RESP_CACHE.set(key, { val, exp: Date.now() + Math.max(500, Number(ttlMs || 10000)) });
 }
 
 async function fetchSymbolNewsFa(symbol, env) {
@@ -5485,7 +5589,9 @@ function setTf(tf){
 
 async function api(path, body){
   let lastErr = null;
-  for (let i = 0; i < 2; i++) {
+  const quickBoot = path === "/api/user" && !!body?.allowGuest;
+  const attempts = quickBoot ? 1 : 2;
+  for (let i = 0; i < attempts; i++) {
     try {
       const ac = new AbortController();
       const isBootUser = String(path || "") === "/api/user";
