@@ -6,11 +6,19 @@ export default {
       if (url.pathname === "/health") return new Response("ok", { status: 200 });
 
       // ===== MINI APP (inline) =====
-      if (request.method === "GET" && (url.pathname === "/" || url.pathname === "")) {
-        return htmlResponse(MINI_APP_HTML);
-      }
-      if (request.method === "GET" && url.pathname === "/app.js") {
+      // Serve app.js from root and nested miniapp paths (e.g. /miniapp/app.js)
+      if (request.method === "GET" && (url.pathname === "/app.js" || url.pathname.endsWith("/app.js"))) {
         return jsResponse(MINI_APP_JS);
+      }
+      // Serve Mini App shell on root and non-API clean paths (e.g. /miniapp)
+      if (
+        request.method === "GET" &&
+        url.pathname !== "/health" &&
+        !url.pathname.startsWith("/api/") &&
+        !url.pathname.startsWith("/telegram/") &&
+        !url.pathname.endsWith(".js")
+      ) {
+        return htmlResponse(MINI_APP_HTML);
       }
 
       // ===== MINI APP APIs =====
@@ -5312,7 +5320,7 @@ const MINI_APP_HTML = `<!doctype html>
         <div class="badge" id="toastB">—</div>
       </div>
 
-      <script src="/app.js"></script>
+      <script src="app.js"></script>
 </body>
 </html>`;
 
