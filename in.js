@@ -334,8 +334,9 @@ ${reply}`;
           return jsonResponse({ ok: true, capital: st.capital });
         }
 
+
         if (url.pathname === "/api/admin/withdrawals/list") {
-          const withdrawals = await listWithdrawals(env, 100);
+          const withdrawals = await listWithdrawals(env, 200);
           return jsonResponse({ ok: true, withdrawals });
         }
 
@@ -348,8 +349,6 @@ ${reply}`;
           return jsonResponse({ ok: true, withdrawal: updated });
         }
 
-
-
         if (url.pathname === "/api/admin/payments/decision") {
           const paymentId = String(body.paymentId || "").trim();
           const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
@@ -365,75 +364,18 @@ ${reply}`;
           return jsonResponse({ ok: true, payment });
         }
 
-        if (url.pathname === "/api/admin/withdrawals/list") {
-          return jsonResponse({ ok: true, withdrawals: await listWithdrawals(env, 200) });
-        }
-
+        // Backward-compat alias for older admin clients
         if (url.pathname === "/api/admin/withdrawals/decision") {
-          const id = String(body.withdrawalId || "").trim();
-          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
-          if (!id) return jsonResponse({ ok: false, error: "withdrawal_id_required" }, 400);
-
-          if (env.BOT_DB) {
-            await env.BOT_DB.prepare("UPDATE withdrawals SET status=?1 WHERE id=?2").bind(status, id).run();
-          }
-          if (env.BOT_KV) {
-            const raw = await env.BOT_KV.get(`withdraw:${id}`);
-            if (raw) {
-              try {
-                const w = JSON.parse(raw);
-                w.status = status;
-                w.reviewedAt = new Date().toISOString();
-                w.reviewedBy = normHandle(v.fromLike?.username);
-                await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(w));
-              } catch {}
-            }
-          }
-          return jsonResponse({ ok: true, status, withdrawalId: id });
+          const id = String(body.withdrawalId || body.id || "").trim();
+          const decisionRaw = String(body.status || body.decision || "").trim();
+          const decision = decisionRaw === "approved" ? "approved" : (decisionRaw === "rejected" ? "rejected" : "");
+          const txHash = String(body.txHash || "").trim();
+          if (!id || !decision) return jsonResponse({ ok: false, error: "bad_request" }, 400);
+          const updated = await reviewWithdrawal(env, id, decision, txHash, v.fromLike);
+          return jsonResponse({ ok: true, withdrawal: updated });
         }
 
 
-        if (url.pathname === "/api/admin/payments/decision") {
-          const paymentId = String(body.paymentId || "").trim();
-          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
-          const raw = env.BOT_KV ? await env.BOT_KV.get(`payment:${paymentId}`) : "";
-          if (!raw) return jsonResponse({ ok: false, error: "payment_not_found" }, 404);
-          let payment = null;
-          try { payment = JSON.parse(raw); } catch {}
-          if (!payment) return jsonResponse({ ok: false, error: "payment_bad_json" }, 500);
-          payment.status = status;
-          payment.reviewedAt = new Date().toISOString();
-          payment.reviewedBy = normHandle(v.fromLike?.username);
-          if (env.BOT_KV) await env.BOT_KV.put(`payment:${paymentId}`, JSON.stringify(payment));
-          return jsonResponse({ ok: true, payment });
-        }
-
-        if (url.pathname === "/api/admin/withdrawals/list") {
-          return jsonResponse({ ok: true, withdrawals: await listWithdrawals(env, 200) });
-        }
-
-        if (url.pathname === "/api/admin/withdrawals/decision") {
-          const id = String(body.withdrawalId || "").trim();
-          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
-          if (!id) return jsonResponse({ ok: false, error: "withdrawal_id_required" }, 400);
-
-          if (env.BOT_DB) {
-            await env.BOT_DB.prepare("UPDATE withdrawals SET status=?1 WHERE id=?2").bind(status, id).run();
-          }
-          if (env.BOT_KV) {
-            const raw = await env.BOT_KV.get(`withdraw:${id}`);
-            if (raw) {
-              try {
-                const w = JSON.parse(raw);
-                w.status = status;
-                w.reviewedAt = new Date().toISOString();
-                w.reviewedBy = normHandle(v.fromLike?.username);
-                await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(w));
-              } catch {}
-            }
-          }
-          return jsonResponse({ ok: true, status, withdrawalId: id });
-        }
 
         if (url.pathname === "/api/admin/payments/approve") {
           const username = String(body.username || "").trim();
@@ -5430,7 +5372,6 @@ let ALL_SYMBOLS = [];
 let INIT_DATA = "";
 let IS_STAFF = false;
 let IS_OWNER = false;
-let IS_GUEST = false;
 let OFFLINE_MODE = false;
 
 const LOCAL_KEYS = {
@@ -5625,13 +5566,13 @@ async function refreshLiveQuote(force = false){
     if (!symbol) return;
     const ck = quoteCacheKey(symbol, timeframe);
 
-    if (OFFLINE_MODE) {
+    if (OFFLINE_MODE || !getFreshInitData()) {
       const cached = readByKey(LOCAL_KEYS.quoteCache, ck);
       setQuoteUi(cached, "قیمت لحظه‌ای از کش محلی");
       return;
     }
 
-    const { json } = await api("/api/quote", buildAuthBody({ symbol, timeframe, allowGuest: true }));
+    const { json } = await api("/api/quote", buildAuthBody({ symbol, timeframe }));
     if (json?.ok) {
       cacheByKey(LOCAL_KEYS.quoteCache, ck, json);
       setQuoteUi(json, "");
@@ -5686,13 +5627,13 @@ async function refreshSymbolNews(force = false){
   if (target && force) target.textContent = "در حال دریافت خبر…";
   const ck = newsCacheKey(symbol);
 
-  if (OFFLINE_MODE) {
+  if (OFFLINE_MODE || !getFreshInitData()) {
     const cached = readByKey(LOCAL_KEYS.newsCache, ck);
     renderNewsList(cached || { ok: false, articles: [] });
     return;
   }
 
-  const { json } = await api("/api/news", buildAuthBody({ symbol, allowGuest: true }));
+  const { json } = await api("/api/news", buildAuthBody({ symbol }));
   if (json?.ok) {
     cacheByKey(LOCAL_KEYS.newsCache, ck, json);
     renderNewsList(json);
@@ -5710,13 +5651,13 @@ async function refreshNewsAnalysis(force = false){
   if (target && force) target.textContent = "در حال تحلیل خبر…";
   const ck = newsCacheKey(symbol);
 
-  if (OFFLINE_MODE) {
+  if (OFFLINE_MODE || !getFreshInitData()) {
     const cached = readByKey(LOCAL_KEYS.newsAnalysisCache, ck);
     if (target) target.textContent = cached?.summary || "تحلیل خبری آفلاین موجود نیست.";
     return;
   }
 
-  const { json } = await api("/api/news/analyze", buildAuthBody({ symbol, allowGuest: true }));
+  const { json } = await api("/api/news/analyze", buildAuthBody({ symbol }));
   if (!target) return;
   if (json?.ok) {
     cacheByKey(LOCAL_KEYS.newsAnalysisCache, ck, json);
@@ -6094,7 +6035,7 @@ async function boot(){
     INIT_DATA = "";
     showToast("حالت مهمان", "اتصال احراز نشده؛ اجرای محدود با داده عمومی", "GUEST", false);
   }
-  const {status, json} = await api("/api/user", buildAuthBody({ allowGuest: true }));
+  const {status, json} = await api("/api/user", buildAuthBody());
 
   if (!json?.ok) {
     if (status === 401) {
@@ -6102,25 +6043,10 @@ async function boot(){
     }
     const cached = readCachedUserSnapshot();
     if (!cached) {
-      const fallback = {
-        welcome: "نسخه محدود مینی‌اپ فعال شد.",
-        state: { timeframe: "H4", style: "پرایس اکشن", risk: "متوسط", newsEnabled: true, promptMode: "style_plus_custom", selectedSymbol: "BTCUSDT" },
-        quota: "guest",
-        symbols: ["BTCUSDT","ETHUSDT","XAUUSD","EURUSD"],
-        styles: ["پرایس اکشن","ICT","ATR","ترکیبی"],
-        offerBanner: "اتصال محدود؛ برخی امکانات نیازمند احراز تلگرام است.",
-        role: "user",
-        isStaff: false,
-        customPrompts: [],
-      };
-      OFFLINE_MODE = true;
-      IS_GUEST = true;
-      applyUserState(fallback);
-      pillTxt.textContent = "Offline (Guest)";
-      out.textContent = "حالت محدود فعال شد ✅ داده‌های پایه بارگذاری شدند.";
-      showToast("حالت محدود", "برای همه امکانات، مینی‌اپ را از داخل تلگرام باز کنید.", "GUEST", false);
-      setupLiveQuotePolling();
-      setupNewsPolling();
+      hideToast();
+      pillTxt.textContent = "Offline";
+      out.textContent = "⚠️ خطا: " + prettyErr(json, status);
+      showToast("خطا", prettyErr(json, status), "API", false);
       return;
     }
     OFFLINE_MODE = true;
@@ -6201,8 +6127,8 @@ el("tfChips").addEventListener("click", (e) => {
 });
 
 el("save").addEventListener("click", async () => {
-  if (OFFLINE_MODE || IS_GUEST) {
-    showToast("محدود", "در حالت آفلاین/مهمان ذخیره روی سرور ممکن نیست.", "SET", false);
+  if (OFFLINE_MODE) {
+    showToast("آفلاین", "در حالت آفلاین ذخیره روی سرور ممکن نیست.", "SET", false);
     return;
   }
   showToast("در حال ذخیره…", "تنظیمات ذخیره می‌شود", "SET", true);
@@ -6232,7 +6158,7 @@ el("save").addEventListener("click", async () => {
 });
 
 el("analyze").addEventListener("click", async () => {
-  if (OFFLINE_MODE || IS_GUEST) {
+  if (OFFLINE_MODE) {
     const symbol = val("symbol") || "";
     const cached = readByKey(LOCAL_KEYS.analyzeCache, analyzeCacheKey(symbol));
     if (cached?.result) {
@@ -6240,8 +6166,8 @@ el("analyze").addEventListener("click", async () => {
       if (cached?.zonesSvg) renderChartFallbackSvg(cached.zonesSvg);
       showToast("آفلاین", "آخرین تحلیل ذخیره‌شده نمایش داده شد.", "AI", false);
     } else {
-      out.textContent = "⚠️ تحلیل آنلاین در حالت آفلاین/مهمان غیرفعال است. برای ادامه از داخل تلگرام متصل شوید.";
-      showToast("محدود", "تحلیل نیاز به اتصال و احراز تلگرام دارد.", "AI", false);
+      out.textContent = "⚠️ تحلیل آنلاین در حالت آفلاین غیرفعال است. برای ادامه دکمه اتصال مجدد را بزنید.";
+      showToast("آفلاین", "تحلیل نیاز به اتصال دارد.", "AI", false);
     }
     return;
   }
@@ -6301,8 +6227,8 @@ el("analyze").addEventListener("click", async () => {
 });
 
 el("sendSupportTicket")?.addEventListener("click", async () => {
-  if (OFFLINE_MODE || IS_GUEST) {
-    showToast("محدود", "ارسال تیکت در حالت آفلاین/مهمان ممکن نیست.", "SUP", false);
+  if (OFFLINE_MODE) {
+    showToast("آفلاین", "ارسال تیکت در حالت آفلاین ممکن نیست.", "SUP", false);
     return;
   }
   const text = (el("supportTicketText")?.value || "").trim();
