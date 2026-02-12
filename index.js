@@ -1137,6 +1137,38 @@ function randomCode(len = 10) {
 const MARKET_CACHE = new Map();
 const ANALYSIS_CACHE = new Map();
 const MARKET_PROVIDER_FAIL_UNTIL = new Map();
+const PROVIDER_FAILURE_COUNT = new Map();
+
+function providerInCooldown(provider) {
+  const key = String(provider || "").toLowerCase();
+  if (!key) return false;
+  const until = Number(MARKET_PROVIDER_FAIL_UNTIL.get(key) || 0);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    MARKET_PROVIDER_FAIL_UNTIL.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function markProviderSuccess(provider, _scope) {
+  const key = String(provider || "").toLowerCase();
+  if (!key) return;
+  MARKET_PROVIDER_FAIL_UNTIL.delete(key);
+  PROVIDER_FAILURE_COUNT.delete(key);
+}
+
+function markProviderFailure(provider, env, _scope) {
+  const key = String(provider || "").toLowerCase();
+  if (!key) return;
+  const fails = Number(PROVIDER_FAILURE_COUNT.get(key) || 0) + 1;
+  PROVIDER_FAILURE_COUNT.set(key, fails);
+
+  const baseMs = Number(env?.PROVIDER_COOLDOWN_BASE_MS || 5000);
+  const maxMs = Number(env?.PROVIDER_COOLDOWN_MAX_MS || 120000);
+  const cooldownMs = Math.min(maxMs, baseMs * Math.min(16, 2 ** Math.max(0, fails - 1)));
+  MARKET_PROVIDER_FAIL_UNTIL.set(key, Date.now() + cooldownMs);
+}
 
 function cacheGet(map, key) {
   const hit = map.get(key);
@@ -3061,7 +3093,6 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
       lastErr = e;
       markProviderFailure(p, env, "market");
       console.error("market provider failed:", p, e?.message || e);
-      markProviderFailure(p, env);
     }
   }
 
@@ -3135,7 +3166,7 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
       markProviderFailure(p, env, "market");
     } catch (e) {
       lastErr = e;
-      markProviderFailure(p, env);
+      markProviderFailure(p, env, "market");
     }
   }
   throw lastErr || new Error("market_data_alt_failed");
@@ -3802,8 +3833,7 @@ TF: ${tf}
       const symbol = String(st.selectedSymbol || "BTCUSDT").toUpperCase();
       try {
         const rows = await fetchSymbolNewsFa(symbol, env);
-        const lines = (rows || []).slice(0, 5).map((x, i) => `${i + 1}) ${x.title || "-"}`).join("
-");
+        const lines = (rows || []).slice(0, 5).map((x, i) => `${i + 1}) ${x.title || "-"}`).join("\n");
         return tgSendMessage(env, chatId, `📰 اخبار ${symbol}
 
 ${lines || "خبری پیدا نشد."}`, mainMenuKeyboard(env));
@@ -5789,6 +5819,32 @@ function buildAuthBody(extra = {}) {
   return { initData: getFreshInitData(), miniToken: MINI_TOKEN || localStorage.getItem(LOCAL_KEYS.miniToken) || "", ...extra };
 }
 
+function parseMiniTokenStartParam(raw) {
+  const v = String(raw || "").trim();
+  if (!v) return "";
+  try {
+    const qp = new URLSearchParams(v);
+    const t = String(qp.get("miniToken") || qp.get("token") || "").trim();
+    if (t) return t;
+  } catch {}
+  const m = v.match(/(?:^|[?&])(?:miniToken|token)=([^&]+)/i);
+  if (m?.[1]) {
+    try { return decodeURIComponent(m[1]).trim(); } catch { return String(m[1] || "").trim(); }
+  }
+  if (/^[a-f0-9]{24,96}$/i.test(v)) return v;
+  return "";
+}
+
+function getParamEverywhere(name) {
+  const n = String(name || "").trim();
+  if (!n) return "";
+  const q = new URLSearchParams(window.location.search).get(n) || "";
+  if (q) return q;
+  const hash = String(window.location.hash || "").replace(/^#/, "");
+  const h = new URLSearchParams(hash).get(n) || "";
+  return h || "";
+}
+
 function showToast(title, subline = "", badge = "", loading = false){
   if (!toast || !toastT || !toastS || !toastB || !spin) return;
   toastT.textContent = title || "";
@@ -6494,12 +6550,16 @@ async function boot(){
   }
 
   const isTelegramRuntime = !!window.Telegram?.WebApp;
-  const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
+  const qsInitData = getParamEverywhere("initData") || "";
   const savedInitData = localStorage.getItem(LOCAL_KEYS.initData) || "";
-  const qsMiniToken = new URLSearchParams(window.location.search).get("miniToken") || "";
+  const qsMiniToken = getParamEverywhere("miniToken") || getParamEverywhere("token") || "";
+  const startParamToken = parseMiniTokenStartParam(tg?.initDataUnsafe?.start_param || "");
   const savedMiniToken = localStorage.getItem(LOCAL_KEYS.miniToken) || "";
-  if (qsMiniToken) { MINI_TOKEN = qsMiniToken; try { localStorage.setItem(LOCAL_KEYS.miniToken, qsMiniToken); } catch {} }
-  else if (savedMiniToken) { MINI_TOKEN = savedMiniToken; }
+  const resolvedMiniToken = qsMiniToken || startParamToken || savedMiniToken || "";
+  if (resolvedMiniToken) {
+    MINI_TOKEN = resolvedMiniToken;
+    try { localStorage.setItem(LOCAL_KEYS.miniToken, resolvedMiniToken); } catch {}
+  }
   let initData = (tg?.initData || "").trim();
 
   // Telegram WebApp may populate initData with a slight delay.
@@ -6727,22 +6787,18 @@ el("analyze").addEventListener("click", async () => {
   if (chartCard && chartImg) {
       const u = json.chartUrl || "";
       const fallbackSvg = json.zonesSvg || "";
-      if (u) {
+      if (fallbackSvg) {
+        renderChartFallbackSvg(fallbackSvg);
+      } else if (u) {
         chartImg.onerror = () => {
           chartImg.onerror = null;
-          if (fallbackSvg) {
-            renderChartFallbackSvg(fallbackSvg);
-          } else {
-            chartImg.removeAttribute("src");
-            chartCard.style.display = "none";
-          }
+          chartImg.removeAttribute("src");
+          chartCard.style.display = "none";
         };
         chartImg.src = u;
         chartCard.style.display = "block";
         const cm = el("chartMeta");
         if (cm) cm.textContent = "QuickChart";
-      } else if (fallbackSvg) {
-        renderChartFallbackSvg(fallbackSvg);
       } else {
         chartImg.removeAttribute("src");
         chartCard.style.display = "none";
