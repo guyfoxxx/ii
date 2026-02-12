@@ -3093,7 +3093,6 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
       lastErr = e;
       markProviderFailure(p, env, "market");
       console.error("market provider failed:", p, e?.message || e);
-      markProviderFailure(p, env);
     }
   }
 
@@ -3167,7 +3166,7 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
       markProviderFailure(p, env, "market");
     } catch (e) {
       lastErr = e;
-      markProviderFailure(p, env);
+      markProviderFailure(p, env, "market");
     }
   }
   throw lastErr || new Error("market_data_alt_failed");
