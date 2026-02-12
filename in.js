@@ -1030,6 +1030,7 @@ function randomCode(len = 10) {
 
 const MARKET_CACHE = new Map();
 const ANALYSIS_CACHE = new Map();
+const MARKET_PROVIDER_FAIL_UNTIL = new Map();
 
 function cacheGet(map, key) {
   const hit = map.get(key);
@@ -2200,6 +2201,7 @@ async function runTextProviders(prompt, env, orderOverride) {
   const chain = [...new Set(parseOrder(orderOverride || env.TEXT_PROVIDER_ORDER, ["cf","openai","openrouter","deepseek","gemini"]))];
   let lastErr = null;
   for (const p of chain) {
+    if (providerInCooldown(p)) continue;
     try {
       const out = await Promise.race([
         textProvider(p, prompt, env),
@@ -2225,6 +2227,7 @@ async function runPolishProviders(draft, env, orderOverride) {
     `متن:\n${draft}`;
 
   for (const p of chain) {
+    if (providerInCooldown(p)) continue;
     try {
       const out = await Promise.race([
         textProvider(p, polishPrompt, env),
@@ -2498,6 +2501,26 @@ function resolveMarketProviderChain(env, symbol) {
   const filtered = desired.filter((p) => providerSupportsSymbol(p, symbol, env));
   if (filtered.length) return filtered;
   return ["yahoo"];
+}
+
+function rotateProviderChain(chain, symbol, env) {
+  const list = Array.isArray(chain) ? chain.slice() : [];
+  if (list.length <= 1) return list;
+  const rolling = String(env.MARKET_PROVIDER_ROLLING || "1").trim();
+  if (rolling === "0" || rolling.toLowerCase() === "false") return list;
+  const tick = Math.floor(Date.now() / Math.max(30, Number(env.MARKET_PROVIDER_ROLLING_SEC || 60)) / 1000);
+  const seed = (String(symbol || "").length * 7 + tick) % list.length;
+  return list.slice(seed).concat(list.slice(0, seed));
+}
+
+function markProviderFailure(provider, env) {
+  const coolSec = Math.max(5, Number(env.MARKET_PROVIDER_COOLDOWN_SEC || 45));
+  MARKET_PROVIDER_FAIL_UNTIL.set(String(provider || ""), Date.now() + coolSec * 1000);
+}
+
+function providerInCooldown(provider) {
+  const until = Number(MARKET_PROVIDER_FAIL_UNTIL.get(String(provider || "")) || 0);
+  return until > Date.now();
 }
 
 function mapTimeframeToBinance(tf) {
@@ -2796,10 +2819,11 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
   const cached = await getMarketCache(env, cacheKey);
   if (Array.isArray(cached) && cached.length >= Math.min(6, minNeed)) return cached;
 
-  const chain = resolveMarketProviderChain(env, symbol);
+  const chain = rotateProviderChain(resolveMarketProviderChain(env, symbol), symbol, env);
   let lastErr = null;
 
   for (const p of chain) {
+    if (providerInCooldown(p)) continue;
     try {
       let candles = null;
       if (p === "binance") candles = await fetchBinanceCandles(symbol, tf, limit, timeoutMs);
@@ -2814,6 +2838,7 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
     } catch (e) {
       lastErr = e;
       console.error("market provider failed:", p, e?.message || e);
+      markProviderFailure(p, env);
     }
   }
 
@@ -2868,9 +2893,10 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
   const cacheKey = marketCacheKey(symbol, timeframe);
   const cached = await getMarketCache(env, cacheKey);
   if (Array.isArray(cached) && cached.length) return cached;
-  const chain = resolveMarketProviderChain(env, symbol);
+  const chain = rotateProviderChain(resolveMarketProviderChain(env, symbol), symbol, env);
   let lastErr = null;
   for (const p of chain) {
+    if (providerInCooldown(p)) continue;
     try {
       let candles = null;
       if (p === "binance") candles = await fetchBinanceCandles(symbol, timeframe, limit, timeoutMs);
@@ -2884,6 +2910,7 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
       }
     } catch (e) {
       lastErr = e;
+      markProviderFailure(p, env);
     }
   }
   throw lastErr || new Error("market_data_alt_failed");
@@ -2894,13 +2921,18 @@ async function fetchSymbolNewsFa(symbol, env) {
   const timeoutMs = Number(env.NEWS_TIMEOUT_MS || 9000);
   const limit = Math.min(8, Math.max(3, Number(env.NEWS_ITEMS_LIMIT || 6)));
 
-  const urls = [
+  const urlsBase = [
     "https://news.google.com/rss/search?q=" + encodeURIComponent(query) + "&hl=fa&gl=IR&ceid=IR:fa",
     "https://news.google.com/rss/search?q=" + encodeURIComponent(symbol + " market") + "&hl=fa&gl=IR&ceid=IR:fa",
+    "https://www.bing.com/news/search?q=" + encodeURIComponent(query) + "&format=rss&setlang=fa",
   ];
+  const ext = String(env.NEWS_FEEDS_EXTRA || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const urls = urlsBase.concat(ext);
+  const shift = urls.length ? (Math.floor(Date.now() / 60000) + String(symbol || "").length) % urls.length : 0;
+  const rolledUrls = urls.slice(shift).concat(urls.slice(0, shift));
 
   let lastErr = null;
-  for (const u of urls) {
+  for (const u of rolledUrls) {
     try {
       const r = await fetchWithTimeout(u, { headers: { "User-Agent": "Mozilla/5.0" } }, timeoutMs);
       if (!r.ok) throw new Error("news_http_" + r.status);
@@ -5456,7 +5488,8 @@ async function api(path, body){
   for (let i = 0; i < 2; i++) {
     try {
       const ac = new AbortController();
-      const tm = setTimeout(() => ac.abort("timeout"), 12000 + (i * 4000));
+      const isBootUser = String(path || "") === "/api/user";
+      const tm = setTimeout(() => ac.abort("timeout"), (isBootUser ? 7000 : 12000) + (i * 2500));
       const r = await fetch(API_BASE + path, {        method: "POST",
         headers: {"content-type":"application/json"},
         body: JSON.stringify(body),
@@ -5964,6 +5997,15 @@ async function boot(){
   out.textContent = "⏳ در حال آماده‌سازی…";
   pillTxt.textContent = "Connecting…";
   showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
+
+  const preCached = readCachedUserSnapshot();
+  if (preCached) {
+    applyUserState(preCached);
+    out.textContent = "⏳ در حال همگام‌سازی با سرور…";
+    pillTxt.textContent = "Syncing…";
+    setupLiveQuotePolling();
+    setupNewsPolling();
+  }
 
   const isTelegramRuntime = !!window.Telegram?.WebApp;
   const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
