@@ -1556,21 +1556,10 @@ async function getOfferBannerImage(env) {
   return (raw || env.SPECIAL_OFFER_IMAGE || "").toString().trim();
 }
 
-async function setOfferBannerImage(env, image) {
-  if (!env.BOT_KV) return;
-  await env.BOT_KV.put("settings:offer_banner_image", String(image || "").trim());
-}
 
-async function setOfferBanner(env, text) {
-  if (!env.BOT_KV) return;
-  await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
-}
 
-async function getOfferBannerImage(env) {
-  if (!env.BOT_KV) return "";
-  const raw = await env.BOT_KV.get("settings:offer_banner_image");
-  return String(raw || "").trim();
-}
+
+
 
 async function setOfferBannerImage(env, dataUrl) {
   if (!env.BOT_KV) return;
@@ -3835,7 +3824,7 @@ TF: ${tf}
       const symbol = String(st.selectedSymbol || "BTCUSDT").toUpperCase();
       try {
         const rows = await fetchSymbolNewsFa(symbol, env);
-        const lines = (rows || []).slice(0, 5).map((x, i) => `${i + 1}) ${x.title || "-"}`).join(String.fromCharCode(10));
+        const lines = (rows || []).slice(0, 5).map((x, i) => `${i + 1}) ${x.title || "-"}`).join("\n");
         return tgSendMessage(env, chatId, `📰 اخبار ${symbol}
 
 ${lines || "خبری پیدا نشد."}`, mainMenuKeyboard(env));
