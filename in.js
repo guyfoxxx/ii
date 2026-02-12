@@ -5363,6 +5363,35 @@ let QUOTE_BUSY = false;
 let NEWS_TIMER = null;
 const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
 
+
+function storageGet(key){
+  try { return localStorage.getItem(key) || ""; } catch { return ""; }
+}
+function storageSet(key, val){
+  try { localStorage.setItem(key, String(val || "")); } catch {}
+}
+function storageRemove(key){
+  try { localStorage.removeItem(key); } catch {}
+}
+
+function extractInitDataFromLocation(){
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const fromQuery = q.get("tgWebAppData") || q.get("initData") || "";
+    if (fromQuery) return fromQuery;
+  } catch {}
+
+  try {
+    const h = String(window.location.hash || "").replace(/^#/, "");
+    if (!h) return "";
+    const hp = new URLSearchParams(h);
+    const raw = hp.get("tgWebAppData") || hp.get("initData") || "";
+    return raw ? decodeURIComponent(raw) : "";
+  } catch {
+    return "";
+  }
+}
+
 function showToast(title, subline = "", badge = "", loading = false){
   if (!toast || !toastT || !toastS || !toastB || !spin) return;
   toastT.textContent = title || "";
@@ -5824,8 +5853,8 @@ async function boot(){
   showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
 
   const isTelegramRuntime = !!window.Telegram?.WebApp;
-  const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
-  const savedInitData = localStorage.getItem("miniapp_init_data") || "";
+  const qsInitData = extractInitDataFromLocation();
+  const savedInitData = storageGet("miniapp_init_data");
   let initData = (tg?.initData || "").trim();
 
   // Telegram WebApp may populate initData with a slight delay.
@@ -5836,16 +5865,16 @@ async function boot(){
 
   if (initData) {
     INIT_DATA = initData;
-    localStorage.setItem("miniapp_init_data", initData);
+    storageSet("miniapp_init_data", initData);
   } else if (qsInitData) {
     INIT_DATA = qsInitData;
-    localStorage.setItem("miniapp_init_data", qsInitData);
+    storageSet("miniapp_init_data", qsInitData);
   } else if (savedInitData && !isTelegramRuntime) {
     INIT_DATA = savedInitData;
   } else if (!isTelegramRuntime) {
     const devInit = "dev:999001";
     INIT_DATA = devInit;
-    localStorage.setItem("miniapp_init_data", devInit);
+    storageSet("miniapp_init_data", devInit);
     showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
   } else {
     hideToast();
@@ -5853,11 +5882,12 @@ async function boot(){
     out.textContent = "⚠️ اتصال مینی‌اپ برقرار نیست. " + CONNECTION_HINT;
     return;
   }
+
   const {status, json} = await api("/api/user", { initData: INIT_DATA });
 
   if (!json?.ok) {
     if (status === 401) {
-      try { localStorage.removeItem("miniapp_init_data"); } catch {}
+      storageRemove("miniapp_init_data");
     }
     hideToast();
     pillTxt.textContent = "Offline";
@@ -6344,7 +6374,12 @@ el("downloadReportPdf")?.addEventListener("click", async () => {
   }
 });
 
-boot();`;
+boot().catch((e) => {
+  console.error("miniapp boot failed:", e);
+  if (out) out.textContent = "⚠️ خطای داخلی مینی‌اپ. یک‌بار رفرش کنید.";
+  if (pillTxt) pillTxt.textContent = "Offline";
+  showToast("خطا", "اجرای مینی‌اپ با خطا متوقف شد", "JS", false);
+});`;
 
 
 async function runDailySuggestions(env) {
