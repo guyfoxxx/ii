@@ -36,6 +36,7 @@ export default {
         const st = await ensureUser(v.userId, env);
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
         const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
+        const miniToken = await issueMiniappToken(env, v.userId, v.fromLike || {});
         const styles = await getStyleList(env);
         const [offerBanner, offerBannerImage] = await Promise.all([getOfferBanner(env), getOfferBannerImage(env)]);
         const customPrompts = await getCustomPrompts(env);
@@ -60,6 +61,7 @@ export default {
             timezone: st.profile?.timezone || "Asia/Tehran",
             entrySource: st.profile?.entrySource || "",
           },
+          miniToken,
         });
       }
 
@@ -325,7 +327,7 @@ ${reply}`;
           const withdrawals = await listWithdrawals(env, 120);
           const tickets = await listSupportTickets(env, 120);
           const lines = buildAdminReportLines(users, payments, withdrawals, tickets);
-          const pdfBytes = buildSimplePdfFromText(lines.join("\n"));
+          const pdfBytes = buildSimplePdfFromText(lines.join(String.fromCharCode(10)));
           return new Response(pdfBytes, {
             status: 200,
             headers: {
@@ -1414,7 +1416,7 @@ function getStyleGuide(style) {
       "[پرایس اکشن]", STYLE_PROMPTS_DEFAULT["پرایس اکشن"] || "",
       "[ICT]", STYLE_PROMPTS_DEFAULT["ICT"] || "",
       "[ATR]", STYLE_PROMPTS_DEFAULT["ATR"] || "",
-    ].join("\n").trim();
+    ].join(String.fromCharCode(10)).trim();
   }
   return STYLE_PROMPTS_DEFAULT[key] || "";
 }
@@ -3250,7 +3252,7 @@ async function buildNewsBlockForSymbol(symbol, env, maxItems = 4) {
       const src = x?.source ? (" | " + x.source) : "";
       const dt = x?.publishedAt ? (" | " + x.publishedAt) : "";
       return (i + 1) + ") " + String(x?.title || "") + src + dt;
-    }).join("\n");
+    }).join(String.fromCharCode(10));
   } catch {
     return "";
   }
@@ -3265,7 +3267,7 @@ function parseNewsBlockRows(newsBlock) {
 async function buildNewsAnalysisSummary(symbol, articles, env) {
   const rows = Array.isArray(articles) ? articles.slice(0, 5) : [];
   if (!rows.length) return "برای این نماد خبر کافی جهت جمع‌بندی خبری در دسترس نیست.";
-  const top = rows.map((a, i) => `${i + 1}) ${String(a?.title || "")}`).join("\n");
+  const top = rows.map((a, i) => `${i + 1}) ${String(a?.title || "")}`).join(String.fromCharCode(10));
   const prompt = [
     "تحلیل‌گر خبر بازار مالی هستی.",
     `نماد: ${symbol}`,
@@ -3276,7 +3278,7 @@ async function buildNewsAnalysisSummary(symbol, articles, env) {
     "خیال‌بافی نکن و فقط بر اساس تیترها بنویس.",
     "TIERS:",
     top,
-  ].join("\n");
+  ].join(String.fromCharCode(10));
   try {
     const out = await runTextProviders(prompt, env, env.TEXT_PROVIDER_ORDER);
     return String(out || "").trim() || "جمع‌بندی خبری تولید نشد.";
@@ -3349,7 +3351,7 @@ function computeSnapshot(candles) {
 
 function candlesToCompactCSV(candles, maxRows = 80) {
   const tail = candles.slice(-maxRows);
-  return tail.map(x => `${x.t},${x.o},${x.h},${x.l},${x.c}`).join("\n");
+  return tail.map(x => `${x.t},${x.o},${x.h},${x.l},${x.c}`).join(String.fromCharCode(10));
 }
 
 function minCandlesForTimeframe(tf) {
@@ -3384,7 +3386,7 @@ function buildLocalFallbackAnalysis(symbol, st, candles, reason = "") {
     "",
     "۵) وضعیت سرویس",
     `تحلیل با فالبک داخلی تولید شد (${reason || "text_provider_unavailable"}).`,
-  ].join("\n");
+  ].join(String.fromCharCode(10));
 }
 
 /* ========================== TEXT BUILDERS ========================== */
@@ -3892,7 +3894,7 @@ ${finalUrl}`, kbInline);
       st.state = "support_faq";
       await saveUser(userId, st, env);
       const faq = getSupportFaq();
-      const list = faq.map((f, i) => `${i + 1}) ${f.q}`).join("\n");
+      const list = faq.map((f, i) => `${i + 1}) ${f.q}`).join(String.fromCharCode(10));
       return tgSendMessage(env, chatId, `❓ سوالات آماده\n\n${list}\n\nعدد سوال را ارسال کن تا پاسخ را ببینی.`, kb([[BTN.BACK, BTN.HOME]]));
     }
 
@@ -4035,7 +4037,7 @@ ${finalUrl}`, kbInline);
       st.state = "support_faq";
       await saveUser(userId, st, env);
       const faq = getSupportFaq();
-      const list = faq.map((f, i) => `${i + 1}) ${f.q}`).join("\n");
+      const list = faq.map((f, i) => `${i + 1}) ${f.q}`).join(String.fromCharCode(10));
       return tgSendMessage(env, chatId, `❓ سوالات آماده\n\n${list}\n\nعدد سوال را ارسال کن تا پاسخ را ببینی.`, kb([[BTN.BACK, BTN.HOME]]));
     }
 
@@ -4377,7 +4379,7 @@ async function sendUsersList(env, chatId) {
     return `• ${name} | ${username} | ${phone} | استفاده: ${used} | امتیاز: ${pts} | دعوت: ${inv}`;
   });
 
-  return tgSendMessage(env, chatId, "👥 کاربران (۲۰ تای اول):\n\n" + lines.join("\n"), mainMenuKeyboard(env));
+  return tgSendMessage(env, chatId, "👥 کاربران (۲۰ تای اول):\n\n" + lines.join(String.fromCharCode(10)), mainMenuKeyboard(env));
 }
 
 function maskPhone(p) {
@@ -4485,6 +4487,16 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
     c: Number(c.c),
   })).filter((x) => Number.isFinite(x.x) && Number.isFinite(x.o) && Number.isFinite(x.h) && Number.isFinite(x.l) && Number.isFinite(x.c));
 
+  const zoneLines = (levels || []).slice(0, 8).map((lvl, idx) => ({
+    type: "line",
+    scaleID: "y",
+    value: Number(lvl),
+    borderColor: idx % 2 === 0 ? "#00d1ff" : "#ff8a65",
+    borderWidth: 1.5,
+    borderDash: [6, 4],
+    label: { enabled: true, content: `Z${idx + 1}` },
+  })).filter((x) => Number.isFinite(x.value));
+
   const cfg = {
     type: "candlestick",
     data: {
@@ -4498,7 +4510,10 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
     },
     options: {
       parsing: false,
-      plugins: { legend: { display: false } },
+      plugins: {
+        legend: { display: false },
+        annotation: { annotations: zoneLines },
+      },
       scales: {
         x: { ticks: { maxRotation: 0, autoSkip: true } },
       },
@@ -4506,7 +4521,7 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
   };
 
   const encoded = encodeURIComponent(JSON.stringify(cfg));
-  return `https://quickchart.io/chart?version=4&format=png&w=900&h=450&devicePixelRatio=2&plugins=chartjs-chart-financial&c=${encoded}`;
+  return `https://quickchart.io/chart?version=4&format=png&w=900&h=450&devicePixelRatio=2&plugins=chartjs-chart-financial,chartjs-plugin-annotation&c=${encoded}`;
 }
 
 function buildQuickChartLevelsOnlyUrl(symbol, tf, levels = []) {
@@ -4574,7 +4589,7 @@ function buildSimplePdfFromText(text) {
     else streamLines.push(`T* (${escaped[i]}) Tj`);
   }
   streamLines.push("ET");
-  const stream = streamLines.join("\n");
+  const stream = streamLines.join(String.fromCharCode(10));
 
   const objects = [];
   objects.push("1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n");
@@ -4826,7 +4841,7 @@ function buildLevelsOnlySvg(symbol, timeframe, levels = []) {
     const y = yFor(p);
     const c = i % 2 === 0 ? "#2FE3A5" : "#FFB020";
     return `<line x1="${pad}" y1="${y}" x2="${width-pad}" y2="${y}" stroke="${c}" stroke-width="2" stroke-dasharray="6 6"/><text x="${width-pad-8}" y="${y-6}" fill="${c}" font-size="22" text-anchor="end">${p}</text>`;
-  }).join("\n");
+  }).join(String.fromCharCode(10));
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
   <rect width="100%" height="100%" fill="#0B0F17"/>
@@ -5037,7 +5052,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const pairs = [];
   params.forEach((v, k) => pairs.push([k, v]));
   pairs.sort((a, b) => a[0].localeCompare(b[0]));
-  const dataCheckString = pairs.map(([k, v]) => `${k}=${v}`).join("\n");
+  const dataCheckString = pairs.map(([k, v]) => `${k}=${v}`).join(String.fromCharCode(10));
 
   const secretKey = await hmacSha256Raw(utf8("WebAppData"), utf8(botToken));
   const sigHex = await hmacSha256Hex(secretKey, utf8(dataCheckString));
@@ -6276,7 +6291,7 @@ function renderTickets(list, keepMaster = false){
     target.textContent = items.slice(0, 25).map((t) => {
       const who = t.username ? ("@"+String(t.username).replace(/^@/,"")) : (t.userId || "-");
       return "• " + t.id + " | " + who + " | " + (t.status || "pending") + " | " + shortText(t.text, 80);
-    }).join("\n");
+    }).join(String.fromCharCode(10));
   }
 }
 
@@ -6307,7 +6322,7 @@ function renderWithdrawals(list){
   if (target){
     target.textContent = items.slice(0, 25).map((w) => {
       return "• " + w.id + " | " + (w.userId || "-") + " | " + (w.amount || 0) + " | " + (w.status || "pending") + " | " + shortText(w.address, 32);
-    }).join("\n");
+    }).join(String.fromCharCode(10));
   }
 }
 
@@ -6341,7 +6356,7 @@ function renderPromptReqs(list){
       const who = r.username ? ("@"+String(r.username).replace(/^@/,"")) : (r.userId || "-");
       const pid = r.promptId ? (" | prompt:" + r.promptId) : "";
       return "• " + r.id + " | " + who + " | " + (r.status || "pending") + pid;
-    }).join("\n");
+    }).join(String.fromCharCode(10));
   }
 }
 
@@ -6420,7 +6435,7 @@ function renderFullAdminReport(users, payments, withdrawals, tickets) {
     "➖ برداشت‌ها:", ...(wdBlock.length ? wdBlock : ["—"]),
     "",
     "🎫 تیکت‌ها:", ...(tkBlock.length ? tkBlock : ["—"]),
-  ].join("\n");
+  ].join(String.fromCharCode(10));
 }
 
 function safeJsonParse(text, fallback) {
@@ -6574,7 +6589,16 @@ async function boot(){
     INIT_DATA = "";
     showToast("حالت مهمان", "اتصال احراز نشده؛ اجرای محدود با داده عمومی", "GUEST", false);
   }
-  const {status, json} = await api("/api/user", buildAuthBody({ allowGuest: true }));
+  let {status, json} = await api("/api/user", buildAuthBody({ allowGuest: true }));
+
+  if (!json?.ok && status === 401 && (MINI_TOKEN || localStorage.getItem(LOCAL_KEYS.miniToken))) {
+    const initBackup = INIT_DATA;
+    INIT_DATA = "";
+    const retry = await api("/api/user", buildAuthBody({ allowGuest: true }));
+    status = retry.status;
+    json = retry.json;
+    if (!json?.ok) INIT_DATA = initBackup;
+  }
 
   if (!json?.ok) {
     if (status === 401) {
@@ -6619,6 +6643,10 @@ async function boot(){
   }
 
   OFFLINE_MODE = false;
+  if (json?.miniToken) {
+    MINI_TOKEN = String(json.miniToken || "").trim();
+    try { localStorage.setItem(LOCAL_KEYS.miniToken, MINI_TOKEN); } catch {}
+  }
   cacheUserSnapshot(json);
   applyUserState(json);
   out.textContent = "آماده ✅";
@@ -7208,7 +7236,7 @@ async function runDailySuggestions(env) {
     const cap = u.capital?.enabled === false ? "" : (u.capital?.amount ? (" | سرمایه: " + u.capital.amount) : "");
     const articles = await fetchSymbolNewsFa(symbol, env).catch(() => []);
     const newsBlock = Array.isArray(articles) && articles.length
-      ? articles.slice(0, 2).map((x, i) => `${i + 1}) ${x?.title || ""}`).join("\n")
+      ? articles.slice(0, 2).map((x, i) => `${i + 1}) ${x?.title || ""}`).join(String.fromCharCode(10))
       : "";
     const newsLine = newsBlock
       ? ("\n\n📰 خبر مرتبط " + symbol + ":\n" + newsBlock)
