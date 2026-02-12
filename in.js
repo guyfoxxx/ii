@@ -329,8 +329,9 @@ ${reply}`;
           return jsonResponse({ ok: true, capital: st.capital });
         }
 
+
         if (url.pathname === "/api/admin/withdrawals/list") {
-          const withdrawals = await listWithdrawals(env, 100);
+          const withdrawals = await listWithdrawals(env, 200);
           return jsonResponse({ ok: true, withdrawals });
         }
 
@@ -343,8 +344,6 @@ ${reply}`;
           return jsonResponse({ ok: true, withdrawal: updated });
         }
 
-
-
         if (url.pathname === "/api/admin/payments/decision") {
           const paymentId = String(body.paymentId || "").trim();
           const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
@@ -360,75 +359,18 @@ ${reply}`;
           return jsonResponse({ ok: true, payment });
         }
 
-        if (url.pathname === "/api/admin/withdrawals/list") {
-          return jsonResponse({ ok: true, withdrawals: await listWithdrawals(env, 200) });
-        }
-
+        // Backward-compat alias for older admin clients
         if (url.pathname === "/api/admin/withdrawals/decision") {
-          const id = String(body.withdrawalId || "").trim();
-          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
-          if (!id) return jsonResponse({ ok: false, error: "withdrawal_id_required" }, 400);
-
-          if (env.BOT_DB) {
-            await env.BOT_DB.prepare("UPDATE withdrawals SET status=?1 WHERE id=?2").bind(status, id).run();
-          }
-          if (env.BOT_KV) {
-            const raw = await env.BOT_KV.get(`withdraw:${id}`);
-            if (raw) {
-              try {
-                const w = JSON.parse(raw);
-                w.status = status;
-                w.reviewedAt = new Date().toISOString();
-                w.reviewedBy = normHandle(v.fromLike?.username);
-                await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(w));
-              } catch {}
-            }
-          }
-          return jsonResponse({ ok: true, status, withdrawalId: id });
+          const id = String(body.withdrawalId || body.id || "").trim();
+          const decisionRaw = String(body.status || body.decision || "").trim();
+          const decision = decisionRaw === "approved" ? "approved" : (decisionRaw === "rejected" ? "rejected" : "");
+          const txHash = String(body.txHash || "").trim();
+          if (!id || !decision) return jsonResponse({ ok: false, error: "bad_request" }, 400);
+          const updated = await reviewWithdrawal(env, id, decision, txHash, v.fromLike);
+          return jsonResponse({ ok: true, withdrawal: updated });
         }
 
 
-        if (url.pathname === "/api/admin/payments/decision") {
-          const paymentId = String(body.paymentId || "").trim();
-          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
-          const raw = env.BOT_KV ? await env.BOT_KV.get(`payment:${paymentId}`) : "";
-          if (!raw) return jsonResponse({ ok: false, error: "payment_not_found" }, 404);
-          let payment = null;
-          try { payment = JSON.parse(raw); } catch {}
-          if (!payment) return jsonResponse({ ok: false, error: "payment_bad_json" }, 500);
-          payment.status = status;
-          payment.reviewedAt = new Date().toISOString();
-          payment.reviewedBy = normHandle(v.fromLike?.username);
-          if (env.BOT_KV) await env.BOT_KV.put(`payment:${paymentId}`, JSON.stringify(payment));
-          return jsonResponse({ ok: true, payment });
-        }
-
-        if (url.pathname === "/api/admin/withdrawals/list") {
-          return jsonResponse({ ok: true, withdrawals: await listWithdrawals(env, 200) });
-        }
-
-        if (url.pathname === "/api/admin/withdrawals/decision") {
-          const id = String(body.withdrawalId || "").trim();
-          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
-          if (!id) return jsonResponse({ ok: false, error: "withdrawal_id_required" }, 400);
-
-          if (env.BOT_DB) {
-            await env.BOT_DB.prepare("UPDATE withdrawals SET status=?1 WHERE id=?2").bind(status, id).run();
-          }
-          if (env.BOT_KV) {
-            const raw = await env.BOT_KV.get(`withdraw:${id}`);
-            if (raw) {
-              try {
-                const w = JSON.parse(raw);
-                w.status = status;
-                w.reviewedAt = new Date().toISOString();
-                w.reviewedBy = normHandle(v.fromLike?.username);
-                await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(w));
-              } catch {}
-            }
-          }
-          return jsonResponse({ ok: true, status, withdrawalId: id });
-        }
 
         if (url.pathname === "/api/admin/payments/approve") {
           const username = String(body.username || "").trim();
@@ -5376,6 +5318,35 @@ let QUOTE_BUSY = false;
 let NEWS_TIMER = null;
 const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
 
+
+function storageGet(key){
+  try { return localStorage.getItem(key) || ""; } catch { return ""; }
+}
+function storageSet(key, val){
+  try { localStorage.setItem(key, String(val || "")); } catch {}
+}
+function storageRemove(key){
+  try { localStorage.removeItem(key); } catch {}
+}
+
+function extractInitDataFromLocation(){
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const fromQuery = q.get("tgWebAppData") || q.get("initData") || "";
+    if (fromQuery) return fromQuery;
+  } catch {}
+
+  try {
+    const h = String(window.location.hash || "").replace(/^#/, "");
+    if (!h) return "";
+    const hp = new URLSearchParams(h);
+    const raw = hp.get("tgWebAppData") || hp.get("initData") || "";
+    return raw ? decodeURIComponent(raw) : "";
+  } catch {
+    return "";
+  }
+}
+
 function showToast(title, subline = "", badge = "", loading = false){
   if (!toast || !toastT || !toastS || !toastB || !spin) return;
   toastT.textContent = title || "";
@@ -5893,6 +5864,7 @@ async function boot(){
   const isTelegramRuntime = !!window.Telegram?.WebApp;
   const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
   const savedInitData = localStorage.getItem(LOCAL_KEYS.initData) || "";
+
   let initData = (tg?.initData || "").trim();
 
   // Telegram WebApp may populate initData with a slight delay.
@@ -5902,17 +5874,19 @@ async function boot(){
   }
 
   if (initData) {
-    INIT_DATA = initData;
+    INIT_DATA = initData;<<<<<<< codex/fix-payment-system-and-mini-app-functions
     localStorage.setItem(LOCAL_KEYS.initData, initData);
   } else if (qsInitData) {
     INIT_DATA = qsInitData;
     localStorage.setItem(LOCAL_KEYS.initData, qsInitData);
+
   } else if (savedInitData && !isTelegramRuntime) {
     INIT_DATA = savedInitData;
   } else if (!isTelegramRuntime) {
     const devInit = "dev:999001";
     INIT_DATA = devInit;
     localStorage.setItem(LOCAL_KEYS.initData, devInit);
+
     showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
   } else {
     hideToast();
@@ -5920,6 +5894,7 @@ async function boot(){
     out.textContent = "⚠️ اتصال مینی‌اپ برقرار نیست. " + CONNECTION_HINT;
     return;
   }
+
   const {status, json} = await api("/api/user", { initData: INIT_DATA });
 
   if (!json?.ok) {
@@ -5933,6 +5908,7 @@ async function boot(){
       out.textContent = "⚠️ خطا: " + prettyErr(json, status);
       showToast("خطا", prettyErr(json, status), "API", false);
       return;
+
     }
     OFFLINE_MODE = true;
     applyUserState(cached);
