@@ -2395,9 +2395,14 @@ async function runTextProviders(prompt, env, orderOverride) {
         textProvider(p, prompt, env),
         timeoutPromise(TIMEOUT_TEXT_MS, `text_${p}_timeout`)
       ]);
-      if (out && String(out).trim()) return String(out).trim();
+      if (out && String(out).trim()) {
+        markProviderSuccess(p, "text");
+        return String(out).trim();
+      }
+      markProviderFailure(p, env, "text");
     } catch (e) {
       lastErr = e;
+      markProviderFailure(p, env, "text");
       console.error("text provider failed:", p, e?.message || e);
     }
   }
@@ -2421,8 +2426,13 @@ async function runPolishProviders(draft, env, orderOverride) {
         textProvider(p, polishPrompt, env),
         timeoutPromise(TIMEOUT_POLISH_MS, `polish_${p}_timeout`)
       ]);
-      if (out && String(out).trim()) return String(out).trim();
+      if (out && String(out).trim()) {
+        markProviderSuccess(p, "polish");
+        return String(out).trim();
+      }
+      markProviderFailure(p, env, "polish");
     } catch (e) {
+      markProviderFailure(p, env, "polish");
       console.error("polish provider failed:", p, e?.message || e);
     }
   }
@@ -3042,10 +3052,14 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
       if (p === "yahoo") candles = await fetchYahooChartCandles(symbol, tf, limit, timeoutMs);
       if (Array.isArray(candles) && candles.length) {
         await setMarketCache(env, cacheKey, candles);
+        markProviderSuccess(p, "market");
         if (candles.length >= minNeed) return candles;
+      } else {
+        markProviderFailure(p, env, "market");
       }
     } catch (e) {
       lastErr = e;
+      markProviderFailure(p, env, "market");
       console.error("market provider failed:", p, e?.message || e);
       markProviderFailure(p, env);
     }
@@ -3115,8 +3129,10 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
       if (p === "yahoo") candles = await fetchYahooChartCandles(symbol, timeframe, limit, timeoutMs);
       if (Array.isArray(candles) && candles.length) {
         await setMarketCache(env, cacheKey, candles);
+        markProviderSuccess(p, "market");
         return candles;
       }
+      markProviderFailure(p, env, "market");
     } catch (e) {
       lastErr = e;
       markProviderFailure(p, env);
