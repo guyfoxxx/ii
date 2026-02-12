@@ -1137,6 +1137,38 @@ function randomCode(len = 10) {
 const MARKET_CACHE = new Map();
 const ANALYSIS_CACHE = new Map();
 const MARKET_PROVIDER_FAIL_UNTIL = new Map();
+const PROVIDER_FAILURE_COUNT = new Map();
+
+function providerInCooldown(provider) {
+  const key = String(provider || "").toLowerCase();
+  if (!key) return false;
+  const until = Number(MARKET_PROVIDER_FAIL_UNTIL.get(key) || 0);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    MARKET_PROVIDER_FAIL_UNTIL.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function markProviderSuccess(provider, _scope) {
+  const key = String(provider || "").toLowerCase();
+  if (!key) return;
+  MARKET_PROVIDER_FAIL_UNTIL.delete(key);
+  PROVIDER_FAILURE_COUNT.delete(key);
+}
+
+function markProviderFailure(provider, env, _scope) {
+  const key = String(provider || "").toLowerCase();
+  if (!key) return;
+  const fails = Number(PROVIDER_FAILURE_COUNT.get(key) || 0) + 1;
+  PROVIDER_FAILURE_COUNT.set(key, fails);
+
+  const baseMs = Number(env?.PROVIDER_COOLDOWN_BASE_MS || 5000);
+  const maxMs = Number(env?.PROVIDER_COOLDOWN_MAX_MS || 120000);
+  const cooldownMs = Math.min(maxMs, baseMs * Math.min(16, 2 ** Math.max(0, fails - 1)));
+  MARKET_PROVIDER_FAIL_UNTIL.set(key, Date.now() + cooldownMs);
+}
 
 function cacheGet(map, key) {
   const hit = map.get(key);
@@ -1522,21 +1554,10 @@ async function getOfferBannerImage(env) {
   return (raw || env.SPECIAL_OFFER_IMAGE || "").toString().trim();
 }
 
-async function setOfferBannerImage(env, image) {
-  if (!env.BOT_KV) return;
-  await env.BOT_KV.put("settings:offer_banner_image", String(image || "").trim());
-}
 
-async function setOfferBanner(env, text) {
-  if (!env.BOT_KV) return;
-  await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
-}
 
-async function getOfferBannerImage(env) {
-  if (!env.BOT_KV) return "";
-  const raw = await env.BOT_KV.get("settings:offer_banner_image");
-  return String(raw || "").trim();
-}
+
+
 
 async function setOfferBannerImage(env, dataUrl) {
   if (!env.BOT_KV) return;
@@ -3802,8 +3823,7 @@ TF: ${tf}
       const symbol = String(st.selectedSymbol || "BTCUSDT").toUpperCase();
       try {
         const rows = await fetchSymbolNewsFa(symbol, env);
-        const lines = (rows || []).slice(0, 5).map((x, i) => `${i + 1}) ${x.title || "-"}`).join("
-");
+        const lines = (rows || []).slice(0, 5).map((x, i) => `${i + 1}) ${x.title || "-"}`).join("\n");
         return tgSendMessage(env, chatId, `📰 اخبار ${symbol}
 
 ${lines || "خبری پیدا نشد."}`, mainMenuKeyboard(env));
