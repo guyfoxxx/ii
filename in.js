@@ -4486,6 +4486,23 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
     c: Number(c.c),
   })).filter((x) => Number.isFinite(x.x) && Number.isFinite(x.o) && Number.isFinite(x.h) && Number.isFinite(x.l) && Number.isFinite(x.c));
 
+  const zoneLines = (levels || []).map((v) => Number(v)).filter((v) => Number.isFinite(v)).slice(0, 8).map((lvl, idx) => ({
+    type: "line",
+    scaleID: "y",
+    value: lvl,
+    borderColor: idx < 2 ? "#00d1ff" : (idx < 4 ? "#ffb020" : "#ff6b6b"),
+    borderWidth: idx < 2 ? 2 : 1.4,
+    borderDash: idx < 2 ? [] : [6, 4],
+    label: {
+      enabled: true,
+      backgroundColor: "rgba(10,15,28,.78)",
+      color: "#fff",
+      content: `Z${idx + 1}: ${lvl.toFixed(4)}`,
+      position: "end",
+      yAdjust: -2,
+    },
+  }));
+
   const cfg = {
     type: "candlestick",
     data: {
@@ -4499,7 +4516,10 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
     },
     options: {
       parsing: false,
-      plugins: { legend: { display: false } },
+      plugins: {
+        legend: { display: false },
+        annotation: { annotations: zoneLines },
+      },
       scales: {
         x: { ticks: { maxRotation: 0, autoSkip: true } },
       },
@@ -4507,7 +4527,7 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
   };
 
   const encoded = encodeURIComponent(JSON.stringify(cfg));
-  return `https://quickchart.io/chart?version=4&format=png&w=900&h=450&devicePixelRatio=2&plugins=chartjs-chart-financial&c=${encoded}`;
+  return `https://quickchart.io/chart?version=4&format=png&w=900&h=450&devicePixelRatio=2&plugins=chartjs-chart-financial,chartjs-plugin-annotation&c=${encoded}`;
 }
 
 function buildQuickChartLevelsOnlyUrl(symbol, tf, levels = []) {
