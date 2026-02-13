@@ -3935,8 +3935,7 @@ ${summary || "تحلیل خبری در دسترس نیست."}`, mainMenuKeyboard
       return tgSendMessage(env, chatId, `🧩 مینی‌اپ فعال شد.
 
 از دکمه زیر وارد شوید. اگر دکمه باز نشد، این لینک را مستقیم باز کنید:
-${url}\n\nچک‌لیست سریع اتصال:
-${MINIAPP_EXEC_CHECKLIST}`, kbInline);
+${url}`, kbInline);
     }
 
 
@@ -6236,7 +6235,7 @@ function prettyErr(j, status){
   if (status === 403 && String(e) === "forbidden") return "دسترسی این بخش برای نقش فعلی شما مجاز نیست.";
   if (status === 401) {
     if (String(e).includes("initData")) return "اتصال مینی‌اپ منقضی شده؛ اپ را مجدد از داخل تلگرام باز کنید.";
-    return "احراز هویت تلگرام ناموفق است.\n\n" + MINIAPP_EXEC_CHECKLIST;
+    return "احراز هویت تلگرام ناموفق است. مینی‌اپ را فقط از داخل تلگرام باز کنید و دوباره تلاش کنید.";
   }
   return "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.";
 }
