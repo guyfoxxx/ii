@@ -5273,16 +5273,18 @@ async function buildMiniappGuestPayload(env) {
 
 /* ========================== TELEGRAM MINI APP initData verification ========================== */
 async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientRaw) {
-  const lenientRawNorm = String(lenientRaw ?? "1").trim().toLowerCase();
-  const lenient = !(lenientRawNorm === "0" || lenientRawNorm === "false" || lenientRawNorm === "no");
+  const rawLenient = String(lenientRaw || "").trim().toLowerCase();
+  const lenient = !(rawLenient === "0" || rawLenient === "false" || rawLenient === "no");
+
   if (!initData || typeof initData !== "string") {
-    if (lenient) return { ok: true, userId: 999001, fromLike: { username: "dev_user" } };
+    if (lenient) return { ok: true, userId: 999001, fromLike: { id: 999001, username: "dev_user" } };
     return { ok: false, reason: "initData_missing" };
   }
+
   const initRaw = String(initData || "").trim();
   if (lenient && initRaw.startsWith("dev:")) {
     const devId = Number(initRaw.split(":")[1] || "0") || 999001;
-    return { ok: true, userId: devId, fromLike: { username: "dev_user" } };
+    return { ok: true, userId: devId, fromLike: { id: devId, username: "dev_user" } };
   }
   if (!botToken && !lenient) return { ok: false, reason: "bot_token_missing" };
 
@@ -5308,10 +5310,10 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   if (hash && !timingSafeEqualHex(sigHex, hash) && !lenient) return { ok: false, reason: "hash_mismatch" };
 
   const user = safeJsonParse(params.get("user") || "") || {};
-  const userId = user?.id || Number(params.get("user_id") || "0");
+  const userId = user?.id || Number(params.get("user_id") || "0") || (lenient ? 999001 : 0);
   if (!userId) return { ok: false, reason: "user_missing" };
 
-  const fromLike = { username: user?.username || "", first_name: user?.first_name || "", last_name: user?.last_name || "", language_code: user?.language_code || "" };
+  const fromLike = { id: userId, username: user?.username || (lenient ? "dev_user" : ""), first_name: user?.first_name || "", last_name: user?.last_name || "", language_code: user?.language_code || "" };
   return { ok: true, userId, fromLike };
 }
 
