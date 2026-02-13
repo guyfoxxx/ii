@@ -33,7 +33,9 @@ export default {
           return jsonResponse({ ok: false, error: v.reason }, 401);
         }
 
-        const st = await ensureUser(v.userId, env);
+        const st = await ensureUser(v.userId, env, v.fromLike);
+        applyLocaleFromTelegramUser(st, v.fromLike || {});
+        if (env.BOT_KV) await saveUser(v.userId, st, env);
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
         const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
         const miniToken = await issueMiniappToken(env, v.userId, v.fromLike || {});
@@ -259,7 +261,9 @@ ${reply}`;
           if (typeof body.offerBanner === "string" && env.BOT_KV) {
             await setOfferBanner(env, body.offerBanner);
           }
-          if (typeof body.offerBannerImage === "string") {
+          if (body.clearOfferBannerImage) {
+            await setOfferBannerImage(env, "");
+          } else if (typeof body.offerBannerImage === "string") {
             try {
               await setOfferBannerImage(env, body.offerBannerImage);
             } catch (e) {
@@ -616,7 +620,7 @@ TxID: ${txid}
         const tf = String(url.searchParams.get("tf") || "H4").trim().toUpperCase();
         const levelsRaw = String(url.searchParams.get("levels") || "").trim();
         const levels = levelsRaw
-          ? levelsRaw.split(",").map((x) => Number(x)).filter((n) => Number.isFinite(n)).slice(0, 6)
+          ? levelsRaw.split(",").map((x) => Number(x)).filter((n) => Number.isFinite(n)).slice(0, 8)
           : [];
 
         if (!symbol || !isSymbol(symbol)) {
@@ -784,13 +788,19 @@ TxID: ${txid}
         const v = await verifyMiniappAuth(body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
-        const st = await ensureUser(v.userId, env);
+        const st = await ensureUser(v.userId, env, v.fromLike);
         const symbol = String(body.symbol || "").trim();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
 
-        // lightweight onboarding gate for mini-app: block only if absolutely no identity fields exist
-        const hasAnyIdentity = !!(st.profile?.name || st.profile?.phone || st.profile?.username || v.fromLike?.username);
-        if (!hasAnyIdentity) {
+        const isOnboardingReady = !!(
+          st.profile?.onboardingDone &&
+          st.profile?.name &&
+          st.profile?.phone &&
+          st.profile?.preferredStyle &&
+          st.profile?.preferredMarket &&
+          Number(st.profile?.capital || 0) > 0
+        );
+        if (!isOnboardingReady) {
           return jsonResponse({ ok: false, error: "onboarding_required" }, 403);
         }
 
@@ -817,12 +827,14 @@ TxID: ${txid}
           let levels = [];
           let quickChartSpec = null;
           let zonesSvg = "";
+          let chartCandlesCount = 0;
           try {
             if (String(env.QUICKCHART || "") !== "0") {
               const tf = st.timeframe || "H4";
               levels = extractLevels(result);
               const origin = new URL(request.url).origin;
               const candles = await getMarketCandlesWithFallback(env, symbol, tf).catch(() => []);
+              chartCandlesCount = Array.isArray(candles) ? candles.length : 0;
               if (Array.isArray(candles) && candles.length) {
                 chartUrl = `${origin}/api/chart?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&levels=${encodeURIComponent(levels.join(","))}`;
                 quickChartSpec = buildQuickChartSpec(candles, symbol, tf, levels);
@@ -839,10 +851,19 @@ TxID: ${txid}
           } catch (e) {
             console.error("zones svg build error:", e?.message || e);
           }
-          const quickchartConfig = { symbol, timeframe: st.timeframe || "H4", levels };
-          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec, quickchartConfig, zonesSvg });
+          const tf = st.timeframe || "H4";
+          const quickchartConfig = { symbol, timeframe: tf, levels };
+          const chartMeta = { timeframe: tf, candles: chartCandlesCount, zones: levels.length };
+          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec, quickchartConfig, chartMeta, zonesSvg });
         } catch (e) {
           console.error("api/analyze error:", e);
+          const msg = String(e?.message || e || "");
+          if (msg.includes("api_analyze_timeout") || msg.includes("text_") || msg.includes("timeout")) {
+            let candles = [];
+            try { candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4"); } catch {}
+            const fallback = buildLocalFallbackAnalysis(symbol, st, candles, msg || "analysis_timeout");
+            return jsonResponse({ ok: true, result: fallback, state: st, quota: isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`, fallback: true, reason: msg || "timeout" });
+          }
           return jsonResponse({ ok: false, error: "server_error" }, 500);
         }
       }
@@ -973,7 +994,7 @@ const BTN = {
 };
 
 const TYPING_INTERVAL_MS = 4000;
-const TIMEOUT_TEXT_MS = 26000;
+const TIMEOUT_TEXT_MS = 38000;
 const TIMEOUT_VISION_MS = 12000;
 const TIMEOUT_POLISH_MS = 15000;
 
@@ -1032,15 +1053,41 @@ function applyLocaleDefaults(st) {
   st.profile.countryCode = st.profile.countryCode || loc.country;
   st.profile.timezone = st.profile.timezone || loc.tz;
 
-  if (!st.timeframe) st.timeframe = (loc.country === "IR" ? "H1" : "H4");
-  if (!st.risk) st.risk = "متوسط";
-  if (!st.style) st.style = "پرایس اکشن";
+  const policy = localePolicy(st.profile.language, st.profile.countryCode);
+  if (!st.timeframe) st.timeframe = policy.timeframe;
+  if (!st.risk) st.risk = policy.risk;
+  if (!st.style) st.style = policy.style;
   if (st.profile.preferredStyle && ALLOWED_STYLE_LIST.includes(st.profile.preferredStyle)) {
     st.style = st.profile.preferredStyle;
   }
   if (typeof st.newsEnabled !== "boolean") st.newsEnabled = true;
   if (!st.promptMode) st.promptMode = "style_plus_custom";
   return st;
+}
+
+function localePolicy(language = "fa", country = "IR") {
+  const lang = String(language || "fa").toLowerCase();
+  const c = String(country || "IR").toUpperCase();
+  if (c === "IR") return { timeframe: "H1", risk: "متوسط", style: "پرایس اکشن" };
+  if (lang.startsWith("ar")) return { timeframe: "H1", risk: "متوسط", style: "پرایس اکشن" };
+  if (lang.startsWith("tr") || lang.startsWith("ru")) return { timeframe: "H4", risk: "متوسط", style: "ICT" };
+  return { timeframe: "H4", risk: "medium", style: "پرایس اکشن" };
+}
+
+function applyLocaleFromTelegramUser(st, fromLike = {}) {
+  st.profile = st.profile || {};
+  const langRaw = String(fromLike?.language_code || "").trim().toLowerCase();
+  if (!st.profile.language && langRaw) st.profile.language = langRaw.split("-")[0];
+  if (!st.profile.countryCode && langRaw.includes("-")) st.profile.countryCode = langRaw.split("-")[1].toUpperCase();
+  if (!st.profile.countryCode) st.profile.countryCode = st.profile.language === "fa" ? "IR" : "INT";
+  if (!st.profile.timezone) {
+    const tzMap = { fa: "Asia/Tehran", ar: "Asia/Riyadh", tr: "Europe/Istanbul", ru: "Europe/Moscow", en: "UTC" };
+    st.profile.timezone = tzMap[st.profile.language] || "UTC";
+  }
+  const policy = localePolicy(st.profile.language, st.profile.countryCode);
+  if (!st.timeframe) st.timeframe = policy.timeframe;
+  if (!st.risk) st.risk = policy.risk;
+  if (!st.style) st.style = policy.style;
 }
 
 async function finalizeOnboardingRewards(env, st) {
@@ -1220,183 +1267,38 @@ async function getCachedR2ValueAllowStale(bucket, key) {
 }
 
 /* ========================== PROMPTS (ADMIN/OWNER ONLY) ========================== */
-const DEFAULT_ANALYSIS_PROMPT = `SYSTEM OVERRIDE: تحلیل‌گر بازار چندسبکی (STYLE-AWARE)
+const DEFAULT_ANALYSIS_PROMPT = `SYSTEM: تحلیل‌گر حرفه‌ای بازار
 
-متغیرها:
-- STYLE_MODE: {STYLE}
-- RISK_PROFILE: {RISK}
-- NEWS_MODE: {NEWS}
-- TIMEFRAME: {TIMEFRAME}
+قوانین قطعی:
+1) خروجی نهایی فقط فارسی باشد.
+2) فقط بر اساس STYLE_PROMPT_JSON (سبک انتخابی کاربر) تحلیل کن.
+3) فقط از داده MARKET_DATA استفاده کن و خیال‌پردازی نکن.
+4) ورودی‌های کاربر را الزامی لحاظ کن: Symbol, Timeframe, Risk, Capital.
+5) خروجی را مرحله‌ای، اجرایی و با مدیریت ریسک ارائه بده.
+6) در صورت نبود داده کافی، شفاف اعلام کن.
 
-قوانین سخت:
-1) خروجی فقط فارسی باشد و فقط شامل بخش‌های ۱ تا ۵ با همین تیترها.
-2) فقط از داده‌های MARKET_DATA استفاده کن؛ اگر داده کافی نیست، شفاف بگو و حدس نزن.
-3) سطح‌های قیمتی را با عدد و برچسب X / Y / Z ارائه کن (اگر عدد از داده مشخص نیست: «نامشخص از داده»).
-4) شرط کندلی را واضح بنویس (Close بالا/پایین، Wick Sweep، شکست با بدنه، پولبک).
-5) هیچ توصیه قطعی «حتماً بخر/بفروش» نده؛ سناریومحور و مشروط بنویس.
-
-سوئیچ سبک (بر اساس STYLE_MODE):
-A) اگر STYLE_MODE = "پرایس اکشن"
-- تمرکز: ساختار (HH/HL یا LH/LL)، حمایت/مقاومت، شکست و پولبک، عرضه/تقاضا، الگوهای کندلی.
-- از اصطلاحات ICT فقط در صورت نیاز و با توضیح کوتاه استفاده کن.
-
-B) اگر STYLE_MODE = "ICT"
-- تمرکز: Liquidity (استاپ‌ها)، Sweep/Grab، Order Block، FVG، Breaker/Structure Shift.
-- هدف نقدینگی و واکنش در برخورد را مشخص کن.
-
-C) اگر STYLE_MODE = "ATR"
-- تمرکز: نوسان و مدیریت ریسک با ATR.
-- اگر ATR عددی در داده نبود، استاپ/اهداف را نسبی بنویس (مثلاً ۱×ATR) و بگو «ATR عددی در داده نیست».
-
-سوئیچ ریسک (بر اساس RISK_PROFILE):
-- کم‌ریسک: فقط با تایید قوی (Close + Retest)، SL محافظه‌کار، TP پله‌ای.
-- متوسط: تایید استاندارد، SL پشت ناحیه، TP دو مرحله‌ای.
-- پرریسک: ورود تهاجمی‌تر فقط اگر سناریو واضح است؛ حتماً هشدار «ریسک بالا».
-
-NEWS_MODE:
-- اگر {NEWS} = "on": تاثیر خبر/رویداد را کوتاه داخل سناریوها اضافه کن.
-- اگر {NEWS} = "off": از خبر حرف نزن.
-
-OUTPUT FORMAT (STRICT):
-۱. نقشه پول‌های پارک‌شده (شکارگاه نهنگ‌ها):
-۲. تله‌های قیمتی اخیر (فریب بازار):
-۳. ردپای ورود پول هوشمند / ساختار (طبق STYLE_MODE):
-۴. سناریوی بعدی (مسیر احتمالی + شروط فعال‌سازی):
-۵. استراتژی لحظه برخورد (ماشه نهایی + Entry/SL/TP مشروط با X/Y/Z):`;
+ساختار خروجی:
+۱) بایاس و وضعیت ساختار
+۲) نواحی و نقدینگی/سطوح کلیدی
+۳) سناریوی ورود (Entry/SL/TP)
+۴) مدیریت ریسک و اندازه پوزیشن
+۵) سناریوی ابطال و جمع‌بندی اجرایی`;
 
 /* ========================== STYLE PROMPTS (DEFAULTS) ==========================
  * Users choose st.style (Persian labels) and we inject a style-specific guide
  * into the analysis prompt. Admin can still override the global base prompt via KV.
  */
 const STYLE_PROMPTS_DEFAULT = {
-  "پرایس اکشن": `You are a professional Price Action trader and market analyst.
-
-Analyze the given market (Symbol, Timeframe) using pure Price Action concepts only.
-Do NOT use indicators unless explicitly requested.
-
-Your analysis must include:
-
-1. Market Structure
-- Identify the current structure (Uptrend / Downtrend / Range)
-- Mark HH, HL, LH, LL
-- Specify whether structure is intact or broken (BOS / MSS)
-
-2. Key Levels
-- Strong Support & Resistance zones
-- Flip zones (SR → Resistance / Resistance → Support)
-- Psychological levels (if relevant)
-
-3. Candlestick Behavior
-- Identify strong rejection candles (Pin bar, Engulfing, Inside bar)
-- Explain what these candles indicate about buyers/sellers
-
-4. Entry Scenarios
-For each valid setup:
-- Entry zone
-- Stop Loss (logical, structure-based)
-- Take Profit targets (TP1 / TP2)
-- Risk to Reward (minimum 1:2)
-
-5. Bias & Scenarios
-- Main bias (Bullish / Bearish / Neutral)
-- Alternative scenario if price invalidates the setup
-
-6. Execution Plan
-- Is this a continuation or reversal trade?
-- What confirmation is required before entry?
-
-Explain everything step-by-step, clearly and professionally.
-Avoid overtrading. Focus on high-probability setups only.`,
-  "ICT": `You are an ICT (Inner Circle Trader) & Smart Money analyst.
-
-Analyze the market (Symbol, Timeframe) using ICT & Smart Money Concepts ONLY.
-
-Your analysis must include:
-
-1. Higher Timeframe Bias
-- Determine HTF bias (Daily / H4)
-- Identify Premium & Discount zones
-- Is price in equilibrium or imbalance?
-
-2. Liquidity Mapping
-- Identify:
-  - Equal Highs / Equal Lows
-  - Buy-side liquidity
-  - Sell-side liquidity
-- Mark likely stop-loss pools
-
-3. Market Structure
-- Identify:
-  - BOS (Break of Structure)
-  - MSS (Market Structure Shift)
-- Clarify whether the move is manipulation or expansion
-
-4. PD Arrays
-- Order Blocks (Bullish / Bearish)
-- Fair Value Gaps (FVG)
-- Liquidity Voids
-- Previous High / Low (PDH, PDL, PWH, PWL)
-
-5. Kill Zones (if intraday)
-- London Kill Zone
-- New York Kill Zone
-- Explain timing relevance
-
-6. Entry Model
-- Entry model used (e.g. Liquidity Sweep → MSS → FVG entry)
-- Entry price
-- Stop Loss (below/above OB or swing)
-- Take Profits (liquidity targets)
-
-7. Narrative
-- Explain the story:
-  - Who is trapped?
-  - Where did smart money enter?
-  - Where is price likely engineered to go?
-
-Provide a clear bullish/bearish execution plan and an invalidation point.`,
-  "ATR": `You are a quantitative trading assistant specializing in volatility-based strategies.
-
-Analyze the market (Symbol, Timeframe) using ATR (Average True Range) as the core tool.
-
-Your analysis must include:
-
-1. Volatility State
-- Current ATR value
-- Compare current ATR with historical average
-- Is volatility expanding or contracting?
-
-2. Market Condition
-- Trending or Ranging?
-- Is the market suitable for breakout or mean reversion?
-
-3. Trade Setup
-- Optimal Entry based on price structure
-- ATR-based Stop Loss:
-  - SL = Entry ± (ATR × Multiplier)
-- ATR-based Take Profit:
-  - TP1, TP2 based on ATR expansion
-
-4. Position Sizing
-- Risk per trade (%)
-- Position size calculation based on SL distance
-
-5. Trade Filtering
-- When NOT to trade based on ATR
-- High-risk volatility conditions (news, spikes)
-
-6. Risk Management
-- Max daily loss
-- Max consecutive losses
-- Trailing Stop logic using ATR
-
-7. Summary
-- Is this trade statistically justified?
-- Expected trade duration
-- Risk classification (Low / Medium / High)
-
-Keep the explanation practical and execution-focused.`,
+  "ICT": `{"role":"system","identity":{"title":"ICT & Smart Money Analyst","methodology":["ICT (Inner Circle Trader)","Smart Money Concepts"],"restrictions":["No indicators","No retail concepts","ICT & Smart Money concepts ONLY"]},"task":{"description":"Analyze the requested market (Symbol, Timeframe) using ICT & Smart Money Concepts ONLY."},"analysis_requirements":{"1_higher_timeframe_bias":{"timeframes":["Daily","H4"],"elements":["Overall HTF bias (Bullish / Bearish / Neutral)","Premium zone","Discount zone","Equilibrium level (50%)","Imbalance vs Balance state"]},"2_liquidity_mapping":{"identify":["Equal Highs (EQH)","Equal Lows (EQL)","Buy-side liquidity","Sell-side liquidity","Stop-loss pools"],"objective":"Determine where liquidity is resting and likely to be engineered toward"},"3_market_structure":{"elements":["BOS (Break of Structure)","MSS / CHoCH (Market Structure Shift)"],"clarification":["Manipulation phase","Expansion phase"]},"4_pd_arrays":{"arrays":["Bullish Order Blocks","Bearish Order Blocks","Fair Value Gaps (FVG)","Liquidity Voids","Previous Day High (PDH)","Previous Day Low (PDL)","Previous Week High (PWH)","Previous Week Low (PWL)"]},"5_kill_zones":{"condition":"Intraday only","zones":["London Kill Zone","New York Kill Zone"],"explanation":"Explain why timing matters for this setup"},"6_entry_model":{"model_examples":["Liquidity Sweep → MSS → FVG Entry","Liquidity Sweep → Order Block Entry"],"must_include":["Entry price","Stop Loss location (above/below OB or swing)","Take Profit targets based on liquidity"]},"7_narrative":{"storytelling":["Who is trapped?","Where did smart money enter?","Where is price likely engineered to go?"]}},"execution_plan":{"bias":"Bullish or Bearish","entry_conditions":"Clear confirmation rules","targets":"Liquidity-based targets","invalidation_point":"Price level that invalidates the idea"},"output_style":{"tone":"Professional, precise, educational","structure":"Step-by-step, clearly labeled sections","language":"Clear and technical ICT terminology"}}`,
+  "ATR": `{"role":"quantitative_trading_assistant","strategy":"ATR-based volatility trading","analysis_requirements":{"volatility_state":["Current ATR value","Comparison with historical ATR average","Volatility expansion or contraction"],"market_condition":["Trending or Ranging","Breakout vs Mean Reversion suitability"],"trade_setup":{"entry":"Based on price structure","stop_loss":"SL = Entry ± (ATR × Multiplier)","take_profit":["TP1 based on ATR expansion","TP2 based on ATR expansion"]},"position_sizing":["Risk per trade (%)","Position size based on SL distance"],"trade_filtering":["When NOT to trade based on ATR","High-risk volatility conditions (news, spikes)"],"risk_management":["Max daily loss","Max consecutive losses","ATR-based trailing stop logic"],"summary":["Statistical justification","Expected trade duration","Risk classification (Low/Medium/High)"]}}`,
+  "پرایس اکشن": `{"role":"system","description":"Professional Price Action Market Analysis Prompt","constraints":{"analysis_style":"Pure Price Action Only","indicators":"Forbidden unless explicitly requested","focus":"High-probability setups only","language":"Professional, clear, step-by-step"},"required_sections":{"market_structure":{"items":["Trend identification (Uptrend / Downtrend / Range)","HH, HL, LH, LL labeling","Structure status (Intact / BOS / MSS)"]},"key_levels":{"items":["Strong Support zones","Strong Resistance zones","Flip zones (SR to Resistance / Resistance to Support)","Psychological levels (if relevant)"]},"candlestick_behavior":{"items":["Pin Bar","Engulfing","Inside Bar","Explanation of buyer/seller intent"]},"entry_scenarios":{"requirements":["Clear entry zone","Logical structure-based Stop Loss","TP1 and TP2 targets","Minimum Risk:Reward of 1:2"]},"bias_and_scenarios":{"items":["Main bias (Bullish / Bearish / Neutral)","Alternative scenario upon invalidation"]},"execution_plan":{"items":["Continuation or Reversal trade","Required confirmation before entry"]}},"instructions":["Explain everything step-by-step","Use structure-based logic","Avoid overtrading","Execution-focused explanations"]}`,
 };
+const DEFAULT_CUSTOM_PROMPTS = [
+  { id: "ict_style", title: "ICT & Smart Money", text: STYLE_PROMPTS_DEFAULT["ICT"] },
+  { id: "atr_style", title: "ATR Volatility", text: STYLE_PROMPTS_DEFAULT["ATR"] },
+  { id: "price_action_style", title: "Price Action", text: STYLE_PROMPTS_DEFAULT["پرایس اکشن"] },
+];
+
 
 function normalizeStyleLabel(style) {
   const s = String(style || "").trim();
@@ -1405,19 +1307,11 @@ function normalizeStyleLabel(style) {
   if (low === "price action" || low === "priceaction") return "پرایس اکشن";
   if (low === "ict") return "ICT";
   if (low === "atr") return "ATR";
-  if (low === "combo" || low === "combined" || low === "all" || low === "ترکیبی") return "ترکیبی";
   return s;
 }
 
 function getStyleGuide(style) {
   const key = normalizeStyleLabel(style);
-  if (key === "ترکیبی") {
-    return [
-      "[پرایس اکشن]", STYLE_PROMPTS_DEFAULT["پرایس اکشن"] || "",
-      "[ICT]", STYLE_PROMPTS_DEFAULT["ICT"] || "",
-      "[ATR]", STYLE_PROMPTS_DEFAULT["ATR"] || "",
-    ].join(String.fromCharCode(10)).trim();
-  }
   return STYLE_PROMPTS_DEFAULT[key] || "";
 }
 
@@ -1456,18 +1350,9 @@ function styleKey(style) {
   return String(style || "").trim().toLowerCase().replace(/\s+/g, "_");
 }
 async function getStylePrompt(env, style) {
-  if (!env.BOT_KV) return "";
   const map = await getStylePromptMap(env);
   const key = normalizeStyleLabel(style);
-  if (key === "ترکیبی") {
-    const parts = [];
-    for (const s of ["پرایس اکشن", "ICT", "ATR"]) {
-      const v = (map?.[styleKey(s)] || "").toString().trim();
-      if (v) parts.push("[" + s + "]\n" + v);
-    }
-    return parts.join("\n\n");
-  }
-  return (map?.[styleKey(key)] || "").toString();
+  return (map?.[styleKey(key)] || STYLE_PROMPTS_DEFAULT[key] || "").toString().trim();
 }
 async function setStylePrompt(env, style, prompt) {
   if (!env.BOT_KV) return;
@@ -1477,13 +1362,19 @@ async function setStylePrompt(env, style, prompt) {
 }
 
 async function getStylePromptMap(env) {
-  if (!env.BOT_KV) return {};
+  const defaults = {
+    [styleKey("ICT")]: STYLE_PROMPTS_DEFAULT["ICT"],
+    [styleKey("ATR")]: STYLE_PROMPTS_DEFAULT["ATR"],
+    [styleKey("پرایس اکشن")]: STYLE_PROMPTS_DEFAULT["پرایس اکشن"],
+  };
+  if (!env.BOT_KV) return defaults;
   const raw = await env.BOT_KV.get("settings:style_prompts_json");
   try {
     const parsed = raw ? JSON.parse(raw) : {};
-    return parsed && typeof parsed === "object" ? parsed : {};
+    if (!parsed || typeof parsed !== "object") return defaults;
+    return { ...defaults, ...parsed };
   } catch {
-    return {};
+    return defaults;
   }
 }
 
@@ -1494,13 +1385,13 @@ async function setStylePromptMap(env, map) {
 }
 
 async function getCustomPrompts(env) {
-  if (!env.BOT_KV) return [];
+  if (!env.BOT_KV) return DEFAULT_CUSTOM_PROMPTS.slice();
   const raw = await env.BOT_KV.get("settings:custom_prompts");
   try {
     const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed : [];
+    return (Array.isArray(parsed) && parsed.length) ? parsed : DEFAULT_CUSTOM_PROMPTS.slice();
   } catch {
-    return [];
+    return DEFAULT_CUSTOM_PROMPTS.slice();
   }
 }
 
@@ -1520,7 +1411,7 @@ async function setFreeDailyLimit(env, limit) {
   if (!env.BOT_KV) return;
   await env.BOT_KV.put("settings:free_daily_limit", String(limit));
 }
-const ALLOWED_STYLE_LIST = ["پرایس اکشن", "ICT", "ATR", "ترکیبی"];
+const ALLOWED_STYLE_LIST = ["پرایس اکشن", "ICT", "ATR"];
 const DEFAULT_STYLE_LIST = ALLOWED_STYLE_LIST.slice();
 
 async function getStyleList(env) {
@@ -1550,6 +1441,11 @@ async function getOfferBanner(env) {
   return (raw || env.SPECIAL_OFFER_TEXT || "").toString().trim();
 }
 
+async function setOfferBanner(env, text) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
+}
+
 async function getOfferBannerImage(env) {
   if (!env.BOT_KV) return (env.SPECIAL_OFFER_IMAGE || "").toString().trim();
   const raw = await env.BOT_KV.get("settings:offer_banner_image");
@@ -1568,8 +1464,10 @@ async function setOfferBannerImage(env, dataUrl) {
     await env.BOT_KV.delete("settings:offer_banner_image");
     return;
   }
-  if (!clean.startsWith("data:image/")) throw new Error("bad_offer_image_format");
-  if (clean.length > 1_500_000) throw new Error("offer_image_too_large");
+  const isDataImage = clean.startsWith("data:image/");
+  const isHttpUrl = /^https?:\/\//i.test(clean);
+  if (!isDataImage && !isHttpUrl) throw new Error("bad_offer_image_format");
+  if (isDataImage && clean.length > 1_500_000) throw new Error("offer_image_too_large");
   await env.BOT_KV.put("settings:offer_banner_image", clean);
 }
 
@@ -1917,9 +1815,20 @@ function contactKeyboard() {
   };
 }
 
+const DEFAULT_MINIAPP_URL = "https://sniperim.mad-pyc.workers.dev/";
+
 function getMiniappUrl(env) {
-  const u = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || "").toString().trim();
-  return u;
+  const configured = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || "").toString().trim();
+  const raw = configured || DEFAULT_MINIAPP_URL;
+  try {
+    const u = new URL(raw);
+    u.pathname = "/";
+    u.search = "";
+    u.hash = "";
+    return u.toString();
+  } catch {
+    return DEFAULT_MINIAPP_URL;
+  }
 }
 async function miniappInlineKeyboard(env, st, from) {
   const url = getMiniappUrl(env);
@@ -2139,6 +2048,7 @@ async function ensureUser(userId, env, from) {
   if (from?.username) st.profile.username = String(from.username);
   if (from?.first_name) st.profile.firstName = String(from.first_name);
   if (from?.last_name) st.profile.lastName = String(from.last_name);
+  applyLocaleFromTelegramUser(st, from || {});
   if (st.profile?.phone) applyLocaleDefaults(st);
 
   const today = kyivDateString();
@@ -2209,6 +2119,13 @@ async function tgSendMessage(env, chatId, text, replyMarkup) {
     reply_markup: replyMarkup,
     disable_web_page_preview: true,
   });
+}
+
+async function tgSendLongMessage(env, chatId, text, replyMarkup) {
+  const parts = chunkText(String(text || ""), 3500);
+  for (const part of parts) {
+    await tgSendMessage(env, chatId, part, replyMarkup);
+  }
 }
 
 async function tgSendMessageHtml(env, chatId, html, replyMarkup) {
@@ -3394,12 +3311,6 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
   const tf = st.timeframe || "H4";
   const baseRaw = await getAnalysisPrompt(env);
   const sp = await getStylePrompt(env, st.style);
-  const customPrompts = await getCustomPrompts(env);
-  const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
-  const promptMode = String(st.promptMode || "style_plus_custom").trim();
-  const includeStylePrompt = promptMode !== "custom_only";
-  const includeStyleGuide = promptMode === "combined_all" || promptMode === "style_only" || promptMode === "style_plus_custom";
-  const includeCustomPrompt = !!customPrompt?.text && (promptMode === "custom_only" || promptMode === "style_plus_custom" || promptMode === "combined_all");
   const newsAnalysisBlock = newsBlock ? await buildNewsAnalysisSummary(symbol, parseNewsBlockRows(newsBlock), env) : "";
   const base = baseRaw
      .split("{TIMEFRAME}").join(tf)
@@ -3407,30 +3318,27 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
      .split("{RISK}").join(st.risk || "")
      .split("{NEWS}").join(st.newsEnabled ? "on" : "off");
 
+  const capital = st.capital?.enabled === false
+    ? "disabled"
+    : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"));
+
   const userExtra = (isStaff({ username: st.profile?.username }, env) && userPrompt?.trim())
     ? userPrompt.trim()
-    : "تحلیل با حالت نهادی";
+    : "تحلیل را دقیق، مشروط و اجرایی بنویس.";
 
   return (
     `${base}
 
 ` +
-    (includeStylePrompt && sp ? `STYLE_PROMPT:
+    `STYLE_PROMPT_JSON:
 ${sp}
 
-` : ``) +
-    (includeStyleGuide && getStyleGuide(st.style) ? `STYLE_GUIDE:
-${getStyleGuide(st.style)}
-
-` : ``) +
-    (includeCustomPrompt ? `CUSTOM_PROMPT:
-${customPrompt.text}
-
-` : ``) +
-    `ASSET: ${symbol}
 ` +
-
-    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}, Capital=${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}, Lang=${st.profile?.language || "fa"}, TZ=${st.profile?.timezone || "Asia/Tehran"}, Country=${st.profile?.countryCode || "IR"}
+    `CONTEXT:
+Symbol=${symbol}
+Timeframe=${tf}
+Risk=${st.risk || "متوسط"}
+Capital=${capital}
 
 ` +
     `MARKET_DATA:
@@ -3447,24 +3355,15 @@ ${newsAnalysisBlock}
 ` : ``) +
     `RULES:
 ` +
-    `- خروجی فقط فارسی و دقیقاً بخش‌های ۱ تا ۵
+    `- فقط و فقط بر اساس سبک انتخابی (${st.style || "پرایس اکشن"}) تحلیل کن.
 ` +
-    (st.style === "ترکیبی" || promptMode === "combined_all"
-      ? `- از ترکیب سبک‌ها (پرایس اکشن، اسمارت‌مانی، ساختار بازار، حجم، سناریو) استفاده کن
-`
-      : `- فقط بر اساس سبک انتخابی (${st.style || "مشخص نشده"}) تحلیل کن و سبک‌های دیگر را دخیل نکن
-`) +
-    `- مدیریت سرمایه متناسب با Capital را لحاظ کن و سایز پوزیشن پیشنهادی بده
+    `- خروجی نهایی حتماً فارسی باشد.
 ` +
-    `- quickchart_config را به شکل JSON داخلی بساز اما به کاربر نمایش نده
+    `- مدیریت سرمایه و ریسک را براساس Capital و Risk اعمال کن.
 ` +
-    `- سطح‌های قیمتی را مشخص کن (X/Y/Z)
+    `- از داده OHLC استفاده کن و خیال‌بافی نکن.
 ` +
-    `- شرط کندلی را واضح بگو (close/wick)
-` +
-    `- از داده OHLC استفاده کن، خیال‌بافی نکن
-` +
-    `- اگر NEWS_HEADLINES_FA موجود بود، تحلیل خبری کوتاه و اثر خبر روی سناریوها را اضافه کن
+    `- quickchart_config را به شکل JSON داخلی بساز اما به کاربر نمایش نده.
 
 ` +
     `EXTRA:
@@ -3476,37 +3375,32 @@ async function buildVisionPrompt(st, env) {
   const tf = st.timeframe || "H4";
   const baseRaw = await getAnalysisPrompt(env);
   const sp = await getStylePrompt(env, st.style);
-  const customPrompts = await getCustomPrompts(env);
-  const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
-  const promptMode = String(st.promptMode || "style_plus_custom").trim();
-  const includeStylePrompt = promptMode !== "custom_only";
-  const includeStyleGuide = promptMode === "combined_all" || promptMode === "style_only" || promptMode === "style_plus_custom";
-  const includeCustomPrompt = !!customPrompt?.text && (promptMode === "custom_only" || promptMode === "style_plus_custom" || promptMode === "combined_all");
   const base = baseRaw
      .split("{TIMEFRAME}").join(tf)
      .split("{STYLE}").join(st.style || "")
      .split("{RISK}").join(st.risk || "")
      .split("{NEWS}").join(st.newsEnabled ? "on" : "off");
+  const capital = st.capital?.enabled === false
+    ? "disabled"
+    : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"));
   return (
     `${base}
 
 ` +
-    (includeStylePrompt && sp ? `STYLE_PROMPT:
+    `STYLE_PROMPT_JSON:
 ${sp}
 
-` : ``) +
-    (includeStyleGuide && getStyleGuide(st.style) ? `STYLE_GUIDE:
-${getStyleGuide(st.style)}
-
-` : ``) +
-    (includeCustomPrompt ? `CUSTOM_PROMPT:
-${customPrompt.text}
-
-` : ``) +
-    `TASK: این تصویر چارت را تحلیل کن. دقیقاً خروجی ۱ تا ۵ بده و سطح‌ها را مشخص کن.
 ` +
-    `RULES: فقط فارسی، لحن افشاگر، خیال‌بافی نکن.
-`
+    `CONTEXT:
+Symbol=CHART
+Timeframe=${tf}
+Risk=${st.risk || "متوسط"}
+Capital=${capital}
+
+` +
+    `TASK: این تصویر چارت را فقط با سبک انتخابی تحلیل کن و خروجی را کاملاً فارسی بده.
+` +
+    `RULES: فقط فارسی، فقط سبک انتخابی، بدون اندیکاتور اضافی و بدون خیال‌بافی.`
   );
 }
 
@@ -3724,10 +3618,29 @@ async function handleUpdate(update, env) {
 
     if (text === "/wallet" || text === BTN.WALLET) {
       const wallet = await getWallet(env);
+      const txs = Array.isArray(st.wallet?.transactions) ? st.wallet.transactions.slice(-5).reverse() : [];
+      const txHistory = txs.length
+        ? txs.map((t, i) => `${i + 1}) ${t.txHash || "-"} | ${t.amount || "-"} USDT | ${String(t.createdAt || "").slice(0, 16).replace("T", " ")}`).join(String.fromCharCode(10))
+        : "—";
+      const planName = `${st.profile?.username || "marketi1"}  PRO`;
       const txt =
-        `💳 ولت و پرداخت\n\n` +
-        (wallet ? `آدرس ولت:\n${wallet}\n\n` : "") +
-        `برای مشاهده موجودی، واریز یا برداشت از دکمه‌ها استفاده کن.`;
+        `💳 ولت
+
+` +
+        `پلن: ${planName}
+با ارزش ۲۵ USDT
+
+` +
+        `📜 تاریخچه تراکنشات
+${txHistory}
+
+` +
+        (wallet ? `🏦 آدرس ولت:
+${wallet}
+
+` : "") +
+        `«واریزی فقط به آدرس ولت درگاه ممکن است
+در لیست زیر باید از واریز هش واریزی را ارسال کنید.»`;
       return tgSendMessage(env, chatId, txt, walletMenuKeyboard());
     }
 
@@ -3752,7 +3665,10 @@ ${wallet}
 Memo/Tag: ${memo}
 
 ` +
-        `TxID پرداخت را همینجا بفرست (در صورت نیاز: <txid> <amount>).`;
+        `«واریزی فقط به آدرس ولت درگاه ممکن است
+در لیست زیر باید از واریز هش واریزی را ارسال کنید.»
+
+TxID پرداخت را همینجا بفرست (در صورت نیاز: <txid> <amount>).`;
       return tgSendMessage(env, chatId, txt, kb([[BTN.BACK, BTN.HOME]]));
     }
 
@@ -3770,15 +3686,27 @@ Memo/Tag: ${memo}
     if (text === "/invite" || text === BTN.INVITE) {
       const { link, share } = inviteShareText(st, env);
       if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
+      const inv = Number(st.referral?.successfulInvites || 0);
+      const pts = Number(st.referral?.points || 0);
       const txt =
         `🤝 دعوت دوستان
 
 ` +
-        `🔗 لینک رفرال اختصاصی: <a href="${escapeHtml(link)}">باز کردن لینک دعوت</a>
+        `دعوت موفق: ${inv}
+` +
+        `امتیاز شما: ${pts}
 
 ` +
-        (share ? `برای اشتراک‌گذاری سریع: <a href="${escapeHtml(share)}">ارسال لینک</a>
-` : "");
+        `🔗 لینک رفرال قابل کپی: <code>${escapeHtml(link)}</code>
+` +
+        `لینک رفرال: <a href="${escapeHtml(link)}">باز کردن لینک دعوت</a>
+
+` +
+        (share ? `اشتراک‌گذاری سریع: <a href="${escapeHtml(share)}">ارسال لینک</a>
+
+` : "") +
+        `«با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتباز بدست می اورید در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید
+»`;
       return tgSendMessageHtml(env, chatId, txt, mainMenuKeyboard(env));
     }
 
@@ -3794,7 +3722,13 @@ Memo/Tag: ${memo}
       return tgSendMessage(
         env,
         chatId,
-        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.\n\nپیام مستقیم: ${handle}${walletLine}`,
+        `🆘 پشتیبانی
+
+«با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.»
+
+برای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.
+
+پیام مستقیم: ${handle}${walletLine}`,
         kb([[BTN.SUPPORT_FAQ, BTN.SUPPORT_TICKET], [BTN.SUPPORT_CUSTOM_PROMPT], [BTN.HOME]])
       );
     }
@@ -3859,7 +3793,8 @@ ${summary || "تحلیل خبری در دسترس نیست."}`, mainMenuKeyboard
       return tgSendMessage(env, chatId, `🧩 مینی‌اپ فعال شد.
 
 از دکمه زیر وارد شوید. اگر دکمه باز نشد، این لینک را مستقیم باز کنید:
-${finalUrl}`, kbInline);
+${finalUrl}\n\nچک‌لیست سریع اتصال:
+${MINIAPP_EXEC_CHECKLIST}`, kbInline);
     }
 
 
@@ -3992,12 +3927,29 @@ ${finalUrl}`, kbInline);
       await saveUser(userId, st, env);
 
       const marketFa = ({crypto:"کریپتو", forex:"فارکس", metals:"فلزات", stocks:"سهام"})[result.recommendedMarket] || "کریپتو";
-      return tgSendMessage(
+      await tgSendMessage(
         env,
         chatId,
-        `✅ تعیین سطح انجام شد.\n\nسطح: ${st.profile.level}\nپیشنهاد بازار: ${marketFa}\n\nتنظیمات پیشنهادی:\n⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}\n\nیادداشت:\n${st.profile.levelNotes || "—"}\n\nاگر می‌خوای دوباره تعیین‌سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
+        `✅ تعیین سطح انجام شد.
+
+سطح: ${st.profile.level}
+پیشنهاد بازار: ${marketFa}
+
+تنظیمات پیشنهادی:
+⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}
+
+یادداشت:
+${st.profile.levelNotes || "—"}
+
+اگر می‌خوای دوباره تعیین‌سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
         mainMenuKeyboard(env)
       );
+      const teaserSymbol = st.profile?.preferredMarket?.includes("فارکس") ? "EURUSD" : (st.profile?.preferredMarket?.includes("فلز") ? "XAUUSD" : (st.profile?.preferredMarket?.includes("سهام") ? "US500" : "BTCUSDT"));
+      const teaser = `📌 یک تحلیل کوتاه ویژه پروفایل شما:
+${teaserSymbol} در ${st.timeframe} با ریسک ${st.risk} → در صورت تثبیت بالای ناحیه حمایتی اخیر، سناریوی ادامه‌دار صعودی فعال می‌شود؛ در غیر این صورت پولبک عمیق‌تر محتمل است.
+
+برای تحلیل کامل از منوی سیگنال استفاده کن 🚀`;
+      return tgSendMessage(env, chatId, teaser, mainMenuKeyboard(env));
     }
 
     if (text === BTN.CAT_MAJORS) return tgSendMessage(env, chatId, "💱 ماجورها:", listKeyboard(MAJORS));
@@ -4316,8 +4268,7 @@ async function startOnboarding(env, chatId, from, st) {
     await saveUser(st.userId, st, env);
     return tgSendMessage(env, chatId, "🎯 سبک ترجیحی‌ات را انتخاب کن:", optionsKeyboard(ALLOWED_STYLE_LIST));
   }
-  const flags = await getAdminFlags(env);
-  if (flags.capitalModeEnabled && !Number(st.profile?.capital || 0)) {
+  if (!Number(st.profile?.capital || 0)) {
     st.state = "onb_capital";
     await saveUser(st.userId, st, env);
     return tgSendMessage(env, chatId, "💼 سرمایه تقریبی‌ات را وارد کن (عدد). مثال: 1000", kb([[BTN.BACK, BTN.HOME]]));
@@ -4681,6 +4632,14 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
   } catch (e) {
     console.error("runSignalTextFlow error:", e);
     t.stop = true;
+    const msg = String(e?.message || e || "");
+    if (msg.includes("timeout") || msg.includes("text_")) {
+      let candles = [];
+      try { candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4"); } catch {}
+      const fallback = buildLocalFallbackAnalysis(symbol, st, candles, msg || "signal_timeout");
+      await tgSendLongMessage(env, chatId, fallback, kb([[BTN.HOME]]));
+      return false;
+    }
     await tgSendMessage(env, chatId, "⚠️ فعلاً امکان انجام این عملیات نیست. لطفاً بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
     return false;
   }
@@ -4747,14 +4706,21 @@ async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
     console.error("text providers failed (retry compact):", e?.message || e);
     try {
       const compactBlock = buildMarketBlock(candles, 40);
-      const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env, newsBlock);      draft = await runTextProviders(compactPrompt, env, st.textOrder);
+      const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env, newsBlock);
+      draft = await runTextProviders(compactPrompt, env, st.textOrder);
     } catch (e2) {
       console.error("text providers failed (fallback local):", e2?.message || e2);
       draft = buildLocalFallbackAnalysis(symbol, st, candles, e2?.message || "text_provider_timeout");
     }
   }
-  const polished = await runPolishProviders(draft, env, st.polishOrder);
-  const clean = stripHiddenModelOutput(polished);
+  let polished = draft;
+  try {
+    polished = await runPolishProviders(draft, env, st.polishOrder);
+  } catch (e) {
+    console.error("polish flow failed:", e?.message || e);
+    polished = draft;
+  }
+  const clean = stripHiddenModelOutput(polished || draft);
   if (useCache && clean) await setAnalysisCache(env, cacheKey, clean);
   return clean;
 }
@@ -4852,11 +4818,44 @@ function buildLevelsOnlySvg(symbol, timeframe, levels = []) {
 }
 
 function extractLevels(text) {
-  const nums = (String(text || "").match(/\b\d{1,6}(?:\.\d{1,6})?\b/g) || [])
-    .map(Number)
-    .filter(n => Number.isFinite(n));
-  const uniq = [...new Set(nums)].sort((a,b)=>a-b);
-  return uniq.slice(0, 6);
+  const src = String(text || "");
+  const lines = src.split(/\r?\n/);
+  const weighted = [];
+  const plain = [];
+
+  const scoreLine = (ln) => {
+    const l = ln.toLowerCase();
+    let score = 0;
+    if (/زون|zone|support|resistance|sr|flip|entry|tp|sl|target/.test(l)) score += 4;
+    if (/\d/.test(l)) score += 1;
+    return score;
+  };
+
+  for (const ln of lines) {
+    const nums = (ln.match(/\b\d{1,6}(?:\.\d{1,8})?\b/g) || [])
+      .map(Number)
+      .filter((n) => Number.isFinite(n) && n > 0);
+    if (!nums.length) continue;
+    const sc = scoreLine(ln);
+    for (const n of nums) {
+      if (sc >= 4) weighted.push(n);
+      else plain.push(n);
+    }
+  }
+
+  const all = [...weighted, ...plain]
+    .filter((n) => Number.isFinite(n))
+    .filter((n) => n >= 0.00001 && n <= 1_000_000)
+    .sort((a, b) => a - b);
+
+  const dedup = [];
+  for (const n of all) {
+    const prev = dedup[dedup.length - 1];
+    if (prev == null || Math.abs(prev - n) > Math.max(1e-6, Math.abs(prev) * 0.0005)) {
+      dedup.push(Number(n.toFixed(6)));
+    }
+  }
+  return dedup.slice(0, 8);
 }
 
 function extractLevelsFromCandles(candles) {
@@ -5046,7 +5045,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const authDate = Number(params.get("auth_date") || "0");
   if ((!Number.isFinite(authDate) || authDate <= 0) && !lenient) return { ok: false, reason: "auth_date_invalid" };
   const now = Math.floor(Date.now() / 1000);
-  const maxAgeSec = Math.max(60, Number(maxAgeSecRaw || 0) || (lenient ? 7 * 24 * 60 * 60 : 24 * 60 * 60));
+  const maxAgeSec = Math.max(60, Number(maxAgeSecRaw || 0) || (7 * 24 * 60 * 60));
   if (Number.isFinite(authDate) && authDate > 0 && (now - authDate > maxAgeSec) && !lenient) return { ok: false, reason: "initData_expired" };
 
   const pairs = [];
@@ -5063,7 +5062,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const userId = user?.id || Number(params.get("user_id") || "0");
   if (!userId) return { ok: false, reason: "user_missing" };
 
-  const fromLike = { username: user?.username || "" };
+  const fromLike = { username: user?.username || "", first_name: user?.first_name || "", last_name: user?.last_name || "", language_code: user?.language_code || "" };
   return { ok: true, userId, fromLike };
 }
 
@@ -5576,6 +5575,9 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="field">
             <div class="label">پرامپت‌های اختصاصی (JSON)</div>
             <textarea id="customPromptsJson" class="control" placeholder='[{"id":"p1","title":"VIP","text":"..."}]'></textarea>
+            <div class="admin-row">
+              <input id="customPromptsJsonFile" type="file" accept="application/json,.json" class="control" />
+            </div>
             <div class="actions">
               <button id="saveCustomPrompts" class="btn">ذخیره پرامپت‌های اختصاصی</button>
             </div>
@@ -5613,16 +5615,15 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="field admin-tab" data-tab="content">
             <div class="label">بنر پیشنهاد (نمایش داخل مینی‌اپ)</div>
             <textarea id="offerBannerInput" class="control" placeholder="متن بنر پیشنهاد..."></textarea>
-            <input id="offerBannerImageInput" type="file" accept="image/*" class="control" />
+            <input id="offerImageFile" type="file" accept="image/*" class="control" />
             <div class="muted" style="font-size:12px;">برای حذف تصویر، فایل را خالی بگذار و ذخیره کن.</div>
             <div class="actions">
               <button id="saveOfferBanner" class="btn">ذخیره بنر</button>
             </div>
             <div class="admin-row">
-              <input id="offerImageFile" type="file" accept="image/*" class="control" />
+              <input id="offerBannerImageUrlInput" class="control" placeholder="یا لینک تصویر بنر..." />
               <button id="clearOfferImage" class="btn ghost">حذف تصویر</button>
             </div>
-            <input id="offerBannerImageInput" class="control" placeholder="یا لینک تصویر بنر..." />
           </div>
 
           <div class="field admin-tab" data-tab="content">
@@ -5772,6 +5773,11 @@ const reportBlock = document.getElementById("reportBlock");
 const roleLabel = document.getElementById("roleLabel");
 const energyToday = document.getElementById("energyToday");
 const remainingAnalyses = document.getElementById("remainingAnalyses");
+const remainingText = document.getElementById("remainingText");
+const energyText = document.getElementById("energyText");
+const energyFill = document.getElementById("energyFill");
+const offerMedia = document.getElementById("offerMedia");
+const offerImg = document.getElementById("offerImg");
 
 function el(id){ return document.getElementById(id); }
 function val(id){ return el(id).value; }
@@ -5809,6 +5815,14 @@ let QUOTE_TIMER = null;
 let QUOTE_BUSY = false;
 let NEWS_TIMER = null;
 const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
+const MINIAPP_EXEC_CHECKLIST = [
+  "1) مینی‌اپ را فقط از داخل تلگرام باز کنید.",
+  "2) تاریخ/ساعت گوشی را روی حالت خودکار بگذارید.",
+  "3) VPN/Proxy را یک‌بار خاموش/روشن و دوباره تست کنید.",
+  "4) اپ تلگرام را آپدیت کنید و Mini App cache را پاک کنید.",
+  "5) اگر خطای 401 بود، اپ را کامل ببندید و از دکمه /miniapp دوباره وارد شوید.",
+  "6) اگر هنوز وصل نشد، لاگ /health و پاسخ /api/user را برای پشتیبانی ارسال کنید."
+].join("\n");
 
 function getFreshInitData() {
   const latestTg = (tg?.initData || "").trim();
@@ -5990,11 +6004,11 @@ async function adminApi(path, body){
 function prettyErr(j, status){
   const e = j?.error || "نامشخص";
   if (status === 429 && String(e).startsWith("quota_exceeded")) return "سهمیه امروز تمام شد.";
-  if (status === 403 && String(e) === "onboarding_required") return "ابتدا حداقل نام یا یوزرنیم خود را تکمیل کنید.";
+  if (status === 403 && String(e) === "onboarding_required") return "لطفاً آنبوردینگ را کامل کن: نام، شماره، سرمایه، تعیین‌سطح و سبک.";
   if (status === 403 && String(e) === "forbidden") return "دسترسی این بخش برای نقش فعلی شما مجاز نیست.";
   if (status === 401) {
     if (String(e).includes("initData")) return "اتصال مینی‌اپ منقضی شده؛ اپ را مجدد از داخل تلگرام باز کنید.";
-    return "احراز هویت تلگرام ناموفق است.";
+    return "احراز هویت تلگرام ناموفق است.\n\n" + MINIAPP_EXEC_CHECKLIST;
   }
   return "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.";
 }
@@ -6170,10 +6184,10 @@ function pickTicketReplyTemplate(){
 }
 
 function updateMeta(state, quota){
-  const q = String(quota || "-");
+  const qRaw = String(quota || "-");
   let energy = "—";
   let remainTxt = "∞";
-  const m = q.match(/^(\d+)\/(\d+)$/);
+  const m = qRaw.match(/^(\d+)\/(\d+)$/);
   if (m) {
     const used = Number(m[1] || 0);
     const lim = Math.max(1, Number(m[2] || 1));
@@ -6181,19 +6195,19 @@ function updateMeta(state, quota){
     const pct = Math.max(0, Math.min(100, Math.round((remain / lim) * 100)));
     energy = pct + "%";
     remainTxt = String(remain);
-  } else if (q === "∞") {
+  } else if (qRaw === "∞") {
     energy = "100%";
     remainTxt = "∞";
   }
-  meta.textContent = "انرژی: " + energy + " | تحلیل باقی‌مانده: " + remainTxt + " | سهمیه: " + q;
+  meta.textContent = "انرژی: " + energy + " | تحلیل باقی‌مانده: " + remainTxt + " | سهمیه: " + qRaw;
   sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
   const q = String(quota || "");
-  const m = q.match(/(\d+)\s*\/\s*(\d+)/);
+  const m2 = q.match(/(\d+)\s*\/\s*(\d+)/);
   let used = 0;
   let limit = 0;
-  if (m) {
-    used = Number(m[1] || 0);
-    limit = Number(m[2] || 0);
+  if (m2) {
+    used = Number(m2[1] || 0);
+    limit = Number(m2[2] || 0);
   }
   const remaining = Math.max(0, limit - used);
   const pct = limit > 0 ? Math.max(0, Math.min(100, Math.round((remaining / limit) * 100))) : 100;
@@ -6611,7 +6625,7 @@ async function boot(){
         state: { timeframe: "H4", style: "پرایس اکشن", risk: "متوسط", newsEnabled: true, promptMode: "style_plus_custom", selectedSymbol: "BTCUSDT" },
         quota: "guest",
         symbols: ["BTCUSDT","ETHUSDT","XAUUSD","EURUSD"],
-        styles: ["پرایس اکشن","ICT","ATR","ترکیبی"],
+        styles: ["پرایس اکشن","ICT","ATR"],
         offerBanner: "اتصال محدود؛ برخی امکانات نیازمند احراز تلگرام است.",
         offerBannerImage: "",
         role: "user",
@@ -6624,6 +6638,7 @@ async function boot(){
       pillTxt.textContent = "Offline (Guest)";
       out.textContent = "حالت محدود فعال شد ✅ داده‌های پایه بارگذاری شدند.";
       showToast("حالت محدود", "برای همه امکانات، مینی‌اپ را از داخل تلگرام باز کنید.", "GUEST", false);
+      if (status === 401) out.textContent = "اتصال کامل برقرار نشد.\n\n" + MINIAPP_EXEC_CHECKLIST;
       setupLiveQuotePolling();
       setupNewsPolling();
       return;
@@ -6672,7 +6687,7 @@ async function boot(){
     });
 
     if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
-    if (el("offerBannerImageInput")) el("offerBannerImageInput").value = json.offerBannerImage || "";
+    if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = json.offerBannerImage || "";
     if (IS_OWNER && el("walletAddressInput")) el("walletAddressInput").value = json.wallet || "";
 
     await loadAdminBootstrap();
@@ -6690,7 +6705,7 @@ async function loadAdminBootstrap(){
   if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(json.customPrompts || [], null, 2);
   if (el("freeDailyLimit")) el("freeDailyLimit").value = String(json.freeDailyLimit ?? "");
   if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
-  if (el("offerBannerImageInput")) el("offerBannerImageInput").value = json.offerBannerImage || "";
+  if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = json.offerBannerImage || "";
   if (el("welcomeBotInput")) el("welcomeBotInput").value = json.welcomeBot || "";
   if (el("welcomeMiniappInput")) el("welcomeMiniappInput").value = json.welcomeMiniapp || "";
 
@@ -6802,25 +6817,35 @@ el("analyze").addEventListener("click", async () => {
   const chartCard = el("chartCard");
   const chartImg = el("chartImg");
   if (chartCard && chartImg) {
-      const u = json.chartUrl || "";
-      const fallbackSvg = json.zonesSvg || "";
-      if (fallbackSvg) {
-        renderChartFallbackSvg(fallbackSvg);
-      } else if (u) {
-        chartImg.onerror = () => {
-          chartImg.onerror = null;
-          chartImg.removeAttribute("src");
-          chartCard.style.display = "none";
-        };
-        chartImg.src = u;
-        chartCard.style.display = "block";
-        const cm = el("chartMeta");
-        if (cm) cm.textContent = "QuickChart";
-      } else {
+    const u = json.chartUrl || "";
+    const fallbackSvg = json.zonesSvg || "";
+    const tf = json?.quickchartConfig?.timeframe || val("timeframe") || "H4";
+    const zones = Array.isArray(json?.levels) ? json.levels.length : 0;
+    const candleCount = Number(json?.chartMeta?.candles || 0);
+    const cm = el("chartMeta");
+    if (u) {
+      chartImg.onerror = () => {
+        chartImg.onerror = null;
+        if (fallbackSvg) {
+          renderChartFallbackSvg(fallbackSvg);
+          const cmFallback = el("chartMeta");
+          if (cmFallback) cmFallback.textContent = "Zones SVG | TF: " + tf + " | zones: " + zones;
+          return;
+        }
         chartImg.removeAttribute("src");
         chartCard.style.display = "none";
-      }
+      };
+      chartImg.src = u;
+      chartCard.style.display = "block";
+      if (cm) cm.textContent = "Candlestick | TF: " + tf + " | candles: " + candleCount + " | zones: " + zones;
+    } else if (fallbackSvg) {
+      renderChartFallbackSvg(fallbackSvg);
+      if (cm) cm.textContent = "Zones SVG | TF: " + tf + " | zones: " + zones;
+    } else {
+      chartImg.removeAttribute("src");
+      chartCard.style.display = "none";
     }
+  }
   updateMeta(json.state, json.quota);
   showToast("آماده ✅", "خروجی دریافت شد", "OK", false);
   setTimeout(hideToast, 1200);
@@ -6910,9 +6935,12 @@ el("saveFreeLimit")?.addEventListener("click", async () => {
 el("saveOfferBanner")?.addEventListener("click", async () => {
   const offerBanner = el("offerBannerInput")?.value || "";
   let offerBannerImage = undefined;
-  const file = el("offerBannerImageInput")?.files?.[0];
+  const file = el("offerImageFile")?.files?.[0];
+  const imageUrl = String(el("offerBannerImageUrlInput")?.value || "").trim();
   if (file) {
     offerBannerImage = await fileToDataUrl(file);
+  } else if (imageUrl) {
+    offerBannerImage = imageUrl;
   }
   const { json } = await adminApi("/api/admin/offer", { offerBanner, offerBannerImage });
   if (json?.ok) {
@@ -6939,7 +6967,7 @@ el("offerImageFile")?.addEventListener("change", async (ev) => {
   const reader = new FileReader();
   reader.onload = () => {
     const dataUrl = typeof reader.result === "string" ? reader.result : "";
-    if (el("offerBannerImageInput")) el("offerBannerImageInput").value = dataUrl;
+    if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = dataUrl;
     if (offerImg) offerImg.src = dataUrl;
     if (offerMedia) offerMedia.classList.toggle("show", !!dataUrl);
   };
@@ -6949,7 +6977,7 @@ el("offerImageFile")?.addEventListener("change", async (ev) => {
 el("clearOfferImage")?.addEventListener("click", async () => {
   const offerBanner = el("offerBannerInput")?.value || "";
   const { json } = await adminApi("/api/admin/offer", { offerBanner, clearOfferBannerImage: true });
-  if (el("offerBannerImageInput")) el("offerBannerImageInput").value = "";
+  if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = "";
   if (el("offerImageFile")) el("offerImageFile").value = "";
   if (offerImg) offerImg.src = "";
   if (offerMedia) offerMedia.classList.remove("show");
@@ -7099,6 +7127,23 @@ el("saveCapitalToggle")?.addEventListener("click", async () => {
   }
 });
 
+
+el("customPromptsJsonFile")?.addEventListener("change", async (ev) => {
+  const file = ev?.target?.files?.[0];
+  if (!file) return;
+  try {
+    const txt = await file.text();
+    const parsed = safeJsonParse(txt, null);
+    if (!Array.isArray(parsed)) {
+      showToast("خطا", "فایل JSON باید آرایه باشد", "ADM", false);
+      return;
+    }
+    if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(parsed, null, 2);
+    showToast("بارگذاری شد ✅", "JSON پرامپت آماده ذخیره است", "ADM", false);
+  } catch {
+    showToast("خطا", "خواندن فایل JSON ناموفق بود", "ADM", false);
+  }
+});
 
 el("saveCustomPrompts")?.addEventListener("click", async () => {
   const raw = el("customPromptsJson")?.value || "[]";
