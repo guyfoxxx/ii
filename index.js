@@ -817,12 +817,14 @@ TxID: ${txid}
           let levels = [];
           let quickChartSpec = null;
           let zonesSvg = "";
+          let chartCandlesCount = 0;
           try {
             if (String(env.QUICKCHART || "") !== "0") {
               const tf = st.timeframe || "H4";
               levels = extractLevels(result);
               const origin = new URL(request.url).origin;
               const candles = await getMarketCandlesWithFallback(env, symbol, tf).catch(() => []);
+              chartCandlesCount = Array.isArray(candles) ? candles.length : 0;
               if (Array.isArray(candles) && candles.length) {
                 chartUrl = `${origin}/api/chart?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&levels=${encodeURIComponent(levels.join(","))}`;
                 quickChartSpec = buildQuickChartSpec(candles, symbol, tf, levels);
@@ -839,8 +841,10 @@ TxID: ${txid}
           } catch (e) {
             console.error("zones svg build error:", e?.message || e);
           }
-          const quickchartConfig = { symbol, timeframe: st.timeframe || "H4", levels };
-          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec, quickchartConfig, zonesSvg });
+          const tf = st.timeframe || "H4";
+          const quickchartConfig = { symbol, timeframe: tf, levels };
+          const chartMeta = { timeframe: tf, candles: chartCandlesCount, zones: levels.length };
+          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec, quickchartConfig, chartMeta, zonesSvg });
         } catch (e) {
           console.error("api/analyze error:", e);
           return jsonResponse({ ok: false, error: "server_error" }, 500);
@@ -5772,6 +5776,11 @@ const reportBlock = document.getElementById("reportBlock");
 const roleLabel = document.getElementById("roleLabel");
 const energyToday = document.getElementById("energyToday");
 const remainingAnalyses = document.getElementById("remainingAnalyses");
+const remainingText = document.getElementById("remainingText");
+const energyText = document.getElementById("energyText");
+const energyFill = document.getElementById("energyFill");
+const offerMedia = document.getElementById("offerMedia");
+const offerImg = document.getElementById("offerImg");
 
 function el(id){ return document.getElementById(id); }
 function val(id){ return el(id).value; }
@@ -6170,10 +6179,10 @@ function pickTicketReplyTemplate(){
 }
 
 function updateMeta(state, quota){
-  const q = String(quota || "-");
+  const qRaw = String(quota || "-");
   let energy = "—";
   let remainTxt = "∞";
-  const m = q.match(/^(\d+)\/(\d+)$/);
+  const m = qRaw.match(/^(\d+)\/(\d+)$/);
   if (m) {
     const used = Number(m[1] || 0);
     const lim = Math.max(1, Number(m[2] || 1));
@@ -6181,19 +6190,19 @@ function updateMeta(state, quota){
     const pct = Math.max(0, Math.min(100, Math.round((remain / lim) * 100)));
     energy = pct + "%";
     remainTxt = String(remain);
-  } else if (q === "∞") {
+  } else if (qRaw === "∞") {
     energy = "100%";
     remainTxt = "∞";
   }
-  meta.textContent = "انرژی: " + energy + " | تحلیل باقی‌مانده: " + remainTxt + " | سهمیه: " + q;
+  meta.textContent = "انرژی: " + energy + " | تحلیل باقی‌مانده: " + remainTxt + " | سهمیه: " + qRaw;
   sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
   const q = String(quota || "");
-  const m = q.match(/(\d+)\s*\/\s*(\d+)/);
+  const m2 = q.match(/(\d+)\s*\/\s*(\d+)/);
   let used = 0;
   let limit = 0;
-  if (m) {
-    used = Number(m[1] || 0);
-    limit = Number(m[2] || 0);
+  if (m2) {
+    used = Number(m2[1] || 0);
+    limit = Number(m2[2] || 0);
   }
   const remaining = Math.max(0, limit - used);
   const pct = limit > 0 ? Math.max(0, Math.min(100, Math.round((remaining / limit) * 100))) : 100;
@@ -6802,25 +6811,35 @@ el("analyze").addEventListener("click", async () => {
   const chartCard = el("chartCard");
   const chartImg = el("chartImg");
   if (chartCard && chartImg) {
-      const u = json.chartUrl || "";
-      const fallbackSvg = json.zonesSvg || "";
-      if (fallbackSvg) {
-        renderChartFallbackSvg(fallbackSvg);
-      } else if (u) {
-        chartImg.onerror = () => {
-          chartImg.onerror = null;
-          chartImg.removeAttribute("src");
-          chartCard.style.display = "none";
-        };
-        chartImg.src = u;
-        chartCard.style.display = "block";
-        const cm = el("chartMeta");
-        if (cm) cm.textContent = "QuickChart";
-      } else {
+    const u = json.chartUrl || "";
+    const fallbackSvg = json.zonesSvg || "";
+    const tf = json?.quickchartConfig?.timeframe || val("timeframe") || "H4";
+    const zones = Array.isArray(json?.levels) ? json.levels.length : 0;
+    const candleCount = Number(json?.chartMeta?.candles || 0);
+    const cm = el("chartMeta");
+    if (u) {
+      chartImg.onerror = () => {
+        chartImg.onerror = null;
+        if (fallbackSvg) {
+          renderChartFallbackSvg(fallbackSvg);
+          const cmFallback = el("chartMeta");
+          if (cmFallback) cmFallback.textContent = "Zones SVG | TF: " + tf + " | zones: " + zones;
+          return;
+        }
         chartImg.removeAttribute("src");
         chartCard.style.display = "none";
-      }
+      };
+      chartImg.src = u;
+      chartCard.style.display = "block";
+      if (cm) cm.textContent = "Candlestick | TF: " + tf + " | candles: " + candleCount + " | zones: " + zones;
+    } else if (fallbackSvg) {
+      renderChartFallbackSvg(fallbackSvg);
+      if (cm) cm.textContent = "Zones SVG | TF: " + tf + " | zones: " + zones;
+    } else {
+      chartImg.removeAttribute("src");
+      chartCard.style.display = "none";
     }
+  }
   updateMeta(json.state, json.quota);
   showToast("آماده ✅", "خروجی دریافت شد", "OK", false);
   setTimeout(hideToast, 1200);
