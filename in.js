@@ -719,88 +719,6 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await authMiniappRequest(request, body, env);
-        const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
-        if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
-
-        const st = v.ok ? await ensureUser(v.userId, env) : defaultUser("guest");
-        const symbol = String(body.symbol || "").trim();
-        const tf = String(body.timeframe || st.timeframe || "H4").toUpperCase();
-        if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
-
-        const quoteRespKey = `quote|${symbol}|${tf}`;
-        const quoteCachedResp = apiRespCacheGet(quoteRespKey);
-        if (quoteCachedResp) return jsonResponse(quoteCachedResp);
-
-        let candles = [];
-        try {
-          candles = await getMarketCandlesWithFallback(env, symbol, tf);
-        } catch (e) {
-          console.error("api/quote market fallback failed:", e?.message || e);
-          candles = [];
-        }
-        if (!Array.isArray(candles) || !candles.length) {
-          candles = await getMarketCacheStale(env, marketCacheKey(symbol, tf));
-        }
-        if (!Array.isArray(candles) || !candles.length) {
-          return jsonResponse({ ok: false, error: "quote_unavailable" }, 404);
-        }
-
-        const snap = computeSnapshot(candles);
-        if (!snap || !Number.isFinite(Number(snap.lastPrice))) {
-          return jsonResponse({ ok: false, error: "quote_bad_data" }, 502);
-        }
-        const cp = Number(snap.changePct || 0);
-        const status = cp > 0.08 ? "up" : (cp < -0.08 ? "down" : "flat");
-        const quality = candles.length >= minCandlesForTimeframe(tf) ? "full" : "limited";
-
-        const quotePayload = {
-          ok: true,
-          symbol,
-          timeframe: tf,
-          price: Number(snap.lastPrice),
-          changePct: cp,
-          trend: snap.trend || "نامشخص",
-          sma20: snap.sma20,
-          sma50: snap.sma50,
-          lastTs: snap.lastTs,
-          candles: candles.length,
-          quality,
-          status,
-        };
-        apiRespCacheSet(quoteRespKey, quotePayload, Number(env.QUOTE_RESPONSE_CACHE_MS || 10000));
-        return jsonResponse(quotePayload);
-      }
-
-      if (url.pathname === "/api/news" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-
-        const v = await authMiniappRequest(request, body, env);
-        const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
-        if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
-
-        const symbol = String(body.symbol || "").trim().toUpperCase();
-        if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
-
-        const newsRespKey = `news|${symbol}`;
-        const newsCachedResp = apiRespCacheGet(newsRespKey);
-        if (newsCachedResp) return jsonResponse(newsCachedResp);
-        try {
-          const articles = await fetchSymbolNewsFa(symbol, env);
-          const payload = { ok: true, symbol, articles, count: articles.length };
-          apiRespCacheSet(newsRespKey, payload, Number(env.NEWS_RESPONSE_CACHE_MS || 30000));
-          return jsonResponse(payload);
-        } catch (e) {
-          console.error("api/news failed:", e?.message || e);
-          return jsonResponse({ ok: false, error: "news_unavailable", symbol, articles: [] }, 502);
-        }
-      }
-
-      if (url.pathname === "/api/quote" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-
         const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
@@ -848,6 +766,25 @@ TxID: ${txid}
       }
 
       if (url.pathname === "/api/news" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
+        const symbol = String(body.symbol || "").trim().toUpperCase();
+        if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
+
+        try {
+          const articles = await fetchSymbolNewsFa(symbol, env);
+          return jsonResponse({ ok: true, symbol, articles, count: articles.length });
+        } catch (e) {
+          console.error("api/news failed:", e?.message || e);
+          return jsonResponse({ ok: false, error: "news_unavailable", symbol, articles: [] }, 502);
+        }
+      }
+
+      if (url.pathname === "/api/analyze" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
@@ -1315,38 +1252,26 @@ async function getCachedR2ValueAllowStale(bucket, key) {
 }
 
 /* ========================== PROMPTS (ADMIN/OWNER ONLY) ========================== */
-const DEFAULT_ANALYSIS_PROMPT = `SYSTEM OVERRIDE: تحلیل‌گر چندسبکی بازار (BASE PROMPT)
+const DEFAULT_ANALYSIS_PROMPT = `SYSTEM: Professional multi-style trading analyst.
+Use only STYLE_PROMPT and STYLE_USER_CONTEXT.
 
-متغیرها:
+INPUT KEYS:
 - STYLE_MODE: {STYLE}
 - RISK_PROFILE: {RISK}
 - NEWS_MODE: {NEWS}
 - TIMEFRAME: {TIMEFRAME}
 
-قوانین قطعی:
-1) خروجی فقط فارسی باشد.
-2) فقط از MARKET_DATA استفاده کن و اگر داده ناکافی است شفاف اعلام کن.
-3) سیگنال قطعی نده؛ سناریومحور و شرطی بنویس.
-4) اعداد کلیدی را دقیق بنویس و اگر ناموجود بود «نامشخص از داده» درج کن.
-5) مدیریت ریسک را الزامی بیاور (Entry / SL / TP).
-
-راهنمای سبک:
-- پرایس اکشن: ساختار بازار، شکست/پولبک، نواحی حمایت/مقاومت، رفتار کندل.
-- ICT: نقدینگی، Sweep/Grab، OB/FVG، شکست ساختار و جهت حرکت پول هوشمند.
-- ATR: وضعیت نوسان، SL/TP مبتنی بر ATR، فیلتر ورود در نوسان‌های پرریسک.
-- ترکیبی: بهترین اجزای سه سبک را بدون تناقض ادغام کن.
-
-راهنمای ریسک:
-- کم: ورود با تایید قوی، SL محافظه‌کار.
-- متوسط: تایید استاندارد، TP مرحله‌ای.
-- زیاد: هشدار ریسک بالا + سناریوی ابطال دقیق.
-
-فرمت خروجی (اجباری):
-۱) ساختار و وضعیت بازار
-۲) نواحی کلیدی و نقدینگی
-۳) سناریوهای ورود/خروج مشروط
-۴) مدیریت ریسک و ابطال تحلیل
-۵) جمع‌بندی کوتاه اجرایی`;
+MANDATORY RULES:
+1) Output must be Persian.
+2) Use only MARKET_DATA (+ NEWS_HEADLINES_FA when present).
+3) Respect style boundaries; no cross-style mixing.
+4) Include conditional execution with Entry / SL / TP and invalidation.
+5) Keep response in 5 numbered sections:
+   ۱) ساختار و بایاس
+   ۲) سطوح و نقدینگی
+   ۳) سناریوهای ورود
+   ۴) مدیریت ریسک/سرمایه
+   ۵) جمع‌بندی و شرایط ابطال`;
 
 /* ========================== STYLE PROMPTS (DEFAULTS) ==========================
  * Users choose st.style (Persian labels) and we inject a style-specific guide
@@ -3245,6 +3170,65 @@ function timeframeMinutes(tf) {
   return map[String(tf || "").toUpperCase()] || 0;
 }
 
+function symbolNewsQueryFa(symbol) {
+  const map = {
+    BTCUSDT: "بیت کوین", ETHUSDT: "اتریوم", BNBUSDT: "بایننس کوین", SOLUSDT: "سولانا",
+    XRPUSDT: "ریپل", ADAUSDT: "کاردانو", DOGEUSDT: "دوج کوین", AVAXUSDT: "آوالانچ",
+    EURUSD: "یورو دلار", GBPUSD: "پوند دلار", USDJPY: "دلار ین", AUDUSD: "دلار استرالیا",
+    XAUUSD: "طلا", XAGUSD: "نقره", DJI: "داوجونز", NDX: "نزدک", SPX: "اس اند پی 500"
+  };
+  return (map[symbol] || symbol) + " بازار مالی";
+}
+
+function stripTags(s) {
+  return String(s || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function decodeXmlEntities(s) {
+  return String(s || "")
+    .split("&amp;").join("&")
+    .split("&lt;").join("<")
+    .split("&gt;").join(">")
+    .split("&quot;").join('"')
+    .split("&#39;").join("'");
+}
+
+function parseRssItems(xml, limit) {
+  const raw = String(xml || "");
+  const blocks = raw.match(/<item>[\s\S]*?<\/item>/g) || [];
+  const out = [];
+  for (const b of blocks.slice(0, limit * 2)) {
+    const title = decodeXmlEntities(stripTags((b.match(/<title>([\s\S]*?)<\/title>/i) || [])[1] || "")).trim();
+    const link = decodeXmlEntities(((b.match(/<link>([\s\S]*?)<\/link>/i) || [])[1] || "").trim());
+    const source = decodeXmlEntities(stripTags((b.match(/<source[^>]*>([\s\S]*?)<\/source>/i) || [])[1] || "")).trim();
+    const pubDate = decodeXmlEntities(stripTags((b.match(/<pubDate>([\s\S]*?)<\/pubDate>/i) || [])[1] || "")).trim();
+    if (!title || !link) continue;
+    out.push({ title: title.slice(0, 180), url: link, source: source || "Google News", publishedAt: pubDate || "" });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+async function buildNewsBlockForSymbol(symbol, env, maxItems = 4) {
+  try {
+    const rows = await fetchSymbolNewsFa(symbol, env);
+    if (!Array.isArray(rows) || !rows.length) return "";
+    return rows.slice(0, maxItems).map((x, i) => {
+      const src = x?.source ? (" | " + x.source) : "";
+      const dt = x?.publishedAt ? (" | " + x.publishedAt) : "";
+      return (i + 1) + ") " + String(x?.title || "") + src + dt;
+    }).join("
+");
+  } catch {
+    return "";
+  }
+}
+
+function timeframeMinutes(tf) {
+  const map = { M1: 1, M5: 5, M15: 15, M30: 30, H1: 60, H4: 240, D1: 1440, W1: 10080 };
+  return map[String(tf || "").toUpperCase()] || 0;
+}
+
 async function fetchSymbolNewsFa(symbol, env) {
   const query = symbolNewsQueryFa(symbol);
   const timeoutMs = Number(env.NEWS_TIMEOUT_MS || 9000);
@@ -3457,6 +3441,37 @@ function buildLocalFallbackAnalysis(symbol, st, candles, reason = "") {
     "۵) وضعیت سرویس",
     `تحلیل با فالبک داخلی تولید شد (${reason || "text_provider_unavailable"}).`,
   ].join(String.fromCharCode(10));
+}
+
+function minCandlesForTimeframe(tf) {
+  const m = { M15: 48, H1: 36, H4: 30, D1: 20 };
+  return m[String(tf || "").toUpperCase()] || 24;
+}
+
+function buildLocalFallbackAnalysis(symbol, timeframe, candles, reason) {
+  const snap = computeSnapshot(Array.isArray(candles) ? candles : []);
+  const levels = extractLevelsFromCandles(candles, 8);
+  const levelTxt = levels.length ? levels.join(" | ") : "داده کافی نیست";
+  const risk = snap ? (Math.abs(Number(snap.changePct || 0)) > 2 ? "بالا" : "متوسط") : "نامشخص";
+  const bias = snap?.trend || "نامشخص";
+  return [
+    `۱) وضعیت کلی`,
+    `نماد ${symbol} در تایم‌فریم ${timeframe} با بایاس ${bias} ارزیابی شد.`,
+    snap ? `قیمت آخر: ${snap.lastPrice} | تغییر: ${snap.changePct}%` : "قیمت لحظه‌ای معتبر در دسترس نیست.",
+    ``,
+    `۲) زون‌ها و سطوح`,
+    `سطوح پیشنهادی (auto): ${levelTxt}`,
+    ``,
+    `۳) سناریوها`,
+    `سناریوی اصلی: ادامه ${bias === "صعودی" ? "حرکت رو به بالا" : (bias === "نزولی" ? "فشار فروش" : "نوسانی")}.`,
+    `سناریوی جایگزین: شکست ساختار خلاف جهت و بازگشت به محدوده‌های میانی.`,
+    ``,
+    `۴) مدیریت ریسک`,
+    `ریسک بازار: ${risk}. ورود پله‌ای، حدضرر اجباری و کاهش اهرم توصیه می‌شود.`,
+    ``,
+    `۵) وضعیت سرویس`,
+    `تحلیل با فالبک داخلی تولید شد (${reason || "text_provider_unavailable"}).`,
+  ].join("\n");
 }
 
 function minCandlesForTimeframe(tf) {
@@ -4107,16 +4122,7 @@ ${summary || "تحلیل خبری در دسترس نیست."}`, mainMenuKeyboard
       return tgSendMessage(
         env,
         chatId,
-        `✅ تعیین سطح انجام شد.
-
-سطح: ${st.profile.level}
-پیشنهاد بازار: ${marketFa}
-
-تنظیمات پیشنهادی:
-⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}
-
-یادداشت:
-${st.profile.levelNotes || "—"}${nudge}
+        `✅ تعیین سطح انجام شد.\n\nسطح: ${st.profile.level}\nپیشنهاد بازار: ${marketFa}\n\nتنظیمات پیشنهادی:\n⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}\n\nیادداشت:\n${st.profile.levelNotes || "—"}\n\nنمونه تحلیل کوتاه مطابق پروفایل شما: برای ${st.profile?.preferredSymbol || "BTCUSDT"} در ${st.timeframe}، اگر قیمت بالای ناحیه تایید بسته شود سناریوی ادامه فعال است و در غیر این‌صورت تا تایید بعدی صبر کن.
 
 اگر می‌خوای دوباره تعیین‌سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
         mainMenuKeyboard(env)
@@ -4690,6 +4696,24 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
 
   const encoded = encodeURIComponent(JSON.stringify(cfg));
   return `https://quickchart.io/chart?version=4&format=png&w=900&h=450&devicePixelRatio=2&plugins=chartjs-chart-financial,chartjs-plugin-annotation&c=${encoded}`;
+}
+
+function buildQuickChartLevelsOnlyUrl(symbol, tf, levels = []) {
+  const lv = levels.map(Number).filter(Number.isFinite).slice(0, 12);
+  const labels = lv.map((_, i) => `L${i + 1}`);
+  const cfg = {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{ label: `${symbol} ${tf} levels`, data: lv, borderColor: "#22d3ee", backgroundColor: "rgba(34,211,238,.15)", fill: true, tension: 0.2 }],
+    },
+    options: {
+      plugins: { legend: { display: true }, title: { display: true, text: `${symbol} · ${tf} · levels` } },
+      scales: { y: { grid: { color: "rgba(148,163,184,.25)" } }, x: { grid: { color: "rgba(148,163,184,.15)" } } },
+    },
+  };
+  const encoded = encodeURIComponent(JSON.stringify(cfg));
+  return `https://quickchart.io/chart?version=4&format=png&w=900&h=450&devicePixelRatio=2&c=${encoded}`;
 }
 
 function buildQuickChartLevelsOnlyUrl(symbol, tf, levels = []) {
@@ -5721,33 +5745,6 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="offer-media" id="offerMedia"><img id="offerImg" alt="offer" /></div>
         </div>
       </div>
-      <div class="card tab-section active" id="quoteCard" data-tab-section="dashboard">
-        <div class="card-h">
-          <strong>داشبورد قیمت لحظه‌ای</strong>
-          <span id="quoteStamp">—</span>
-        </div>
-        <div class="card-b">
-          <div class="quote-grid">
-            <div class="quote-item"><div class="k">نماد</div><div class="v" id="quoteSymbol">—</div></div>
-            <div class="quote-item"><div class="k">قیمت</div><div class="v" id="quotePrice">—</div></div>
-            <div class="quote-item"><div class="k">تغییر</div><div class="v" id="quoteChange">—</div></div>
-            <div class="quote-item"><div class="k">روند</div><div class="v" id="quoteTrend">—</div></div>
-          </div>
-          <div class="muted" style="font-size:12px; margin-top:8px;" id="quoteMeta">در حال دریافت داده…</div>
-        </div>
-      </div>
-
-      <div class="card tab-section" id="newsCard" data-tab-section="news">
-        <div class="card-h">
-          <strong>📰 اخبار فارسی نماد</strong>
-          <button id="refreshNews" class="btn ghost" style="min-width:unset; padding:6px 10px;">بروزرسانی</button>
-        </div>
-        <div class="card-b">
-          <div class="mini-list" id="newsList">در حال دریافت خبر…</div>
-          <div class="muted" style="margin-top:10px; font-size:12px;">تحلیل خبری:</div>
-          <div class="mini-list" id="newsAnalysis">در حال تولید تحلیل خبری…</div>
-        </div>
-      </div>
       <div class="card" id="quoteCard">
         <div class="card-h">
           <strong>داشبورد قیمت لحظه‌ای</strong>
@@ -5771,6 +5768,34 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
         <div class="card-b">
           <div class="mini-list" id="newsList">در حال دریافت خبر…</div>
+        </div>
+      </div>
+
+      <div class="card" id="walletCard">
+        <div class="card-h">
+          <strong>💳 ولت</strong>
+          <span>marketi1 PRO — با ارزش ۲۵ USDT</span>
+        </div>
+        <div class="card-b">
+          <div class="mini-list" id="walletAddressView">ولت: —</div>
+          <div class="mini-list" id="walletDepositGuide">واریزی فقط به آدرس ولت درگاه ممکن است
+در لیست زیر باید از واریز هش واریزی را ارسال کنید.</div>
+          <div class="mini-list" id="walletTxHistory">تاریخچه تراکنشات: —</div>
+        </div>
+      </div>
+
+      <div class="card" id="inviteCard">
+        <div class="card-h">
+          <strong>🤝 دعوت</strong>
+          <span id="inviteMeta">دعوت موفق: ۰ | امتیاز شما: ۰</span>
+        </div>
+        <div class="card-b">
+          <div class="mini-list" id="inviteLinkView">لینک رفرال: —</div>
+          <div class="actions">
+            <button id="copyReferral" class="btn">کپی لینک رفرال</button>
+            <button id="shareReferral" class="btn ghost">اشتراک سریع</button>
+          </div>
+          <div class="mini-list">با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتباز بدست می اورید در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید</div>
         </div>
       </div>
 
@@ -6225,67 +6250,16 @@ let NEWS_TIMER = null;
 
 const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
 
-function getFreshInitData() {
-  const tg = window.Telegram?.WebApp;
-  const latestTg = (tg?.initData || "").trim();
-  if (latestTg) {
-    INIT_DATA = latestTg;
-    try { localStorage.setItem(LOCAL_KEYS.initData, latestTg); } catch {}
-  }
-  return INIT_DATA || latestTg || "";
-}
-
-function buildAuthBody(extra = {}) {
-  const initData = getFreshInitData();
-  if (initData) return { initData, ...extra };
-  const miniToken = MINI_TOKEN || localStorage.getItem(LOCAL_KEYS.miniToken) || "";
-  if (miniToken) return { miniToken, ...extra };
-  if (extra?.allowGuest) return { ...extra, allowGuest: true };
-  return { ...extra };
-}
-
-function isTelegramLikelyContext() {
-  const ua = String(navigator.userAgent || "").toLowerCase();
-  const hasTgData = !!(window.Telegram || getParamEverywhere("tgWebAppData") || getParamEverywhere("tgWebAppVersion"));
-  return ua.includes("telegram") || hasTgData;
-}
-
-function showOpenInTelegramState(msg) {
-  out.textContent = msg;
-  const box = document.createElement("div");
-  box.style.marginTop = "10px";
-  const btn = document.createElement("button");
-  btn.className = "btn";
-  btn.type = "button";
-  btn.textContent = "کپی لینک برای باز کردن داخل Telegram";
-  btn.onclick = async () => {
-    const link = window.location.href;
-    try {
-      await navigator.clipboard.writeText(link);
-      showToast("لینک کپی شد", "آن را در Telegram باز کنید", "COPY", false);
-    } catch {
-      showToast("کپی نشد", "لینک را دستی کپی کنید", "LINK", false);
-    }
-  };
-  box.appendChild(btn);
-  out.appendChild(box);
-}
-
-function isTelegramLikelyContext() {
-  const ua = String(navigator.userAgent || "").toLowerCase();
-  const hasTgData = !!(window.Telegram || getParamEverywhere("tgWebAppData") || getParamEverywhere("tgWebAppVersion"));
-  return ua.includes("telegram") || hasTgData;
-}
-
-
-function getParamEverywhere(name) {
-  const n = String(name || "").trim();
-  if (!n) return "";
-  const q = new URLSearchParams(window.location.search).get(n) || "";
-  if (q) return q;
-  const hash = String(window.location.hash || "").replace(/^#/, "");
-  const h = new URLSearchParams(hash).get(n) || "";
-  return h || "";
+function extractInitDataFromUrl() {
+  const q = new URLSearchParams(window.location.search || "");
+  const h = new URLSearchParams((window.location.hash || "").replace(/^#/, ""));
+  return (
+    q.get("initData") ||
+    q.get("tgWebAppData") ||
+    h.get("initData") ||
+    h.get("tgWebAppData") ||
+    ""
+  );
 }
 
 function showToast(title, subline = "", badge = "", loading = false){
@@ -6505,6 +6479,51 @@ function setupNewsPolling(){
   if (NEWS_TIMER) clearInterval(NEWS_TIMER);
   refreshSymbolNews(true);
   NEWS_TIMER = setInterval(() => { refreshSymbolNews(false); }, 60000);
+}
+
+function renderWalletSection(state, walletAddress){
+  const wa = el("walletAddressView");
+  const wh = el("walletTxHistory");
+  if (wa) wa.textContent = "ولت: " + (walletAddress || "—");
+  const txs = Array.isArray(state?.wallet?.transactions) ? state.wallet.transactions.slice().reverse() : [];
+  if (wh) {
+    if (!txs.length) wh.textContent = "تاریخچه تراکنشات: —";
+    else wh.textContent = "تاریخچه تراکنشات:\n" + txs.slice(0, 8).map((t) => "• " + (t.createdAt || "") + " | " + (t.txHash || "-") + " | " + (t.amount || 0)).join("\n");
+  }
+}
+
+function referralLinkFromState(state){
+  const uid = String(state?.userId || "");
+  const code = String(state?.referral?.codes?.[0] || "");
+  const bot = (window.Telegram?.WebApp?.initDataUnsafe?.user?.username || "").trim();
+  if (code && bot) return "https://t.me/" + bot + "?start=" + code;
+  if (code) return "ref:" + code;
+  if (uid) return "ref_" + uid;
+  return "";
+}
+
+function renderInviteSection(state){
+  const inv = Number(state?.referral?.successfulInvites || 0);
+  const pts = Number(state?.referral?.points || 0);
+  const meta = el("inviteMeta");
+  const linkView = el("inviteLinkView");
+  const link = referralLinkFromState(state);
+  if (meta) meta.textContent = "دعوت موفق: " + inv + " | امتیاز شما: " + pts;
+  if (linkView) linkView.textContent = "لینک رفرال: " + (link || "—");
+  if (el("copyReferral")) {
+    el("copyReferral").onclick = async () => {
+      try { await navigator.clipboard.writeText(link || ""); showToast("کپی شد ✅", "لینک رفرال کپی شد", "REF", false); }
+      catch { showToast("خطا", "کپی لینک ناموفق بود", "REF", false); }
+    };
+  }
+  if (el("shareReferral")) {
+    el("shareReferral").onclick = async () => {
+      if (navigator.share && link) {
+        try { await navigator.share({ title: "دعوت به مارکت آی", text: "با لینک من عضو شو", url: link }); return; } catch {}
+      }
+      if (link) window.open("https://t.me/share/url?url=" + encodeURIComponent(link), "_blank");
+    };
+  }
 }
 
 function renderChartFallbackSvg(svgText){
@@ -6750,7 +6769,12 @@ async function boot(){
   pillTxt.textContent = "Connecting…";
   showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
 
-  const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
+  try {
+    if (tg?.expand) tg.expand();
+    if (tg?.setHeaderColor) tg.setHeaderColor("secondary_bg_color");
+  } catch {}
+
+  const qsInitData = extractInitDataFromUrl();
   const savedInitData = localStorage.getItem("miniapp_init_data") || "";
   const initData = tg?.initData || qsInitData || savedInitData;
   if (!initData) {
@@ -6800,171 +6824,8 @@ function applyUserState(json) {
   }
 
   updateMeta(json.state, json.quota);
-}
-
-
-function storageGetObj(key, fallback = {}) {
-  try {
-    const raw = localStorage.getItem(key);
-    const parsed = raw ? JSON.parse(raw) : fallback;
-    return parsed && typeof parsed === "object" ? parsed : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function storageSetObj(key, value) {
-  try { localStorage.setItem(key, JSON.stringify(value || {})); } catch {}
-}
-
-function cacheByKey(key, itemKey, value) {
-  const bag = storageGetObj(key, {});
-  bag[itemKey] = { ...(value || {}), cachedAt: Date.now() };
-  storageSetObj(key, bag);
-}
-
-function readByKey(key, itemKey) {
-  const bag = storageGetObj(key, {});
-  return bag[itemKey] || null;
-}
-
-function quoteCacheKey(symbol, timeframe) {
-  return String(symbol || "").toUpperCase() + "|" + String(timeframe || "H4").toUpperCase();
-}
-
-function newsCacheKey(symbol) {
-  return String(symbol || "").toUpperCase();
-}
-
-function analyzeCacheKey(symbol) {
-  return String(symbol || "").toUpperCase();
-}
-
-// تست دستی: داخل تلگرام tg/initData آماده می‌شود و /api/user باید ok باشد.
-// خارج تلگرام پیام "داخل تلگرام باز کنید" نمایش داده می‌شود و حالت محدود/مهمان فعال می‌ماند.
-async function boot(){
-  out.textContent = "⏳ در حال آماده‌سازی…";
-  pillTxt.textContent = "Connecting…";
-  showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
-
-  const { tg, isTelegramRuntime } = await ensureTelegramReady();
-
-  const preCached = readCachedUserSnapshot();
-  if (preCached) {
-    applyUserState(preCached);
-    out.textContent = "⏳ در حال همگام‌سازی با سرور…";
-    pillTxt.textContent = "Syncing…";
-    setupLiveQuotePolling();
-    setupNewsPolling();
-  }
-
-  const devModeEnabled = String(window.MINIAPP_DEV_MODE || "").trim() === "1";
-  const maybeTelegram = isTelegramRuntime || isTelegramLikelyContext();
-  const qsInitData = getParamEverywhere("initData") || "";
-  const savedInitData = localStorage.getItem(LOCAL_KEYS.initData) || "";
-  let initData = (tg?.initData || "").trim();
-
-  // Telegram WebApp may populate initData with a slight delay.
-  if (isTelegramRuntime && !initData) {
-    for (let i = 0; i < 8 && !initData; i++) {
-      await new Promise((r) => setTimeout(r, 300));
-      initData = (tg?.initData || "").trim();
-    }
-  }
-
-  if (initData) {
-    INIT_DATA = initData;
-    localStorage.setItem(LOCAL_KEYS.initData, initData);
-  } else if (qsInitData) {
-    INIT_DATA = qsInitData;
-    localStorage.setItem(LOCAL_KEYS.initData, qsInitData);
-  } else if (savedInitData) {
-    INIT_DATA = savedInitData;
-  } else if (!isTelegramRuntime && devModeEnabled) {
-    const devInit = "dev:999001";
-    INIT_DATA = devInit;
-    localStorage.setItem(LOCAL_KEYS.initData, devInit);
-    showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
-  } else {
-    INIT_DATA = "";
-    if (!isTelegramRuntime && maybeTelegram) {
-      showToast("اتصال تلگرام کامل نشد", "لطفاً مینی‌اپ را دوباره از داخل Telegram باز کنید.", "WAIT", false);
-    } else if (!isTelegramRuntime) {
-      showToast("داخل تلگرام باز کنید", "این صفحه باید داخل Telegram WebView باز شود.", "BLOCKED", false);
-      showOpenInTelegramState("این صفحه باید داخل تلگرام باز شود.");
-    } else {
-      showToast("حالت مهمان", "اتصال احراز نشده؛ اجرای محدود با داده عمومی", "GUEST", false);
-    }
-  }
-  let {status, json} = await api("/api/user", buildAuthBody({ allowGuest: true }));
-
-
-  if (!json?.ok && status === 401 && isTelegramRuntime && tg?.initData && !INIT_DATA) {
-    INIT_DATA = tg.initData.trim();
-    if (INIT_DATA) {
-      try { localStorage.setItem(LOCAL_KEYS.initData, INIT_DATA); } catch {}
-      const retryTg = await api("/api/user", buildAuthBody({ allowGuest: true }));
-      status = retryTg.status;
-      json = retryTg.json;
-    }
-  }
-
-  if (!json?.ok && status === 401 && isTelegramRuntime && tg?.initData && !INIT_DATA) {
-    INIT_DATA = tg.initData.trim();
-    if (INIT_DATA) {
-      try { localStorage.setItem(LOCAL_KEYS.initData, INIT_DATA); } catch {}
-      const retryTg = await api("/api/user", buildAuthBody({ allowGuest: true }));
-      status = retryTg.status;
-      json = retryTg.json;
-    }
-  }
-
-  if (!json?.ok) {
-    if (status === 401) {
-      try { localStorage.removeItem(LOCAL_KEYS.initData); } catch {}
-    }
-    const cached = readCachedUserSnapshot();
-    if (!cached) {
-      const fallback = {
-        welcome: "نسخه محدود مینی‌اپ فعال شد.",
-        state: { timeframe: "H4", style: "پرایس اکشن", risk: "متوسط", newsEnabled: true, promptMode: "style_plus_custom", selectedSymbol: "BTCUSDT" },
-        quota: "guest",
-        symbols: ["BTCUSDT","ETHUSDT","XAUUSD","EURUSD"],
-        styles: ["پرایس اکشن","ICT","ATR","ترکیبی"],
-        offerBanner: "اتصال محدود؛ برخی امکانات نیازمند احراز تلگرام است.",
-        offerBannerImage: "",
-        role: "user",
-        isStaff: false,
-        customPrompts: [],
-      };
-      OFFLINE_MODE = true;
-      IS_GUEST = true;
-      applyUserState(fallback);
-      pillTxt.textContent = "Offline (Guest)";
-      out.textContent = "حالت محدود فعال شد ✅ داده‌های پایه بارگذاری شدند.";
-      showToast("حالت محدود", "برای همه امکانات، مینی‌اپ را از داخل تلگرام باز کنید.", "GUEST", false);
-      setupLiveQuotePolling();
-      setupNewsPolling();
-      return;
-    }
-    OFFLINE_MODE = !navigator.onLine;
-    IS_GUEST = true;
-    applyUserState(cached);
-    out.textContent = OFFLINE_MODE
-      ? "حالت آفلاین فعال شد ✅ امکانات از کش محلی بارگذاری می‌شود."
-      : "حالت محدود فعال شد ✅ داده‌های ذخیره‌شده بارگذاری شد و اتصال خواندنی در حال تلاش است.";
-    pillTxt.textContent = OFFLINE_MODE ? "Offline (Cached)" : "Limited (Guest)";
-    hideToast();
-    showToast(OFFLINE_MODE ? "آفلاین" : "حالت محدود", OFFLINE_MODE ? "داده‌های ذخیره‌شده بارگذاری شد" : "اتصال خواندنی مهمان فعال شد", OFFLINE_MODE ? "CACHE" : "GUEST", false);
-    setupLiveQuotePolling();
-    setupNewsPolling();
-    return;
-  }
-}
-
-  OFFLINE_MODE = false;
-  cacheUserSnapshot(json);
-  applyUserState(json);
+  renderWalletSection(json.state, json.wallet || "");
+  renderInviteSection(json.state);
   out.textContent = "آماده ✅";
   pillTxt.textContent = "Online";
   hideToast();
@@ -7057,7 +6918,9 @@ el("save").addEventListener("click", async () => {
   showToast("در حال ذخیره…", "تنظیمات ذخیره می‌شود", "SET", true);
   out.textContent = "⏳ ذخیره تنظیمات…";
 
-  const payload = buildAuthBody({
+  const initData = INIT_DATA || tg?.initData || "";
+  const payload = {
+    initData,
     timeframe: val("timeframe"),
     style: val("style"),
     risk: val("risk"),
@@ -7097,7 +6960,8 @@ el("analyze").addEventListener("click", async () => {
   showToast("در حال تحلیل…", "جمع‌آوری دیتا + تولید خروجی", "AI", true);
   out.textContent = "⏳ در حال تحلیل…";
 
-  const payload = buildAuthBody({ symbol: val("symbol"), userPrompt: "" });
+  const initData = INIT_DATA || tg?.initData || "";
+  const payload = { initData, symbol: val("symbol"), userPrompt: "" };
 
   const {status, json} = await api("/api/analyze", payload);
   if (!json?.ok) {
