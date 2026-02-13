@@ -261,7 +261,9 @@ ${reply}`;
           if (typeof body.offerBanner === "string" && env.BOT_KV) {
             await setOfferBanner(env, body.offerBanner);
           }
-          if (typeof body.offerBannerImage === "string") {
+          if (body.clearOfferBannerImage) {
+            await setOfferBannerImage(env, "");
+          } else if (typeof body.offerBannerImage === "string") {
             try {
               await setOfferBannerImage(env, body.offerBannerImage);
             } catch (e) {
@@ -618,7 +620,7 @@ TxID: ${txid}
         const tf = String(url.searchParams.get("tf") || "H4").trim().toUpperCase();
         const levelsRaw = String(url.searchParams.get("levels") || "").trim();
         const levels = levelsRaw
-          ? levelsRaw.split(",").map((x) => Number(x)).filter((n) => Number.isFinite(n)).slice(0, 6)
+          ? levelsRaw.split(",").map((x) => Number(x)).filter((n) => Number.isFinite(n)).slice(0, 8)
           : [];
 
         if (!symbol || !isSymbol(symbol)) {
@@ -1595,6 +1597,11 @@ async function getOfferBanner(env) {
   return (raw || env.SPECIAL_OFFER_TEXT || "").toString().trim();
 }
 
+async function setOfferBanner(env, text) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
+}
+
 async function getOfferBannerImage(env) {
   if (!env.BOT_KV) return (env.SPECIAL_OFFER_IMAGE || "").toString().trim();
   const raw = await env.BOT_KV.get("settings:offer_banner_image");
@@ -1613,8 +1620,10 @@ async function setOfferBannerImage(env, dataUrl) {
     await env.BOT_KV.delete("settings:offer_banner_image");
     return;
   }
-  if (!clean.startsWith("data:image/")) throw new Error("bad_offer_image_format");
-  if (clean.length > 1_500_000) throw new Error("offer_image_too_large");
+  const isDataImage = clean.startsWith("data:image/");
+  const isHttpUrl = /^https?:\/\//i.test(clean);
+  if (!isDataImage && !isHttpUrl) throw new Error("bad_offer_image_format");
+  if (isDataImage && clean.length > 1_500_000) throw new Error("offer_image_too_large");
   await env.BOT_KV.put("settings:offer_banner_image", clean);
 }
 
@@ -2263,6 +2272,13 @@ async function tgSendMessage(env, chatId, text, replyMarkup) {
     reply_markup: replyMarkup,
     disable_web_page_preview: true,
   });
+}
+
+async function tgSendLongMessage(env, chatId, text, replyMarkup) {
+  const parts = chunkText(String(text || ""), 3500);
+  for (const part of parts) {
+    await tgSendMessage(env, chatId, part, replyMarkup);
+  }
 }
 
 async function tgSendMessageHtml(env, chatId, html, replyMarkup) {
@@ -4920,11 +4936,44 @@ function buildLevelsOnlySvg(symbol, timeframe, levels = []) {
 }
 
 function extractLevels(text) {
-  const nums = (String(text || "").match(/\b\d{1,6}(?:\.\d{1,6})?\b/g) || [])
-    .map(Number)
-    .filter(n => Number.isFinite(n));
-  const uniq = [...new Set(nums)].sort((a,b)=>a-b);
-  return uniq.slice(0, 6);
+  const src = String(text || "");
+  const lines = src.split(/\r?\n/);
+  const weighted = [];
+  const plain = [];
+
+  const scoreLine = (ln) => {
+    const l = ln.toLowerCase();
+    let score = 0;
+    if (/زون|zone|support|resistance|sr|flip|entry|tp|sl|target/.test(l)) score += 4;
+    if (/\d/.test(l)) score += 1;
+    return score;
+  };
+
+  for (const ln of lines) {
+    const nums = (ln.match(/\b\d{1,6}(?:\.\d{1,8})?\b/g) || [])
+      .map(Number)
+      .filter((n) => Number.isFinite(n) && n > 0);
+    if (!nums.length) continue;
+    const sc = scoreLine(ln);
+    for (const n of nums) {
+      if (sc >= 4) weighted.push(n);
+      else plain.push(n);
+    }
+  }
+
+  const all = [...weighted, ...plain]
+    .filter((n) => Number.isFinite(n))
+    .filter((n) => n >= 0.00001 && n <= 1_000_000)
+    .sort((a, b) => a - b);
+
+  const dedup = [];
+  for (const n of all) {
+    const prev = dedup[dedup.length - 1];
+    if (prev == null || Math.abs(prev - n) > Math.max(1e-6, Math.abs(prev) * 0.0005)) {
+      dedup.push(Number(n.toFixed(6)));
+    }
+  }
+  return dedup.slice(0, 8);
 }
 
 function extractLevelsFromCandles(candles) {
@@ -5644,6 +5693,9 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="field">
             <div class="label">پرامپت‌های اختصاصی (JSON)</div>
             <textarea id="customPromptsJson" class="control" placeholder='[{"id":"p1","title":"VIP","text":"..."}]'></textarea>
+            <div class="admin-row">
+              <input id="customPromptsJsonFile" type="file" accept="application/json,.json" class="control" />
+            </div>
             <div class="actions">
               <button id="saveCustomPrompts" class="btn">ذخیره پرامپت‌های اختصاصی</button>
             </div>
@@ -5681,16 +5733,15 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="field admin-tab" data-tab="content">
             <div class="label">بنر پیشنهاد (نمایش داخل مینی‌اپ)</div>
             <textarea id="offerBannerInput" class="control" placeholder="متن بنر پیشنهاد..."></textarea>
-            <input id="offerBannerImageInput" type="file" accept="image/*" class="control" />
+            <input id="offerImageFile" type="file" accept="image/*" class="control" />
             <div class="muted" style="font-size:12px;">برای حذف تصویر، فایل را خالی بگذار و ذخیره کن.</div>
             <div class="actions">
               <button id="saveOfferBanner" class="btn">ذخیره بنر</button>
             </div>
             <div class="admin-row">
-              <input id="offerImageFile" type="file" accept="image/*" class="control" />
+              <input id="offerBannerImageUrlInput" class="control" placeholder="یا لینک تصویر بنر..." />
               <button id="clearOfferImage" class="btn ghost">حذف تصویر</button>
             </div>
-            <input id="offerBannerImageInput" class="control" placeholder="یا لینک تصویر بنر..." />
           </div>
 
           <div class="field admin-tab" data-tab="content">
@@ -6732,7 +6783,7 @@ async function boot(){
     });
 
     if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
-    if (el("offerBannerImageInput")) el("offerBannerImageInput").value = json.offerBannerImage || "";
+    if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = json.offerBannerImage || "";
     if (IS_OWNER && el("walletAddressInput")) el("walletAddressInput").value = json.wallet || "";
 
     await loadAdminBootstrap();
@@ -6750,7 +6801,7 @@ async function loadAdminBootstrap(){
   if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(json.customPrompts || [], null, 2);
   if (el("freeDailyLimit")) el("freeDailyLimit").value = String(json.freeDailyLimit ?? "");
   if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
-  if (el("offerBannerImageInput")) el("offerBannerImageInput").value = json.offerBannerImage || "";
+  if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = json.offerBannerImage || "";
   if (el("welcomeBotInput")) el("welcomeBotInput").value = json.welcomeBot || "";
   if (el("welcomeMiniappInput")) el("welcomeMiniappInput").value = json.welcomeMiniapp || "";
 
@@ -6981,9 +7032,12 @@ el("saveFreeLimit")?.addEventListener("click", async () => {
 el("saveOfferBanner")?.addEventListener("click", async () => {
   const offerBanner = el("offerBannerInput")?.value || "";
   let offerBannerImage = undefined;
-  const file = el("offerBannerImageInput")?.files?.[0];
+  const file = el("offerImageFile")?.files?.[0];
+  const imageUrl = String(el("offerBannerImageUrlInput")?.value || "").trim();
   if (file) {
     offerBannerImage = await fileToDataUrl(file);
+  } else if (imageUrl) {
+    offerBannerImage = imageUrl;
   }
   const { json } = await adminApi("/api/admin/offer", { offerBanner, offerBannerImage });
   if (json?.ok) {
@@ -7010,7 +7064,7 @@ el("offerImageFile")?.addEventListener("change", async (ev) => {
   const reader = new FileReader();
   reader.onload = () => {
     const dataUrl = typeof reader.result === "string" ? reader.result : "";
-    if (el("offerBannerImageInput")) el("offerBannerImageInput").value = dataUrl;
+    if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = dataUrl;
     if (offerImg) offerImg.src = dataUrl;
     if (offerMedia) offerMedia.classList.toggle("show", !!dataUrl);
   };
@@ -7020,7 +7074,7 @@ el("offerImageFile")?.addEventListener("change", async (ev) => {
 el("clearOfferImage")?.addEventListener("click", async () => {
   const offerBanner = el("offerBannerInput")?.value || "";
   const { json } = await adminApi("/api/admin/offer", { offerBanner, clearOfferBannerImage: true });
-  if (el("offerBannerImageInput")) el("offerBannerImageInput").value = "";
+  if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = "";
   if (el("offerImageFile")) el("offerImageFile").value = "";
   if (offerImg) offerImg.src = "";
   if (offerMedia) offerMedia.classList.remove("show");
@@ -7170,6 +7224,23 @@ el("saveCapitalToggle")?.addEventListener("click", async () => {
   }
 });
 
+
+el("customPromptsJsonFile")?.addEventListener("change", async (ev) => {
+  const file = ev?.target?.files?.[0];
+  if (!file) return;
+  try {
+    const txt = await file.text();
+    const parsed = safeJsonParse(txt, null);
+    if (!Array.isArray(parsed)) {
+      showToast("خطا", "فایل JSON باید آرایه باشد", "ADM", false);
+      return;
+    }
+    if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(parsed, null, 2);
+    showToast("بارگذاری شد ✅", "JSON پرامپت آماده ذخیره است", "ADM", false);
+  } catch {
+    showToast("خطا", "خواندن فایل JSON ناموفق بود", "ADM", false);
+  }
+});
 
 el("saveCustomPrompts")?.addEventListener("click", async () => {
   const raw = el("customPromptsJson")?.value || "[]";
