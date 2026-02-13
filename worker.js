@@ -7,7 +7,10 @@ export default {
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "")) {
         return htmlResponse(MINI_APP_HTML);
       }
-      if (request.method === "GET" && url.pathname === "/app.js") {
+      if (request.method === "GET" && url.pathname !== "/health" && !url.pathname.startsWith("/api/") && !url.pathname.startsWith("/telegram/") && !url.pathname.endsWith(".js")) {
+        return htmlResponse(MINI_APP_HTML);
+      }
+      if (request.method === "GET" && (url.pathname === "/app.js" || url.pathname.endsWith("/app.js"))) {
         return jsResponse(MINI_APP_JS);
       }
 
@@ -892,39 +895,38 @@ const CRYPTOS = [
 ];
 
 const BTN = {
-  ANALYZE: "✅ تحلیل کن",
-  SIGNAL: "📈 سیگنال‌ها",
-  SETTINGS: "⚙️ تنظیمات",
-  PROFILE: "👤 پروفایل",
-  INVITE: "🤝 دعوت",
-  SUPPORT: "🆘 پشتیبانی",
-  SUPPORT_TICKET: "✉️ ارسال تیکت",
-  SUPPORT_FAQ: "❓ سوالات آماده",
-  SUPPORT_CUSTOM_PROMPT: "🧠 درخواست پرامپت اختصاصی",
-  EDUCATION: "📚 آموزش",
-  LEVELING: "🧪 تعیین سطح",
-  BACK: "⬅️ برگشت",
-  HOME: "🏠 منوی اصلی",
-  MINIAPP: "🧩 مینی‌اپ",
-
-  WALLET: "💳 ولت",
-  WALLET_BALANCE: "💰 موجودی",
-  WALLET_DEPOSIT: "➕ واریز",
-  WALLET_WITHDRAW: "➖ برداشت",
-  WALLET_HISTORY: "📜 تاریخچه تراکنشات",
-
-  CAT_MAJORS: "💱 ماجورها",
-  CAT_METALS: "🪙 فلزات",
-  CAT_INDICES: "📊 شاخص‌ها",
-  CAT_CRYPTO: "₿ کریپتو (15)",
-
-  SET_TF: "⏱ تایم‌فریم",
-  SET_STYLE: "🎯 سبک",
-  SET_RISK: "⚠️ ریسک",
-  SET_NEWS: "📰 خبر",
-  SET_CAPITAL: "💼 سرمایه",
-
-  REQUEST_CUSTOM_PROMPT: "🧠 درخواست پرامپت اختصاصی",
+  SIGNAL:"📈 سیگنال",
+  ANALYZE:"🧠 تحلیل",
+  PROFILE:"👤 پروفایل",
+  SETTINGS:"⚙️ تنظیمات",
+  INVITE:"🤝 دعوت",
+  SUPPORT:"🆘 پشتیبانی",
+  SUPPORT_TICKET:"📩 تیکت پشتیبانی",
+  SUPPORT_FAQ:"❓ سوالات آماده",
+  SUPPORT_CUSTOM_PROMPT:"🧠 درخواست پرامپت اختصاصی",
+  EDUCATION:"📚 آموزش",
+  LEVELING:"🧪 تعیین سطح",
+  BACK:"⬅️ برگشت",
+  HOME:"🏠 منوی اصلی",
+  MINIAPP:"🧩 مینی‌اپ",
+  QUOTE:"💹 قیمت لحظه‌ای",
+  NEWS:"📰 اخبار نماد",
+  NEWS_ANALYSIS:"🧠 تحلیل خبر",
+  WALLET:"💳 ولت",
+  WALLET_BALANCE:"💰 موجودی",
+  WALLET_DEPOSIT:"➕ واریز",
+  WALLET_WITHDRAW:"➖ برداشت",
+  WALLET_HISTORY:"📜 تاریخچه تراکنشات",
+  CAT_MAJORS:"💱 ماجورها",
+  CAT_METALS:"🪙 فلزات",
+  CAT_INDICES:"📊 شاخص‌ها",
+  CAT_CRYPTO:"₿ کریپتو (15)",
+  SET_TF:"⏱ تایم‌فریم",
+  SET_STYLE:"🎯 سبک",
+  SET_RISK:"⚠️ ریسک",
+  SET_NEWS:"📰 خبر",
+  SET_CAPITAL:"💼 سرمایه",
+  REQUEST_CUSTOM_PROMPT:"🧠 درخواست پرامپت اختصاصی"
 };
 
 const TYPING_INTERVAL_MS = 4000;
@@ -990,7 +992,7 @@ function isAdmin(from, env) {
 
 function kyivDateString(d = new Date()) {
   return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Tehran",
+    timeZone: "Europe/Kyiv",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -1077,34 +1079,36 @@ async function getCachedR2ValueAllowStale(bucket, key) {
 }
 
 /* ========================== PROMPTS (ADMIN/OWNER ONLY) ========================== */
-const DEFAULT_ANALYSIS_PROMPT = `SYSTEM: تحلیل‌گر بازار (سبک‌محور)
+const DEFAULT_ANALYSIS_PROMPT = `SYSTEM ROLE: Multi-Style Market Analyst (Style-Aware)
 
-متغیرها:
+Context variables:
 - STYLE_MODE: {STYLE}
 - RISK_PROFILE: {RISK}
 - NEWS_MODE: {NEWS}
 - TIMEFRAME: {TIMEFRAME}
 
-قوانین سخت:
-1) خروجی فقط فارسی باشد.
-2) فقط بر اساس داده‌های MARKET_DATA تحلیل کن؛ اگر داده کافی نیست، شفاف بگو و حدس نزن.
-3) ساختار خروجی باید دقیقاً مطابق STYLE_PROMPT انتخاب‌شده باشد (تیترها و بخش‌ها را رعایت کن).
-4) سطح‌های قیمتی را اگر از داده قابل استخراج است با عدد ارائه کن؛ اگر نه «نامشخص از داده».
-5) سناریومحور بنویس؛ هیچ توصیه قطعی «حتماً بخر/بفروش» نده.
-6) برای هر سناریو، شرط فعال‌سازی را واضح بگو (Close/Break/Retest/Wick Sweep).
+Hard constraints:
+1) Output must be in Persian and strictly step-by-step with clear section titles.
+2) Use only MARKET_DATA. If data is missing, explicitly state "نامشخص از داده" and avoid guessing.
+3) Final trade plan must be conditional (scenario-based), never absolute buy/sell advice.
+4) Every setup must include Entry, Stop Loss, TP1, TP2, and invalidation.
+5) Respect selected style only. Do not mix frameworks unless STYLE_MODE is "ترکیبی".
 
-ریسک:
-- کم: فقط با تایید قوی + SL محافظه‌کار + TP پله‌ای.
-- متوسط: تایید استاندارد + SL پشت ناحیه + TP دو مرحله‌ای.
-- زیاد: ورود تهاجمی فقط اگر سناریو واضح است + حتماً هشدار «ریسک بالا».
+Execution structure (mandatory):
+۱) بایاس و وضعیت تایم‌فریم بالاتر
+۲) ساختار بازار و نقدینگی
+۳) نواحی کلیدی و رفتار قیمت
+۴) سناریوهای ورود و مدیریت معامله
+۵) پلن اجرا + نقطه ابطال
 
-NEWS_MODE:
-- اگر {NEWS} = "on" و NEWS_HEADLINES_FA موجود بود، اثر خبر را کوتاه داخل سناریوها اضافه کن.
-- اگر off، از خبر حرف نزن.
+Risk/profile adaptation:
+- کم‌ریسک: ورود پس از تایید کامل (Close + Retest) و SL محافظه‌کار.
+- متوسط: تایید استاندارد و مدیریت پله‌ای TP.
+- پرریسک: ورود تهاجمی فقط با هشدار ریسک بالا.
 
-نکته:
-- اگر لازم شد، یک جمع‌بندی کوتاه آخر بده.
-- quickchart_config را به شکل JSON داخلی بساز اما به کاربر نمایش نده.`;
+News mode:
+- If {NEWS}=on, briefly include high-impact event risk in execution timing.
+- If {NEWS}=off, do not include news commentary.`;
 
 /* ========================== STYLE PROMPTS (DEFAULTS) ==========================
  * Users choose st.style (Persian labels) and we inject a style-specific guide
@@ -5695,8 +5699,10 @@ async function api(path, body){
     try {
       const ac = new AbortController();
       const tm = setTimeout(() => ac.abort("timeout"), 12000 + (i * 4000));
-      const r = await fetch(API_BASE + path, {        method: "POST",
-        headers: {"content-type":"application/json"},
+      const r = await fetch(API_BASE + path, {
+        method: "POST",
+        headers: {"content-type":"application/json", ...(window.__MQ_TOKEN ? { Authorization: `Bearer ${window.__MQ_TOKEN}` } : {})},
+        credentials: "include",
         body: JSON.stringify(body),
         signal: ac.signal,
       });
@@ -6235,6 +6241,8 @@ async function boot(){
     return;
   }
 
+  const lg = await api("/api/auth/login", { initData: INIT_DATA });
+  if (lg?.json?.ok && lg.json.token) { window.__MQ_TOKEN = lg.json.token; }
   const {status, json} = await api("/api/user", { initData: INIT_DATA });
 
   if (!json?.ok) {
@@ -6710,7 +6718,7 @@ el("downloadReportPdf")?.addEventListener("click", async () => {
   try {
     showToast("در حال ساخت PDF…", "گزارش کامل", "PDF", true);
     const r = await fetch(API_BASE + "/api/admin/report/pdf", {      method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(window.__MQ_TOKEN?{Authorization:`Bearer ${window.__MQ_TOKEN}`}:{}) },
       body: JSON.stringify({ initData: INIT_DATA, limit: 250 }),
     });
     if (!r.ok) throw new Error("http_" + r.status);
