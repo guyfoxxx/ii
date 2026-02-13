@@ -5891,8 +5891,8 @@ const reportBlock = document.getElementById("reportBlock");
 const roleLabel = document.getElementById("roleLabel");
 const energyToday = document.getElementById("energyToday");
 const remainingAnalyses = document.getElementById("remainingAnalyses");
-const remainingText = document.getElementById("remainingText");
 const energyText = document.getElementById("energyText");
+const remainingText = document.getElementById("remainingText");
 const energyFill = document.getElementById("energyFill");
 const offerMedia = document.getElementById("offerMedia");
 const offerImg = document.getElementById("offerImg");
@@ -6294,23 +6294,6 @@ function pickTicketReplyTemplate(){
 }
 
 function updateMeta(state, quota){
-  const qRaw = String(quota || "-");
-  let energy = "—";
-  let remainTxt = "∞";
-  const m = qRaw.match(/^(\d+)\/(\d+)$/);
-  if (m) {
-    const used = Number(m[1] || 0);
-    const lim = Math.max(1, Number(m[2] || 1));
-    const remain = Math.max(0, lim - used);
-    const pct = Math.max(0, Math.min(100, Math.round((remain / lim) * 100)));
-    energy = pct + "%";
-    remainTxt = String(remain);
-  } else if (qRaw === "∞") {
-    energy = "100%";
-    remainTxt = "∞";
-  }
-  meta.textContent = "انرژی: " + energy + " | تحلیل باقی‌مانده: " + remainTxt + " | سهمیه: " + qRaw;
-  sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
   const q = String(quota || "");
   const m2 = q.match(/(\d+)\s*\/\s*(\d+)/);
   let used = 0;
@@ -6321,6 +6304,10 @@ function updateMeta(state, quota){
   }
   const remaining = Math.max(0, limit - used);
   const pct = limit > 0 ? Math.max(0, Math.min(100, Math.round((remaining / limit) * 100))) : 100;
+  const energy = q === "∞" ? "100%" : (limit > 0 ? (pct + "%") : "—");
+  const remainTxt = q === "∞" ? "∞" : (limit > 0 ? String(remaining) : "—");
+  meta.textContent = "انرژی: " + energy + " | تحلیل باقی‌مانده: " + remainTxt + " | سهمیه: " + (q || "-");
+  sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
   if (remainingText) remainingText.textContent = "تحلیل باقی‌مانده: " + (limit > 0 ? String(remaining) : "∞");
   if (energyText) energyText.textContent = "انرژی: " + (limit > 0 ? (pct + "%") : "نامحدود");
   if (energyFill) energyFill.style.width = (limit > 0 ? pct : 100) + "%";
@@ -6782,7 +6769,7 @@ async function boot(){
   IS_OWNER = json.role === "owner";
   IS_GUEST = !!json.guest;
 
-  const adminTabBtn = document.querySelector(".tab-btn[data-tab="admin"]");
+  const adminTabBtn = document.querySelector('.tab-btn[data-tab="admin"]');
   if (adminTabBtn) adminTabBtn.style.display = IS_STAFF ? "inline-flex" : "none";
 
   if (IS_STAFF && adminCard) {
@@ -6926,33 +6913,34 @@ el("analyze").addEventListener("click", async () => {
   const chartCard = el("chartCard");
   const chartImg = el("chartImg");
   if (chartCard && chartImg) {
-    const u = json.chartUrl || "";
-    const fallbackSvg = json.zonesSvg || "";
-    const tf = json?.quickchartConfig?.timeframe || val("timeframe") || "H4";
-    const zones = Array.isArray(json?.levels) ? json.levels.length : 0;
-    const candleCount = Number(json?.chartMeta?.candles || 0);
-    const cm = el("chartMeta");
-    if (u) {
-      chartImg.onerror = () => {
-        chartImg.onerror = null;
-        if (fallbackSvg) {
-          renderChartFallbackSvg(fallbackSvg);
-          const cmFallback = el("chartMeta");
-          if (cmFallback) cmFallback.textContent = "Zones SVG | TF: " + tf + " | zones: " + zones;
-          return;
-        }
+      const u = json.chartUrl || "";
+      const fallbackSvg = json.zonesSvg || "";
+      const activeSymbol = val("symbol") || "-";
+      const activeTf = val("timeframe") || "H4";
+      const cm = el("chartMeta");
+      if (u) {
+        chartImg.onerror = () => {
+          chartImg.onerror = null;
+          if (fallbackSvg) {
+            renderChartFallbackSvg(fallbackSvg);
+            const cm = el("chartMeta");
+            if (cm) cm.textContent = "زون تحلیل + " + symbol + " (" + tf + ")";
+            return;
+          }
+          chartImg.removeAttribute("src");
+          chartCard.style.display = "none";
+          if (fallbackSvg) renderChartFallbackSvg(fallbackSvg);
+        };
+        chartImg.src = u;
+        chartCard.style.display = "block";
+        if (cm) cm.textContent = "Candlestick | " + activeSymbol + " | " + activeTf;
+      } else if (fallbackSvg) {
+        renderChartFallbackSvg(fallbackSvg);
+      } else {
         chartImg.removeAttribute("src");
         chartCard.style.display = "none";
-      };
-      chartImg.src = u;
-      chartCard.style.display = "block";
-      if (cm) cm.textContent = "Candlestick | TF: " + tf + " | candles: " + candleCount + " | zones: " + zones;
-    } else if (fallbackSvg) {
-      renderChartFallbackSvg(fallbackSvg);
-      if (cm) cm.textContent = "Zones SVG | TF: " + tf + " | zones: " + zones;
-    } else {
-      chartImg.removeAttribute("src");
-      chartCard.style.display = "none";
+        if (cm) cm.textContent = "QuickChart";
+      }
     }
   }
   updateMeta(json.state, json.quota);
