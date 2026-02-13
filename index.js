@@ -1265,36 +1265,36 @@ async function getCachedR2ValueAllowStale(bucket, key) {
 }
 
 /* ========================== PROMPTS (ADMIN/OWNER ONLY) ========================== */
-const DEFAULT_ANALYSIS_PROMPT = `SYSTEM ROLE: تحلیل‌گر چندسبکی بازار (STYLE-AWARE)
+const DEFAULT_ANALYSIS_PROMPT = `SYSTEM ROLE: Multi-Style Market Analyst (Style-Aware)
 
-متغیرها:
+Context variables:
 - STYLE_MODE: {STYLE}
 - RISK_PROFILE: {RISK}
 - NEWS_MODE: {NEWS}
 - TIMEFRAME: {TIMEFRAME}
 
-قوانین اجباری:
-1) خروجی فارسی، حرفه‌ای، مرحله‌به‌مرحله و با تیترهای واضح باشد.
-2) فقط از MARKET_DATA استفاده کن؛ اگر داده‌ای موجود نیست صریح اعلام کن.
-3) تحلیل را دقیقاً طبق STYLE_MODE اجرا کن (پرایس اکشن / ICT / ATR / ترکیبی).
-4) برای هر ستاپ: Entry / SL / TP1 / TP2 / Invalidation را دقیق و شرطی بنویس.
-5) توصیه قطعی خرید/فروش نده؛ سناریو محور و مبتنی بر تایید رفتار قیمت بمان.
+Hard constraints:
+1) Output must be in Persian and strictly step-by-step with clear section titles.
+2) Use only MARKET_DATA. If data is missing, explicitly state "نامشخص از داده" and avoid guessing.
+3) Final trade plan must be conditional (scenario-based), never absolute buy/sell advice.
+4) Every setup must include Entry, Stop Loss, TP1, TP2, and invalidation.
+5) Respect selected style only. Do not mix frameworks unless STYLE_MODE is "ترکیبی".
 
-ساختار خروجی الزامی:
-۱) خلاصه بایاس و وضعیت بازار
-۲) ساختار بازار و نواحی کلیدی
-۳) سناریوهای ورود معتبر
-۴) برنامه اجرا و مدیریت ریسک
-۵) سناریوی جایگزین در صورت ابطال
+Execution structure (mandatory):
+۱) بایاس و وضعیت تایم‌فریم بالاتر
+۲) ساختار بازار و نقدینگی
+۳) نواحی کلیدی و رفتار قیمت
+۴) سناریوهای ورود و مدیریت معامله
+۵) پلن اجرا + نقطه ابطال
 
-تطبیق ریسک:
-- کم‌ریسک: تایید بیشتر، SL محافظه‌کارانه، تریگر سخت‌گیرانه
-- متوسط: تایید استاندارد، SL پشت ساختار
-- پرریسک: ورود تهاجمی‌تر فقط با هشدار ریسک بالا
+Risk/profile adaptation:
+- کم‌ریسک: ورود پس از تایید کامل (Close + Retest) و SL محافظه‌کار.
+- متوسط: تایید استاندارد و مدیریت پله‌ای TP.
+- پرریسک: ورود تهاجمی فقط با هشدار ریسک بالا.
 
-NEWS_MODE:
-- اگر {NEWS}=on اثر خبر را مختصر روی سناریوها اضافه کن.
-- اگر {NEWS}=off تحلیل صرفاً ساختاری و قیمتی باشد.`;
+News mode:
+- If {NEWS}=on, briefly include high-impact event risk in execution timing.
+- If {NEWS}=off, do not include news commentary.`;
 
 /* ========================== STYLE PROMPTS (DEFAULTS) ==========================
  * Users choose st.style (Persian labels) and we inject a style-specific guide
@@ -1302,43 +1302,116 @@ NEWS_MODE:
  */
 const STYLE_PROMPTS_DEFAULT = {
   "پرایس اکشن": `Role: Professional Price Action Market Analyst
-Constraints: Pure Price Action only, indicators forbidden unless requested
+Constraints:
+- Analysis style: Pure Price Action only
+- Indicators: forbidden unless explicitly requested
+- Focus: high-probability setups only
 
-Required flow:
-1) Market Structure: trend (Up/Down/Range), HH/HL/LH/LL, structure status (Intact/BOS/MSS)
-2) Key Levels: strong support/resistance, flip zones, psychological levels (if relevant)
-3) Candlestick Behavior: Pin Bar, Engulfing, Inside Bar + buyer/seller intent
-4) Entry Scenarios: clear entry zone, structure-based SL, TP1/TP2, minimum RR=1:2
-5) Bias & Scenarios: main bias + invalidation alternative scenario
-6) Execution Plan: continuation or reversal + required confirmation
+Required sections:
+1) Market Structure
+- Trend (Uptrend / Downtrend / Range)
+- HH, HL, LH, LL labels
+- Structure status (Intact / BOS / MSS)
 
-Output tone: professional, clear, step-by-step, execution-focused.
-Important: minimum Risk:Reward = 1:2 and include alternative invalidation scenario.`,
+2) Key Levels
+- Strong support/resistance zones
+- Flip zones
+- Psychological levels (if relevant)
+
+3) Candlestick Behavior
+- Pin Bar, Engulfing, Inside Bar
+- Explain buyer/seller intent behind each key candle
+
+4) Entry Scenarios
+- Clear entry zone
+- Logical structure-based SL
+- TP1 and TP2 targets
+- Minimum RR = 1:2
+
+5) Bias & Scenario
+- Main bias (Bullish / Bearish / Neutral)
+- Alternative scenario upon invalidation
+
+6) Execution Plan
+- Continuation or reversal setup
+- Required confirmation before entry
+
+Style of answer: professional, clear, educational, and step-by-step.`,
   "ICT": `Role: ICT & Smart Money Analyst
-Methodology: ICT + Smart Money Concepts ONLY
+Methodology: ICT + Smart Money Concepts only
 Restrictions: No indicators, no retail concepts
 
-Required flow:
-1) Higher Timeframe Bias (Daily/H4): bias, premium/discount, equilibrium(50%), imbalance vs balance
-2) Liquidity Mapping: EQH/EQL, BSL/SSL, stop-loss pools, liquidity objective
-3) Market Structure: BOS, MSS/CHoCH, manipulation vs expansion
-4) PD Arrays: OBs, FVG, liquidity voids, PDH/PDL/PWH/PWL
-5) Kill Zones (intraday): London & New York + timing logic
-6) Entry Model: Liquidity Sweep → MSS → FVG/OB with Entry, SL, TP by liquidity
-7) Narrative: who is trapped, smart money entry, engineered destination
+Required sections:
+1) Higher Timeframe Bias (Daily / H4)
+- Overall bias (Bullish/Bearish/Neutral)
+- Premium zone, Discount zone, Equilibrium (50%)
+- Imbalance vs Balance state
 
-Output: professional, precise, educational, with clear execution plan (bias, conditions, targets, invalidation).`,
-  "ATR": `Role: quantitative_trading_assistant
+2) Liquidity Mapping
+- EQH, EQL, Buy-side liquidity, Sell-side liquidity, SL pools
+- State where liquidity is likely to be engineered
+
+3) Market Structure
+- BOS and MSS/CHoCH
+- Clarify manipulation phase vs expansion phase
+
+4) PD Arrays
+- Bullish/Bearish Order Blocks
+- FVG, Liquidity Voids
+- PDH, PDL, PWH, PWL
+
+5) Kill Zones (intraday only)
+- London Kill Zone
+- New York Kill Zone
+- Explain why timing matters
+
+6) Entry Model
+- Example model: Sweep → MSS → FVG entry OR Sweep → OB entry
+- Must include Entry, SL location, and liquidity-based targets
+
+7) Narrative
+- Who is trapped?
+- Where did smart money enter?
+- Where is price likely engineered to go?
+
+Finish with: Bias, entry conditions, targets, and invalidation point.`,
+  "ATR": `Role: Quantitative Trading Assistant
 Strategy: ATR-based volatility trading
 
-Required flow:
-1) Volatility State: current ATR, historical ATR average comparison, expansion/contraction
-2) Market Condition: trending/ranging, breakout vs mean reversion suitability
-3) Trade Setup: structure-based entry, SL = Entry ± (ATR × Multiplier), TP1/TP2 by ATR expansion
-4) Position Sizing: risk % and position size by SL distance
-5) Trade Filtering: when NOT to trade, high-risk volatility conditions (news/spikes)
-6) Risk Management: max daily loss, max consecutive losses, ATR trailing-stop logic
-7) Summary: statistical justification, expected duration, risk class (Low/Medium/High).`,
+Required sections:
+1) Volatility State
+- Current ATR value
+- Comparison with historical ATR average
+- Volatility expansion or contraction
+
+2) Market Condition
+- Trending or ranging
+- Breakout suitability vs mean-reversion suitability
+
+3) Trade Setup
+- Entry based on price structure
+- Stop Loss = Entry ± (ATR × Multiplier)
+- TP1 and TP2 based on ATR expansion
+
+4) Position Sizing
+- Risk per trade (%)
+- Position size from SL distance
+
+5) Trade Filtering
+- When NOT to trade based on ATR
+- High-risk volatility conditions (news spikes)
+
+6) Risk Management
+- Max daily loss
+- Max consecutive losses
+- ATR-based trailing stop logic
+
+7) Summary
+- Statistical justification
+- Expected trade duration
+- Risk classification (Low/Medium/High)
+
+Output style: practical, precise, execution-focused.`,
 };
 
 function normalizeStyleLabel(style) {
@@ -1867,32 +1940,21 @@ function contactKeyboard() {
   };
 }
 
-const DEFAULT_MINIAPP_URL = "";
-
 function getMiniappUrl(env) {
   const configured = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || "").toString().trim();
-  const raw = configured || DEFAULT_MINIAPP_URL;
+  const raw = configured;
+  if (!raw) return "";
   try {
     const u = new URL(raw);
     return u.toString();
   } catch {
-    return DEFAULT_MINIAPP_URL;
+    return "";
   }
 }
 async function miniappInlineKeyboard(env, st, from) {
   const url = getMiniappUrl(env);
   if (!url) return null;
   return { inline_keyboard: [[{ text: BTN.MINIAPP, web_app: { url } }]] };
-}
-
-function appendQuery(url, params) {
-  try {
-    const u = new URL(url);
-    Object.entries(params || {}).forEach(([k,v]) => { if (v != null && String(v) !== "") u.searchParams.set(k, String(v)); });
-    return u.toString();
-  } catch {
-    return url;
-  }
 }
 
 
@@ -3839,9 +3901,8 @@ ${summary || "تحلیل خبری در دسترس نیست."}`, mainMenuKeyboard
       const kbInline = { inline_keyboard: [[{ text: BTN.MINIAPP, web_app: { url } }]] };
       return tgSendMessage(env, chatId, `🧩 مینی‌اپ فعال شد.
 
-از دکمه زیر وارد شوید (داخل تلگرام).
-
-چک‌لیست سریع اتصال:
+از دکمه زیر وارد شوید. اگر دکمه باز نشد، این لینک را مستقیم باز کنید:
+${url}\n\nچک‌لیست سریع اتصال:
 ${MINIAPP_EXEC_CHECKLIST}`, kbInline);
     }
 
@@ -5022,7 +5083,8 @@ async function buildMiniappGuestPayload(env) {
 }
 
 async function verifyMiniappAuth(body, env) {
-  return verifyTelegramInitData(body?.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+  const initData = body?.initData;
+  return verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
 }
 
 /* ========================== TELEGRAM MINI APP initData verification ========================== */
