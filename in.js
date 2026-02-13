@@ -16,7 +16,7 @@ export default {
         url.pathname !== "/health" &&
         !url.pathname.startsWith("/api/") &&
         !url.pathname.startsWith("/telegram/") &&
-        !url.pathname.endsWith(".js")
+        !/\/[^/]+\.[^/]+$/.test(url.pathname)
       ) {
         return htmlResponse(MINI_APP_HTML);
       }
@@ -5066,10 +5066,25 @@ function escapeHtml(s) {
 
 /* ========================== MINI APP INLINE ASSETS ========================== */
 function htmlResponse(html, status = 200) {
-  return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8" } });
+  return new Response(html, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+    },
+  });
 }
 function jsResponse(js, status = 200) {
-  return new Response(js, { status, headers: { "content-type": "application/javascript; charset=utf-8" } });
+  return new Response(js, {
+    status,
+    headers: {
+      "content-type": "application/javascript; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+    },
+  });
 }
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json; charset=utf-8" } });
@@ -5158,7 +5173,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const authDate = Number(params.get("auth_date") || "0");
   if ((!Number.isFinite(authDate) || authDate <= 0) && !lenient) return { ok: false, reason: "auth_date_invalid" };
   const now = Math.floor(Date.now() / 1000);
-  const maxAgeSec = Math.max(60, Number(maxAgeSecRaw || 0) || (lenient ? 7 * 24 * 60 * 60 : 24 * 60 * 60));
+  const maxAgeSec = Math.max(60, Number(maxAgeSecRaw || 0) || (lenient ? 7 * 24 * 60 * 60 : 300));
   if (Number.isFinite(authDate) && authDate > 0 && (now - authDate > maxAgeSec) && !lenient) return { ok: false, reason: "initData_expired" };
 
   const pairs = [];
@@ -5210,6 +5225,7 @@ const MINI_APP_HTML = `<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <title>MarketiQ Mini App</title>
   <meta name="color-scheme" content="dark light" />
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
     :root{
       --bg: #0B0F17;
@@ -5873,9 +5889,46 @@ const MINI_APP_HTML = `<!doctype html>
 </body>
 </html>`;
 
-const MINI_APP_JS = `const tg = window.Telegram?.WebApp;
-if (tg) tg.ready();
-if (tg?.expand) tg.expand();
+const MINI_APP_JS = `let tg = null;
+
+function injectTelegramSdkOnce() {
+  if (window.Telegram?.WebApp) return Promise.resolve();
+  return new Promise((resolve) => {
+    const existing = document.querySelector('script[src="https://telegram.org/js/telegram-web-app.js"]');
+    const finish = () => {
+      let tries = 0;
+      const t = setInterval(() => {
+        if (window.Telegram?.WebApp) { clearInterval(t); resolve(); return; }
+        tries++;
+        if (tries >= 20) { clearInterval(t); resolve(); }
+      }, 100);
+      setTimeout(() => { clearInterval(t); resolve(); }, 4000);
+    };
+    if (existing) {
+      if (window.Telegram?.WebApp) return resolve();
+      existing.addEventListener('load', finish, { once: true });
+      setTimeout(finish, 200);
+      return;
+    }
+    const sc = document.createElement('script');
+    sc.src = 'https://telegram.org/js/telegram-web-app.js';
+    sc.async = true;
+    sc.onload = finish;
+    sc.onerror = () => resolve();
+    document.head.appendChild(sc);
+  });
+}
+
+async function ensureTelegramReady() {
+  await injectTelegramSdkOnce();
+  const webapp = window.Telegram?.WebApp || null;
+  if (webapp) {
+    webapp.ready();
+    if (webapp.expand) webapp.expand();
+  }
+  tg = webapp;
+  return { tg: webapp, isTelegramRuntime: !!webapp };
+}
 
 const out = document.getElementById("out");
 const meta = document.getElementById("meta");
@@ -6766,6 +6819,7 @@ async function boot(){
     setupNewsPolling();
     return;
   }
+}
 
   OFFLINE_MODE = false;
   if (json?.miniToken) {
