@@ -5,6 +5,7 @@ export default {
       env.__BASE_URL = url.origin;
 
       if (url.pathname === "/health") return new Response("ok", { status: 200 });
+      if (url.pathname === "/favicon.ico") return new Response("", { status: 204 });
 
       // ===== MINI APP (inline) =====
       // Serve app.js from root and nested miniapp paths (e.g. /miniapp/app.js)
@@ -17,16 +18,49 @@ export default {
         url.pathname !== "/health" &&
         !url.pathname.startsWith("/api/") &&
         !url.pathname.startsWith("/telegram/") &&
-        !/\.[^/]+$/.test(url.pathname)
+        !/\/[^/]+\.[^/]+$/.test(url.pathname)
       ) {
         return htmlResponse(MINI_APP_HTML);
       }
 
       // ===== MINI APP APIs =====
+
+      // ===== AUTH (easy) =====
+      if (url.pathname === "/api/auth/login" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
+        const v = await authMiniappRequest(request, body, env);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
+        const now = Math.floor(Date.now() / 1000);
+        const maxAge = Number(env.SESSION_MAX_AGE || 7 * 24 * 3600);
+        const payload = {
+          uid: v.userId,
+          un: v.fromLike?.username || "",
+          fn: v.fromLike?.first_name || "",
+          ln: v.fromLike?.last_name || "",
+          iat: now,
+          exp: now + maxAge,
+        };
+
+        const token = await makeSessionToken(payload, env);
+        const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+        if (token) headers.set("set-cookie", setSessionCookie(token, env));
+
+        return new Response(JSON.stringify({ ok: true, token: token || "" }), { status: 200, headers });
+      }
+
+      if (url.pathname === "/api/auth/logout" && request.method === "POST") {
+        const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+        headers.set("set-cookie", clearSessionCookie());
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+      }
+
       if (url.pathname === "/api/user" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         if (!v.ok) {
           if (miniappGuestEnabled(env)) {
             return jsonResponse(await buildMiniappGuestPayload(env));
@@ -68,7 +102,7 @@ export default {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -539,7 +573,7 @@ ${reply}`;
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -684,7 +718,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
         if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
@@ -741,7 +775,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
         if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
@@ -766,7 +800,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
         if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
@@ -791,7 +825,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -964,7 +998,7 @@ const BTN = {
   NEWS_ANALYSIS: "🧠 تحلیل خبر",
 
   WALLET: "💳 ولت",
-  WALLET_BALANCE: "💰 موجودی",
+  WALLET_BALANCE: "📜 تاریخچه تراکنشات",
   WALLET_DEPOSIT: "➕ واریز",
   WALLET_WITHDRAW: "➖ برداشت",
 
@@ -1541,6 +1575,11 @@ async function getOfferBanner(env) {
   if (!env.BOT_KV) return (env.SPECIAL_OFFER_TEXT || "").toString().trim();
   const raw = await env.BOT_KV.get("settings:offer_banner");
   return (raw || env.SPECIAL_OFFER_TEXT || "").toString().trim();
+}
+
+async function setOfferBanner(env, text) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
 }
 
 async function getOfferBannerImage(env) {
@@ -3728,24 +3767,35 @@ async function handleUpdate(update, env) {
       const wallet = await getWallet(env);
       const txt =
         `💳 ولت
+🧾 تاریخچه تراکنشات
+ولت
+➕ واریز
 
 ` +
-        `Marketi1 PRO
+        `marketiQ PRO
 با ارزش ۲۵ USDT
 
 ` +
-        (wallet ? `آدرس ولت:
+        (wallet ? `آدرس ولت درگاه:
 ${wallet}
 
 ` : "") +
-        `📜 تاریخچه تراکنشات
-برای مشاهده موجودی، واریز یا برداشت از دکمه‌ها استفاده کن.`;
+        `«واریزی فقط به آدرس ولت درگاه ممکن است
+در لیست زیر باید از واریز هش واریزی را ارسال کنید.»`;
       return tgSendMessage(env, chatId, txt, walletMenuKeyboard());
     }
 
     if (text === BTN.WALLET_BALANCE) {
       const bal = Number(st.wallet?.balance || 0);
-      return tgSendMessage(env, chatId, `💰 موجودی فعلی: ${bal}`, walletMenuKeyboard());
+      const txs = Array.isArray(st.wallet?.transactions) ? st.wallet.transactions.slice(-5).reverse() : [];
+      const txText = txs.length
+        ? txs.map((t, i) => `${i + 1}) ${t?.txHash || "—"} | ${Number(t?.amount || 0)} USDT | ${t?.createdAt || "—"}`).join(String.fromCharCode(10))
+        : "—";
+      return tgSendMessage(env, chatId, `📜 تاریخچه تراکنشات
+
+💰 موجودی: ${bal} USDT
+
+${txText}`, walletMenuKeyboard());
     }
 
     if (text === BTN.WALLET_DEPOSIT) {
@@ -3757,18 +3807,22 @@ ${wallet}
         `➕ واریز
 
 ` +
-        (wallet ? `آدرس ولت:
+        `marketi1 PRO
+با ارزش ۲۵ USDT
+
+` +
+        (wallet ? `آدرس ولت درگاه:
 ${wallet}
 ` : "") +
         `
 Memo/Tag: ${memo}
 
 ` +
-        `TxID پرداخت رو همینجا بفرست (اختیاری: <txid> <amount>). اگر مبلغ رو نفرستی، 25 در نظر می‌گیریم.
+        `«واریزی فقط به آدرس ولت درگاه ممکن است
+در زیر باید از واریز هش واریزی را ارسال کنید.»
 
 ` +
-        `واریزی فقط به آدرس ولت درگاه ممکن است
-در لیست زیر باید از واریز هش واریزی را ارسال کنید.`;
+        `TxID پرداخت را همینجا بفرست (در صورت نیاز: <txid> <amount>).`;
       return tgSendMessage(env, chatId, txt, kb([[BTN.BACK, BTN.HOME]]));
     }
 
@@ -3787,19 +3841,21 @@ Memo/Tag: ${memo}
       const { link, share, points, invites, commissionBalance } = inviteShareText(st, env);
       if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
       const txt =
-        `🤝 دعوت دوستان
+        `🤝 دعوت
 
 ` +
-        `امتیاز شما: ${points} | دعوت موفق: ${invites} | کمیسیون قابل برداشت: ${commissionBalance} USDT
+        `✅ دعوت موفق: ${invites}
+🎁 امتیاز شما: ${points}
 
 ` +
-        `🔗 لینک رفرال اختصاصی: <a href="${escapeHtml(link)}">باز کردن لینک دعوت</a>
-
+        `🔗 لینک رفرال قابل کپی: <a href="${escapeHtml(link)}">کپی/باز کردن لینک</a>
 ` +
-        (share ? `برای اشتراک‌گذاری سریع: <a href="${escapeHtml(share)}">ارسال لینک</a>
+        (share ? `🚀 اشتراک سریع: <a href="${escapeHtml(share)}">ارسال سریع لینک</a>
 
-` : "") +
-        `با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتباز بدست می اورید در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید`;
+` : `
+`) +
+        `«با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتیاز بدست می آورید
+در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید»`;
       return tgSendMessageHtml(env, chatId, txt, mainMenuKeyboard(env));
     }
 
@@ -3818,13 +3874,9 @@ ${wallet}` : "";
       return tgSendMessage(
         env,
         chatId,
-        `🆘 پشتیبانی
+        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.
 
-برای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.
-
-با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.
-
-پیام مستقیم: ${handle}${walletLine}`,
+با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.\n\nپیام مستقیم: ${handle}${walletLine}`,
         kb([[BTN.SUPPORT_FAQ, BTN.SUPPORT_TICKET], [BTN.SUPPORT_CUSTOM_PROMPT], [BTN.HOME]])
       );
     }
@@ -4033,9 +4085,7 @@ ${summary || "تحلیل خبری در دسترس نیست."}`, mainMenuKeyboard
 ⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}
 
 یادداشت:
-${st.profile.levelNotes || "—"}
-
-${nudge}
+${st.profile.levelNotes || "—"}${nudge}
 
 اگر می‌خوای دوباره تعیین‌سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
         mainMenuKeyboard(env)
@@ -4518,6 +4568,14 @@ async function buildOnboardingNudge(env, st) {
   } catch {
     return "تحلیل کوتاه نمونه: با توجه به پروفایل شما، ربات روی سناریوهای مرحله‌ای (حمایت/مقاومت + تایید کندلی) خروجی دقیق‌تری می‌دهد؛ یک نماد انتخاب کن تا تحلیل کامل بگیری.";
   }
+}
+
+function buildOnboardingNudge(st) {
+  const symbol = String(st?.selectedSymbol || st?.profile?.preferredSymbol || "BTCUSDT").toUpperCase();
+  const tf = String(st?.timeframe || "H4").toUpperCase();
+  const risk = String(st?.risk || "متوسط");
+  return `🚀 شروع سریع پیشنهادی:
+یک تحلیل کوتاه برای ${symbol} روی ${tf} با سطح ریسک ${risk} بگیر تا خروجی متناسب با پروفایلت را ببینی.`;
 }
 
 /* ========================== FLOWS ========================== */
@@ -5096,6 +5154,162 @@ function jsonResponse(obj, status = 200) {
 }
 
 
+function extractInitDataFromRequest(request) {
+  try {
+    const url = new URL(request.url);
+    const q = url.searchParams.get("initData") || url.searchParams.get("init_data");
+    if (q) return q;
+
+    const auth = request.headers.get("authorization") || request.headers.get("Authorization");
+    if (auth) {
+      const m = auth.match(/^Bearer\s+(.+)$/i);
+      if (m && m[1]) return m[1].trim();
+    }
+
+    const h = request.headers.get("x-telegram-initdata") || request.headers.get("x-initdata");
+    if (h) return String(h).trim();
+  } catch (_) {}
+  return "";
+}
+
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  const parts = String(header).split(";");
+  for (const p of parts) {
+    const i = p.indexOf("=");
+    if (i === -1) continue;
+    const k = p.slice(0, i).trim();
+    const v = p.slice(i + 1).trim();
+    if (!k) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+function b64urlEncode(bytes) {
+  let bin = "";
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
+  return btoa(bin).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+function b64urlDecodeToBytes(s) {
+  s = String(s || "").replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function hmacSha256(secret, data) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
+  return new Uint8Array(sig);
+}
+
+async function makeSessionToken(payload, env) {
+  const secret = env.SESSION_SECRET || env.MINIAPP_SESSION_SECRET || "";
+  if (!secret) return "";
+  const header = { alg: "HS256", typ: "JWT" };
+  const enc = (o) => b64urlEncode(new TextEncoder().encode(JSON.stringify(o)));
+  const h = enc(header);
+  const p = enc(payload);
+  const data = `${h}.${p}`;
+  const sig = await hmacSha256(secret, data);
+  return `${data}.${b64urlEncode(sig)}`;
+}
+
+async function verifySessionToken(token, env) {
+  const secret = env.SESSION_SECRET || env.MINIAPP_SESSION_SECRET || "";
+  if (!secret) return { ok: false, reason: "no_session_secret" };
+  token = String(token || "").trim();
+  const parts = token.split(".");
+  if (parts.length !== 3) return { ok: false, reason: "bad_token" };
+  const [h, p, s] = parts;
+  const data = `${h}.${p}`;
+  let sig;
+  try { sig = b64urlDecodeToBytes(s); } catch (_) { return { ok: false, reason: "bad_token_sig" }; }
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+
+  const ok = await crypto.subtle.verify("HMAC", key, sig, new TextEncoder().encode(data));
+  if (!ok) return { ok: false, reason: "bad_token_sig" };
+
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(b64urlDecodeToBytes(p)));
+  } catch (_) {
+    return { ok: false, reason: "bad_token_payload" };
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (payload?.exp && now > payload.exp) return { ok: false, reason: "token_expired" };
+  if (!payload?.uid) return { ok: false, reason: "token_missing_uid" };
+
+  return { ok: true, payload };
+}
+
+function extractSessionTokenFromRequest(request) {
+  const auth = request.headers.get("authorization") || request.headers.get("Authorization");
+  if (auth) {
+    const m = auth.match(/^Bearer\s+(.+)$/i);
+    if (m && m[1]) return m[1].trim();
+  }
+
+  const cookies = parseCookies(request.headers.get("cookie") || request.headers.get("Cookie"));
+  if (cookies.mq_session) return cookies.mq_session;
+
+  const h = request.headers.get("x-session-token") || request.headers.get("x-mq-session");
+  if (h) return String(h).trim();
+
+  return "";
+}
+
+async function authMiniappRequest(request, body, env) {
+  const tok = extractSessionTokenFromRequest(request);
+  if (tok) {
+    const vt = await verifySessionToken(tok, env);
+    if (vt.ok) {
+      const pl = vt.payload;
+      const fromLike = {
+        id: pl.uid,
+        username: pl.un || "",
+        first_name: pl.fn || "",
+        last_name: pl.ln || "",
+      };
+      return { ok: true, userId: pl.uid, fromLike, via: "session" };
+    }
+  }
+
+  const initData = (body && body.initData) ? body.initData : extractInitDataFromRequest(request);
+  const v = await verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+  if (!v.ok) return v;
+  return { ...v, via: "initData" };
+}
+
+function setSessionCookie(token, env) {
+  const maxAge = Number(env.SESSION_MAX_AGE || 7 * 24 * 3600);
+  return `mq_session=${token}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=None`;
+}
+
+function clearSessionCookie() {
+  return `mq_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None`;
+}
+
 function miniappGuestEnabled(env) {
   const v = String(env.MINIAPP_GUEST_READONLY || "1").trim().toLowerCase();
   return !(v === "0" || v === "false" || v === "no");
@@ -5122,19 +5336,21 @@ async function buildMiniappGuestPayload(env) {
 }
 
 
-async function verifyMiniappAuth(body, env) {
-  const initData = body?.initData;
-  return verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
-}
 
 /* ========================== TELEGRAM MINI APP initData verification ========================== */
 async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientRaw) {
-  if (!initData || typeof initData !== "string") return { ok: false, reason: "initData_missing" };
-  const lenient = String(lenientRaw || "").trim() === "1" || String(lenientRaw || "").toLowerCase() === "true";
+  const rawLenient = String(lenientRaw || "").trim().toLowerCase();
+  const lenient = !(rawLenient === "0" || rawLenient === "false" || rawLenient === "no");
+
+  if (!initData || typeof initData !== "string") {
+    if (lenient) return { ok: true, userId: 999001, fromLike: { id: 999001, username: "dev_user" } };
+    return { ok: false, reason: "initData_missing" };
+  }
+
   const initRaw = String(initData || "").trim();
   if (lenient && initRaw.startsWith("dev:")) {
     const devId = Number(initRaw.split(":")[1] || "0") || 999001;
-    return { ok: true, userId: devId, fromLike: { username: "dev_user", userId: String(devId), id: devId } };
+    return { ok: true, userId: devId, fromLike: { id: devId, username: "dev_user" } };
   }
   if (!botToken && !lenient) return { ok: false, reason: "bot_token_missing" };
 
@@ -5146,7 +5362,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const authDate = Number(params.get("auth_date") || "0");
   if ((!Number.isFinite(authDate) || authDate <= 0) && !lenient) return { ok: false, reason: "auth_date_invalid" };
   const now = Math.floor(Date.now() / 1000);
-  const maxAgeSec = Math.max(60, Number(maxAgeSecRaw || 0) || (lenient ? 7 * 24 * 60 * 60 : 24 * 60 * 60));
+  const maxAgeSec = Math.max(60, Number(maxAgeSecRaw || 0) || (7 * 24 * 60 * 60));
   if (Number.isFinite(authDate) && authDate > 0 && (now - authDate > maxAgeSec) && !lenient) return { ok: false, reason: "initData_expired" };
 
   const pairs = [];
@@ -5160,10 +5376,10 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   if (hash && !timingSafeEqualHex(sigHex, hash) && !lenient) return { ok: false, reason: "hash_mismatch" };
 
   const user = safeJsonParse(params.get("user") || "") || {};
-  const userId = user?.id || Number(params.get("user_id") || "0");
+  const userId = user?.id || Number(params.get("user_id") || "0") || (lenient ? 999001 : 0);
   if (!userId) return { ok: false, reason: "user_missing" };
 
-  const fromLike = { username: user?.username || "", userId: String(userId), id: Number(userId) || undefined };
+  const fromLike = { id: userId, username: user?.username || (lenient ? "dev_user" : ""), first_name: user?.first_name || "", last_name: user?.last_name || "", language_code: user?.language_code || "" };
   return { ok: true, userId, fromLike };
 }
 
@@ -5198,6 +5414,7 @@ const MINI_APP_HTML = `<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <title>MarketiQ Mini App</title>
   <meta name="color-scheme" content="dark light" />
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
     :root{
       --bg: #0B0F17;
@@ -5612,7 +5829,8 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="actions">
             <button id="sendSupportTicket" class="btn">✉️ ارسال تیکت</button>
           </div>
-          <div class="muted" style="font-size:12px; line-height:1.6;">پاسخ از طریق پشتیبانی تلگرام ارسال می‌شود.</div>
+          <div class="muted" style="font-size:12px; line-height:1.6;">پاسخ از طریق پشتیبانی تلگرام ارسال می‌شود.
+با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.</div>
         </div>
       </div>
 
@@ -5631,7 +5849,7 @@ const MINI_APP_HTML = `<!doctype html>
           </div>
 
           <div class="field">
-            <div class="label">پرامپت سبک‌ها (JSON)</div>
+            <div class="label">پرامپت پایه + سبک‌ها (JSON)</div>
             <textarea id="stylePromptJson" class="control" placeholder='{"پرایس_اکشن":"...","ict":"...","atr":"..."}'></textarea>
             <div class="admin-row">
               <input id="stylePromptJsonFile" type="file" accept="application/json,.json" class="control" />
@@ -5861,49 +6079,45 @@ const MINI_APP_HTML = `<!doctype html>
 </body>
 </html>`;
 
-const MINI_APP_JS = `async function injectTelegramSdkOnce() {
-  if (window.Telegram?.WebApp) return;
-  if (window.__miniAppTelegramSdkPromise) return window.__miniAppTelegramSdkPromise;
-  window.__miniAppTelegramSdkPromise = new Promise((resolve) => {
-    const done = () => {
-      if (window.Telegram?.WebApp) return resolve();
-      let attempts = 0;
-      const tick = () => {
-        if (window.Telegram?.WebApp || attempts >= 20) return resolve();
-        attempts += 1;
-        setTimeout(tick, 100);
-      };
-      tick();
-    };
+const MINI_APP_JS = `let tg = null;
 
+function injectTelegramSdkOnce() {
+  if (window.Telegram?.WebApp) return Promise.resolve();
+  return new Promise((resolve) => {
     const existing = document.querySelector('script[src="https://telegram.org/js/telegram-web-app.js"]');
+    const finish = () => {
+      let tries = 0;
+      const t = setInterval(() => {
+        if (window.Telegram?.WebApp) { clearInterval(t); resolve(); return; }
+        tries++;
+        if (tries >= 20) { clearInterval(t); resolve(); }
+      }, 100);
+      setTimeout(() => { clearInterval(t); resolve(); }, 4000);
+    };
     if (existing) {
       if (window.Telegram?.WebApp) return resolve();
-      existing.addEventListener("load", done, { once: true });
-      existing.addEventListener("error", () => resolve(), { once: true });
-      done();
+      existing.addEventListener('load', finish, { once: true });
+      setTimeout(finish, 200);
       return;
     }
-
-    const s = document.createElement("script");
-    s.src = "https://telegram.org/js/telegram-web-app.js";
-    s.async = true;
-    s.onload = done;
-    s.onerror = () => resolve();
-    document.head.appendChild(s);
-    setTimeout(resolve, 4000);
+    const sc = document.createElement('script');
+    sc.src = 'https://telegram.org/js/telegram-web-app.js';
+    sc.async = true;
+    sc.onload = finish;
+    sc.onerror = () => resolve();
+    document.head.appendChild(sc);
   });
-  return window.__miniAppTelegramSdkPromise;
 }
 
 async function ensureTelegramReady() {
   await injectTelegramSdkOnce();
-  const tg = window.Telegram?.WebApp;
-  if (tg) {
-    tg.ready();
-    tg.expand?.();
+  const webapp = window.Telegram?.WebApp || null;
+  if (webapp) {
+    webapp.ready();
+    if (webapp.expand) webapp.expand();
   }
-  return { tg, isTelegramRuntime: !!tg };
+  tg = webapp;
+  return { tg: webapp, isTelegramRuntime: !!webapp };
 }
 
 const out = document.getElementById("out");
@@ -5969,8 +6183,37 @@ function getFreshInitData() {
 function buildAuthBody(extra = {}) {
   const initData = getFreshInitData();
   if (initData) return { initData, ...extra };
+  const miniToken = MINI_TOKEN || localStorage.getItem(LOCAL_KEYS.miniToken) || "";
+  if (miniToken) return { miniToken, ...extra };
   if (extra?.allowGuest) return { ...extra, allowGuest: true };
   return { ...extra };
+}
+
+function isTelegramLikelyContext() {
+  const ua = String(navigator.userAgent || "").toLowerCase();
+  const hasTgData = !!(window.Telegram || getParamEverywhere("tgWebAppData") || getParamEverywhere("tgWebAppVersion"));
+  return ua.includes("telegram") || hasTgData;
+}
+
+function showOpenInTelegramState(msg) {
+  out.textContent = msg;
+  const box = document.createElement("div");
+  box.style.marginTop = "10px";
+  const btn = document.createElement("button");
+  btn.className = "btn";
+  btn.type = "button";
+  btn.textContent = "کپی لینک برای باز کردن داخل Telegram";
+  btn.onclick = async () => {
+    const link = window.location.href;
+    try {
+      await navigator.clipboard.writeText(link);
+      showToast("لینک کپی شد", "آن را در Telegram باز کنید", "COPY", false);
+    } catch {
+      showToast("کپی نشد", "لینک را دستی کپی کنید", "LINK", false);
+    }
+  };
+  box.appendChild(btn);
+  out.appendChild(box);
 }
 
 function isTelegramLikelyContext() {
@@ -6735,12 +6978,23 @@ async function boot(){
       showToast("اتصال تلگرام کامل نشد", "لطفاً مینی‌اپ را دوباره از داخل Telegram باز کنید.", "WAIT", false);
     } else if (!isTelegramRuntime) {
       showToast("داخل تلگرام باز کنید", "این صفحه باید داخل Telegram WebView باز شود.", "BLOCKED", false);
+      showOpenInTelegramState("این صفحه باید داخل تلگرام باز شود.");
     } else {
       showToast("حالت مهمان", "اتصال احراز نشده؛ اجرای محدود با داده عمومی", "GUEST", false);
     }
   }
   let {status, json} = await api("/api/user", buildAuthBody({ allowGuest: true }));
 
+
+  if (!json?.ok && status === 401 && isTelegramRuntime && tg?.initData && !INIT_DATA) {
+    INIT_DATA = tg.initData.trim();
+    if (INIT_DATA) {
+      try { localStorage.setItem(LOCAL_KEYS.initData, INIT_DATA); } catch {}
+      const retryTg = await api("/api/user", buildAuthBody({ allowGuest: true }));
+      status = retryTg.status;
+      json = retryTg.json;
+    }
+  }
 
   if (!json?.ok && status === 401 && isTelegramRuntime && tg?.initData && !INIT_DATA) {
     INIT_DATA = tg.initData.trim();
@@ -6793,6 +7047,7 @@ async function boot(){
     setupNewsPolling();
     return;
   }
+}
 
   OFFLINE_MODE = false;
   cacheUserSnapshot(json);

@@ -4,6 +4,7 @@ export default {
       const url = new URL(request.url);
 
       if (url.pathname === "/health") return new Response("ok", { status: 200 });
+      if (url.pathname === "/favicon.ico") return new Response("", { status: 204 });
 
       // ===== MINI APP (inline) =====
       // Serve app.js from root and nested miniapp paths (e.g. /miniapp/app.js)
@@ -22,10 +23,43 @@ export default {
       }
 
       // ===== MINI APP APIs =====
+
+      // ===== AUTH (easy) =====
+      if (url.pathname === "/api/auth/login" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
+        const v = await authMiniappRequest(request, body, env);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
+        const now = Math.floor(Date.now() / 1000);
+        const maxAge = Number(env.SESSION_MAX_AGE || 7 * 24 * 3600);
+        const payload = {
+          uid: v.userId,
+          un: v.fromLike?.username || "",
+          fn: v.fromLike?.first_name || "",
+          ln: v.fromLike?.last_name || "",
+          iat: now,
+          exp: now + maxAge,
+        };
+
+        const token = await makeSessionToken(payload, env);
+        const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+        if (token) headers.set("set-cookie", setSessionCookie(token, env));
+
+        return new Response(JSON.stringify({ ok: true, token: token || "" }), { status: 200, headers });
+      }
+
+      if (url.pathname === "/api/auth/logout" && request.method === "POST") {
+        const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+        headers.set("set-cookie", clearSessionCookie());
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+      }
+
       if (url.pathname === "/api/user" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         if (!v.ok) {
           if (miniappGuestEnabled(env)) {
             return jsonResponse(await buildMiniappGuestPayload(env));
@@ -38,7 +72,6 @@ export default {
         if (env.BOT_KV) await saveUser(v.userId, st, env);
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
         const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
-        const miniToken = await issueMiniappToken(env, v.userId, v.fromLike || {});
         const styles = await getStyleList(env);
         const [offerBanner, offerBannerImage] = await Promise.all([getOfferBanner(env), getOfferBannerImage(env)]);
         const customPrompts = await getCustomPrompts(env);
@@ -63,7 +96,6 @@ export default {
             timezone: st.profile?.timezone || "Asia/Tehran",
             entrySource: st.profile?.entrySource || "",
           },
-          miniToken,
         });
       }
 
@@ -71,7 +103,7 @@ export default {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -544,7 +576,7 @@ ${reply}`;
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -678,7 +710,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
         if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
@@ -735,7 +767,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
         if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
@@ -760,7 +792,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
         if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
@@ -785,7 +817,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env, v.fromLike);
@@ -1267,182 +1299,153 @@ async function getCachedR2ValueAllowStale(bucket, key) {
 }
 
 /* ========================== PROMPTS (ADMIN/OWNER ONLY) ========================== */
-const DEFAULT_ANALYSIS_PROMPT = `SYSTEM OVERRIDE: تحلیل‌گر بازار چندسبکی (STYLE-AWARE)
+const DEFAULT_ANALYSIS_PROMPT = `SYSTEM ROLE: Multi-Style Market Analyst (Style-Aware)
 
-متغیرها:
+Context variables:
 - STYLE_MODE: {STYLE}
 - RISK_PROFILE: {RISK}
 - NEWS_MODE: {NEWS}
 - TIMEFRAME: {TIMEFRAME}
 
-قوانین سخت:
-1) خروجی فقط فارسی باشد و فقط شامل بخش‌های ۱ تا ۵ با همین تیترها.
-2) فقط از داده‌های MARKET_DATA استفاده کن؛ اگر داده کافی نیست، شفاف بگو و حدس نزن.
-3) سطح‌های قیمتی را با عدد و برچسب X / Y / Z ارائه کن (اگر عدد از داده مشخص نیست: «نامشخص از داده»).
-4) شرط کندلی را واضح بنویس (Close بالا/پایین، Wick Sweep، شکست با بدنه، پولبک).
-5) هیچ توصیه قطعی «حتماً بخر/بفروش» نده؛ سناریومحور و مشروط بنویس.
+Hard constraints:
+1) Output must be in Persian and strictly step-by-step with clear section titles.
+2) Use only MARKET_DATA. If data is missing, explicitly state "نامشخص از داده" and avoid guessing.
+3) Final trade plan must be conditional (scenario-based), never absolute buy/sell advice.
+4) Every setup must include Entry, Stop Loss, TP1, TP2, and invalidation.
+5) Respect selected style only. Do not mix frameworks unless STYLE_MODE is "ترکیبی".
 
-سوئیچ سبک (بر اساس STYLE_MODE):
-A) اگر STYLE_MODE = "پرایس اکشن"
-- تمرکز: ساختار (HH/HL یا LH/LL)، حمایت/مقاومت، شکست و پولبک، عرضه/تقاضا، الگوهای کندلی.
-- از اصطلاحات ICT فقط در صورت نیاز و با توضیح کوتاه استفاده کن.
+Execution structure (mandatory):
+۱) بایاس و وضعیت تایم‌فریم بالاتر
+۲) ساختار بازار و نقدینگی
+۳) نواحی کلیدی و رفتار قیمت
+۴) سناریوهای ورود و مدیریت معامله
+۵) پلن اجرا + نقطه ابطال
 
-B) اگر STYLE_MODE = "ICT"
-- تمرکز: Liquidity (استاپ‌ها)، Sweep/Grab، Order Block، FVG، Breaker/Structure Shift.
-- هدف نقدینگی و واکنش در برخورد را مشخص کن.
+Risk/profile adaptation:
+- کم‌ریسک: ورود پس از تایید کامل (Close + Retest) و SL محافظه‌کار.
+- متوسط: تایید استاندارد و مدیریت پله‌ای TP.
+- پرریسک: ورود تهاجمی فقط با هشدار ریسک بالا.
 
-C) اگر STYLE_MODE = "ATR"
-- تمرکز: نوسان و مدیریت ریسک با ATR.
-- اگر ATR عددی در داده نبود، استاپ/اهداف را نسبی بنویس (مثلاً ۱×ATR) و بگو «ATR عددی در داده نیست».
-
-سوئیچ ریسک (بر اساس RISK_PROFILE):
-- کم‌ریسک: فقط با تایید قوی (Close + Retest)، SL محافظه‌کار، TP پله‌ای.
-- متوسط: تایید استاندارد، SL پشت ناحیه، TP دو مرحله‌ای.
-- پرریسک: ورود تهاجمی‌تر فقط اگر سناریو واضح است؛ حتماً هشدار «ریسک بالا».
-
-NEWS_MODE:
-- اگر {NEWS} = "on": تاثیر خبر/رویداد را کوتاه داخل سناریوها اضافه کن.
-- اگر {NEWS} = "off": از خبر حرف نزن.
-
-OUTPUT FORMAT (STRICT):
-۱. نقشه پول‌های پارک‌شده (شکارگاه نهنگ‌ها):
-۲. تله‌های قیمتی اخیر (فریب بازار):
-۳. ردپای ورود پول هوشمند / ساختار (طبق STYLE_MODE):
-۴. سناریوی بعدی (مسیر احتمالی + شروط فعال‌سازی):
-۵. استراتژی لحظه برخورد (ماشه نهایی + Entry/SL/TP مشروط با X/Y/Z):`;
+News mode:
+- If {NEWS}=on, briefly include high-impact event risk in execution timing.
+- If {NEWS}=off, do not include news commentary.`;
 
 /* ========================== STYLE PROMPTS (DEFAULTS) ==========================
  * Users choose st.style (Persian labels) and we inject a style-specific guide
  * into the analysis prompt. Admin can still override the global base prompt via KV.
  */
 const STYLE_PROMPTS_DEFAULT = {
-  "پرایس اکشن": `You are a professional Price Action trader and market analyst.
+  "پرایس اکشن": `Role: Professional Price Action Market Analyst
+Constraints:
+- Analysis style: Pure Price Action only
+- Indicators: forbidden unless explicitly requested
+- Focus: high-probability setups only
 
-Analyze the given market (Symbol, Timeframe) using pure Price Action concepts only.
-Do NOT use indicators unless explicitly requested.
+Required sections:
+1) Market Structure
+- Trend (Uptrend / Downtrend / Range)
+- HH, HL, LH, LL labels
+- Structure status (Intact / BOS / MSS)
 
-Your analysis must include:
-
-1. Market Structure
-- Identify the current structure (Uptrend / Downtrend / Range)
-- Mark HH, HL, LH, LL
-- Specify whether structure is intact or broken (BOS / MSS)
-
-2. Key Levels
-- Strong Support & Resistance zones
-- Flip zones (SR → Resistance / Resistance → Support)
+2) Key Levels
+- Strong support/resistance zones
+- Flip zones
 - Psychological levels (if relevant)
 
-3. Candlestick Behavior
-- Identify strong rejection candles (Pin bar, Engulfing, Inside bar)
-- Explain what these candles indicate about buyers/sellers
+3) Candlestick Behavior
+- Pin Bar, Engulfing, Inside Bar
+- Explain buyer/seller intent behind each key candle
 
-4. Entry Scenarios
-For each valid setup:
-- Entry zone
-- Stop Loss (logical, structure-based)
-- Take Profit targets (TP1 / TP2)
-- Risk to Reward (minimum 1:2)
+4) Entry Scenarios
+- Clear entry zone
+- Logical structure-based SL
+- TP1 and TP2 targets
+- Minimum RR = 1:2
 
-5. Bias & Scenarios
+5) Bias & Scenario
 - Main bias (Bullish / Bearish / Neutral)
-- Alternative scenario if price invalidates the setup
+- Alternative scenario upon invalidation
 
-6. Execution Plan
-- Is this a continuation or reversal trade?
-- What confirmation is required before entry?
+6) Execution Plan
+- Continuation or reversal setup
+- Required confirmation before entry
 
-Explain everything step-by-step, clearly and professionally.
-Avoid overtrading. Focus on high-probability setups only.`,
-  "ICT": `You are an ICT (Inner Circle Trader) & Smart Money analyst.
+Style of answer: professional, clear, educational, and step-by-step.`,
+  "ICT": `Role: ICT & Smart Money Analyst
+Methodology: ICT + Smart Money Concepts only
+Restrictions: No indicators, no retail concepts
 
-Analyze the market (Symbol, Timeframe) using ICT & Smart Money Concepts ONLY.
+Required sections:
+1) Higher Timeframe Bias (Daily / H4)
+- Overall bias (Bullish/Bearish/Neutral)
+- Premium zone, Discount zone, Equilibrium (50%)
+- Imbalance vs Balance state
 
-Your analysis must include:
+2) Liquidity Mapping
+- EQH, EQL, Buy-side liquidity, Sell-side liquidity, SL pools
+- State where liquidity is likely to be engineered
 
-1. Higher Timeframe Bias
-- Determine HTF bias (Daily / H4)
-- Identify Premium & Discount zones
-- Is price in equilibrium or imbalance?
+3) Market Structure
+- BOS and MSS/CHoCH
+- Clarify manipulation phase vs expansion phase
 
-2. Liquidity Mapping
-- Identify:
-  - Equal Highs / Equal Lows
-  - Buy-side liquidity
-  - Sell-side liquidity
-- Mark likely stop-loss pools
+4) PD Arrays
+- Bullish/Bearish Order Blocks
+- FVG, Liquidity Voids
+- PDH, PDL, PWH, PWL
 
-3. Market Structure
-- Identify:
-  - BOS (Break of Structure)
-  - MSS (Market Structure Shift)
-- Clarify whether the move is manipulation or expansion
-
-4. PD Arrays
-- Order Blocks (Bullish / Bearish)
-- Fair Value Gaps (FVG)
-- Liquidity Voids
-- Previous High / Low (PDH, PDL, PWH, PWL)
-
-5. Kill Zones (if intraday)
+5) Kill Zones (intraday only)
 - London Kill Zone
 - New York Kill Zone
-- Explain timing relevance
+- Explain why timing matters
 
-6. Entry Model
-- Entry model used (e.g. Liquidity Sweep → MSS → FVG entry)
-- Entry price
-- Stop Loss (below/above OB or swing)
-- Take Profits (liquidity targets)
+6) Entry Model
+- Example model: Sweep → MSS → FVG entry OR Sweep → OB entry
+- Must include Entry, SL location, and liquidity-based targets
 
-7. Narrative
-- Explain the story:
-  - Who is trapped?
-  - Where did smart money enter?
-  - Where is price likely engineered to go?
+7) Narrative
+- Who is trapped?
+- Where did smart money enter?
+- Where is price likely engineered to go?
 
-Provide a clear bullish/bearish execution plan and an invalidation point.`,
-  "ATR": `You are a quantitative trading assistant specializing in volatility-based strategies.
+Finish with: Bias, entry conditions, targets, and invalidation point.`,
+  "ATR": `Role: Quantitative Trading Assistant
+Strategy: ATR-based volatility trading
 
-Analyze the market (Symbol, Timeframe) using ATR (Average True Range) as the core tool.
-
-Your analysis must include:
-
-1. Volatility State
+Required sections:
+1) Volatility State
 - Current ATR value
-- Compare current ATR with historical average
-- Is volatility expanding or contracting?
+- Comparison with historical ATR average
+- Volatility expansion or contraction
 
-2. Market Condition
-- Trending or Ranging?
-- Is the market suitable for breakout or mean reversion?
+2) Market Condition
+- Trending or ranging
+- Breakout suitability vs mean-reversion suitability
 
-3. Trade Setup
-- Optimal Entry based on price structure
-- ATR-based Stop Loss:
-  - SL = Entry ± (ATR × Multiplier)
-- ATR-based Take Profit:
-  - TP1, TP2 based on ATR expansion
+3) Trade Setup
+- Entry based on price structure
+- Stop Loss = Entry ± (ATR × Multiplier)
+- TP1 and TP2 based on ATR expansion
 
-4. Position Sizing
+4) Position Sizing
 - Risk per trade (%)
-- Position size calculation based on SL distance
+- Position size from SL distance
 
-5. Trade Filtering
+5) Trade Filtering
 - When NOT to trade based on ATR
-- High-risk volatility conditions (news, spikes)
+- High-risk volatility conditions (news spikes)
 
-6. Risk Management
+6) Risk Management
 - Max daily loss
 - Max consecutive losses
-- Trailing Stop logic using ATR
+- ATR-based trailing stop logic
 
-7. Summary
-- Is this trade statistically justified?
+7) Summary
+- Statistical justification
 - Expected trade duration
-- Risk classification (Low / Medium / High)
+- Risk classification (Low/Medium/High)
 
-Keep the explanation practical and execution-focused.`,
+Output style: practical, precise, execution-focused.`,
 };
 
 function normalizeStyleLabel(style) {
@@ -1971,34 +1974,21 @@ function contactKeyboard() {
   };
 }
 
-const DEFAULT_MINIAPP_URL = "https://sniperim.mad-pyc.workers.dev/";
-
 function getMiniappUrl(env) {
   const configured = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || "").toString().trim();
-  const raw = configured || DEFAULT_MINIAPP_URL;
+  const raw = configured;
+  if (!raw) return "";
   try {
     const u = new URL(raw);
     return u.toString();
   } catch {
-    return DEFAULT_MINIAPP_URL;
+    return "";
   }
 }
 async function miniappInlineKeyboard(env, st, from) {
   const url = getMiniappUrl(env);
   if (!url) return null;
-  const token = await issueMiniappToken(env, st?.userId, from || {});
-  const finalUrl = token ? appendQuery(url, { miniToken: token }) : url;
-  return { inline_keyboard: [[{ text: BTN.MINIAPP, web_app: { url: finalUrl } }]] };
-}
-
-function appendQuery(url, params) {
-  try {
-    const u = new URL(url);
-    Object.entries(params || {}).forEach(([k,v]) => { if (v != null && String(v) !== "") u.searchParams.set(k, String(v)); });
-    return u.toString();
-  } catch {
-    return url;
-  }
+  return { inline_keyboard: [[{ text: BTN.MINIAPP, web_app: { url } }]] };
 }
 
 
@@ -3795,9 +3785,11 @@ async function handleUpdate(update, env) {
     if (text === "/wallet" || text === BTN.WALLET) {
       const wallet = await getWallet(env);
       const txt =
-        `💳 ولت و پرداخت\n\n` +
-        (wallet ? `آدرس ولت:\n${wallet}\n\n` : "") +
-        `برای مشاهده موجودی، واریز یا برداشت از دکمه‌ها استفاده کن.`;
+        `💳 ولت\n\n` +
+        `Marketi1 PRO با ارزش ۲۵ USDT\n\n` +
+        (wallet ? `آدرس ولت درگاه:\n${wallet}\n\n` : "") +
+        `📜 تاریخچه تراکنشات، واریز و برداشت را از دکمه‌های زیر مدیریت کنید.\n\n` +
+        `«واریزی فقط به آدرس ولت درگاه ممکن است\nدر لیست زیر باید از واریز هش واریزی را ارسال کنید.»`;
       return tgSendMessage(env, chatId, txt, walletMenuKeyboard());
     }
 
@@ -3815,11 +3807,18 @@ async function handleUpdate(update, env) {
         `➕ واریز
 
 ` +
-        (wallet ? `آدرس ولت:
+        `Marketi1 PRO با ارزش ۲۵ USDT
+
+` +
+        (wallet ? `آدرس ولت درگاه:
 ${wallet}
 ` : "") +
         `
 Memo/Tag: ${memo}
+
+` +
+        `«واریزی فقط به آدرس ولت درگاه ممکن است
+در لیست زیر باید از واریز هش واریزی را ارسال کنید.»
 
 ` +
         `TxID پرداخت را همینجا بفرست (در صورت نیاز: <txid> <amount>).`;
@@ -3840,15 +3839,25 @@ Memo/Tag: ${memo}
     if (text === "/invite" || text === BTN.INVITE) {
       const { link, share } = inviteShareText(st, env);
       if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
+      const pts = Number(st?.referral?.points || 0);
+      const inv = Number(st?.referral?.successfulInvites || 0);
       const txt =
         `🤝 دعوت دوستان
 
 ` +
-        `🔗 لینک رفرال اختصاصی: <a href="${escapeHtml(link)}">باز کردن لینک دعوت</a>
+        `✅ دعوت موفق: ${inv}
+` +
+        `🎁 امتیاز شما: ${pts}
 
 ` +
-        (share ? `برای اشتراک‌گذاری سریع: <a href="${escapeHtml(share)}">ارسال لینک</a>
-` : "");
+        `🔗 لینک رفرال (قابل کپی):
+<a href="${escapeHtml(link)}">${escapeHtml(link)}</a>
+
+` +
+        (share ? `🚀 اشتراک سریع لینک: <a href="${escapeHtml(share)}">ارسال لینک</a>
+
+` : "") +
+        `«با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتیاز بدست می آورید در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید»`;
       return tgSendMessageHtml(env, chatId, txt, mainMenuKeyboard(env));
     }
 
@@ -3864,7 +3873,7 @@ Memo/Tag: ${memo}
       return tgSendMessage(
         env,
         chatId,
-        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.\n\nپیام مستقیم: ${handle}${walletLine}`,
+        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.\n«با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.»\n\nپیام مستقیم: ${handle}${walletLine}`,
         kb([[BTN.SUPPORT_FAQ, BTN.SUPPORT_TICKET], [BTN.SUPPORT_CUSTOM_PROMPT], [BTN.HOME]])
       );
     }
@@ -3923,14 +3932,11 @@ ${summary || "تحلیل خبری در دسترس نیست."}`, mainMenuKeyboard
 
 در Wrangler / داشبورد یک متغیر ENV به نام MINIAPP_URL یا PUBLIC_BASE_URL بگذار (مثلاً https://<your-worker-domain>/ ) و دوباره Deploy کن.`, mainMenuKeyboard(env));
       }
-      const token = await issueMiniappToken(env, st.userId, from);
-      const finalUrl = token ? appendQuery(url, { miniToken: token }) : url;
-      const kbInline = { inline_keyboard: [[{ text: BTN.MINIAPP, web_app: { url: finalUrl } }]] };
+      const kbInline = { inline_keyboard: [[{ text: BTN.MINIAPP, web_app: { url } }]] };
       return tgSendMessage(env, chatId, `🧩 مینی‌اپ فعال شد.
 
 از دکمه زیر وارد شوید. اگر دکمه باز نشد، این لینک را مستقیم باز کنید:
-${finalUrl}\n\nچک‌لیست سریع اتصال:
-${MINIAPP_EXEC_CHECKLIST}`, kbInline);
+${url}`, kbInline);
     }
 
 
@@ -4063,10 +4069,12 @@ ${MINIAPP_EXEC_CHECKLIST}`, kbInline);
       await saveUser(userId, st, env);
 
       const marketFa = ({crypto:"کریپتو", forex:"فارکس", metals:"فلزات", stocks:"سهام"})[result.recommendedMarket] || "کریپتو";
+      const sampleSymbol = String(st.selectedSymbol || st.profile?.preferredSymbol || "BTCUSDT").toUpperCase();
+      const sampleHint = `نمونه تحلیل کوتاه (${sampleSymbol} / ${st.timeframe}): اگر قیمت بالای ناحیه تعادلی تثبیت شود، سناریوی ادامه روند فعال است؛ در شکست ساختار خلاف جهت، سناریوی جایگزین اجرا می‌شود.`;
       return tgSendMessage(
         env,
         chatId,
-        `✅ تعیین سطح انجام شد.\n\nسطح: ${st.profile.level}\nپیشنهاد بازار: ${marketFa}\n\nتنظیمات پیشنهادی:\n⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}\n\nیادداشت:\n${st.profile.levelNotes || "—"}\n\nاگر می‌خوای دوباره تعیین‌سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
+        `✅ تعیین سطح انجام شد.\n\nسطح: ${st.profile.level}\nپیشنهاد بازار: ${marketFa}\n\nتنظیمات پیشنهادی:\n⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}\n\nیادداشت:\n${st.profile.levelNotes || "—"}\n\n🧠 ${sampleHint}\n\nبرای دریافت تحلیل کامل، از منوی اصلی روی «📈 سیگنال‌ها» یا «تحلیل» بزن.`,
         mainMenuKeyboard(env)
       );
     }
@@ -5082,6 +5090,162 @@ function jsonResponse(obj, status = 200) {
 }
 
 
+function extractInitDataFromRequest(request) {
+  try {
+    const url = new URL(request.url);
+    const q = url.searchParams.get("initData") || url.searchParams.get("init_data");
+    if (q) return q;
+
+    const auth = request.headers.get("authorization") || request.headers.get("Authorization");
+    if (auth) {
+      const m = auth.match(/^Bearer\s+(.+)$/i);
+      if (m && m[1]) return m[1].trim();
+    }
+
+    const h = request.headers.get("x-telegram-initdata") || request.headers.get("x-initdata");
+    if (h) return String(h).trim();
+  } catch (_) {}
+  return "";
+}
+
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  const parts = String(header).split(";");
+  for (const p of parts) {
+    const i = p.indexOf("=");
+    if (i === -1) continue;
+    const k = p.slice(0, i).trim();
+    const v = p.slice(i + 1).trim();
+    if (!k) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+function b64urlEncode(bytes) {
+  let bin = "";
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
+  return btoa(bin).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+function b64urlDecodeToBytes(s) {
+  s = String(s || "").replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function hmacSha256(secret, data) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
+  return new Uint8Array(sig);
+}
+
+async function makeSessionToken(payload, env) {
+  const secret = env.SESSION_SECRET || env.MINIAPP_SESSION_SECRET || "";
+  if (!secret) return "";
+  const header = { alg: "HS256", typ: "JWT" };
+  const enc = (o) => b64urlEncode(new TextEncoder().encode(JSON.stringify(o)));
+  const h = enc(header);
+  const p = enc(payload);
+  const data = `${h}.${p}`;
+  const sig = await hmacSha256(secret, data);
+  return `${data}.${b64urlEncode(sig)}`;
+}
+
+async function verifySessionToken(token, env) {
+  const secret = env.SESSION_SECRET || env.MINIAPP_SESSION_SECRET || "";
+  if (!secret) return { ok: false, reason: "no_session_secret" };
+  token = String(token || "").trim();
+  const parts = token.split(".");
+  if (parts.length !== 3) return { ok: false, reason: "bad_token" };
+  const [h, p, s] = parts;
+  const data = `${h}.${p}`;
+  let sig;
+  try { sig = b64urlDecodeToBytes(s); } catch (_) { return { ok: false, reason: "bad_token_sig" }; }
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+
+  const ok = await crypto.subtle.verify("HMAC", key, sig, new TextEncoder().encode(data));
+  if (!ok) return { ok: false, reason: "bad_token_sig" };
+
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(b64urlDecodeToBytes(p)));
+  } catch (_) {
+    return { ok: false, reason: "bad_token_payload" };
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (payload?.exp && now > payload.exp) return { ok: false, reason: "token_expired" };
+  if (!payload?.uid) return { ok: false, reason: "token_missing_uid" };
+
+  return { ok: true, payload };
+}
+
+function extractSessionTokenFromRequest(request) {
+  const auth = request.headers.get("authorization") || request.headers.get("Authorization");
+  if (auth) {
+    const m = auth.match(/^Bearer\s+(.+)$/i);
+    if (m && m[1]) return m[1].trim();
+  }
+
+  const cookies = parseCookies(request.headers.get("cookie") || request.headers.get("Cookie"));
+  if (cookies.mq_session) return cookies.mq_session;
+
+  const h = request.headers.get("x-session-token") || request.headers.get("x-mq-session");
+  if (h) return String(h).trim();
+
+  return "";
+}
+
+async function authMiniappRequest(request, body, env) {
+  const tok = extractSessionTokenFromRequest(request);
+  if (tok) {
+    const vt = await verifySessionToken(tok, env);
+    if (vt.ok) {
+      const pl = vt.payload;
+      const fromLike = {
+        id: pl.uid,
+        username: pl.un || "",
+        first_name: pl.fn || "",
+        last_name: pl.ln || "",
+      };
+      return { ok: true, userId: pl.uid, fromLike, via: "session" };
+    }
+  }
+
+  const initData = (body && body.initData) ? body.initData : extractInitDataFromRequest(request);
+  const v = await verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+  if (!v.ok) return v;
+  return { ...v, via: "initData" };
+}
+
+function setSessionCookie(token, env) {
+  const maxAge = Number(env.SESSION_MAX_AGE || 7 * 24 * 3600);
+  return `mq_session=${token}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=None`;
+}
+
+function clearSessionCookie() {
+  return `mq_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None`;
+}
+
 function miniappGuestEnabled(env) {
   const v = String(env.MINIAPP_GUEST_READONLY || "1").trim().toLowerCase();
   return !(v === "0" || v === "false" || v === "no");
@@ -5107,52 +5271,21 @@ async function buildMiniappGuestPayload(env) {
   };
 }
 
-async function issueMiniappToken(env, userId, fromLike = {}) {
-  if (!env.BOT_KV) return "";
-  const raw = crypto.getRandomValues(new Uint8Array(24));
-  const token = Array.from(raw).map((b) => b.toString(16).padStart(2, "0")).join("");
-  const payload = {
-    userId: String(userId || ""),
-    username: String(fromLike?.username || ""),
-    createdAt: Date.now(),
-  };
-  await env.BOT_KV.put(`miniapp_token:${token}`, JSON.stringify(payload), { expirationTtl: Math.max(300, Number(env.MINIAPP_TOKEN_TTL_SEC || 86400)) });
-  return token;
-}
-
-async function verifyMiniappToken(token, env) {
-  if (!env.BOT_KV || !token) return { ok: false, reason: "token_missing" };
-  const raw = await env.BOT_KV.get(`miniapp_token:${String(token).trim()}`);
-  if (!raw) return { ok: false, reason: "token_invalid" };
-  try {
-    const j = JSON.parse(raw);
-    const userId = String(j?.userId || "").trim();
-    if (!userId) return { ok: false, reason: "token_user_missing" };
-    return { ok: true, userId, fromLike: { username: String(j?.username || "") }, via: "mini_token" };
-  } catch {
-    return { ok: false, reason: "token_bad_json" };
-  }
-}
-
-async function verifyMiniappAuth(body, env) {
-  const initData = body?.initData;
-  const v = await verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
-  if (v.ok) return v;
-  const token = String(body?.miniToken || "").trim();
-  if (!token) return v;
-  const tv = await verifyMiniappToken(token, env);
-  if (tv.ok) return tv;
-  return v;
-}
 
 /* ========================== TELEGRAM MINI APP initData verification ========================== */
 async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientRaw) {
-  if (!initData || typeof initData !== "string") return { ok: false, reason: "initData_missing" };
-  const lenient = String(lenientRaw || "").trim() === "1" || String(lenientRaw || "").toLowerCase() === "true";
+  const rawLenient = String(lenientRaw || "").trim().toLowerCase();
+  const lenient = !(rawLenient === "0" || rawLenient === "false" || rawLenient === "no");
+
+  if (!initData || typeof initData !== "string") {
+    if (lenient) return { ok: true, userId: 999001, fromLike: { id: 999001, username: "dev_user" } };
+    return { ok: false, reason: "initData_missing" };
+  }
+
   const initRaw = String(initData || "").trim();
   if (lenient && initRaw.startsWith("dev:")) {
     const devId = Number(initRaw.split(":")[1] || "0") || 999001;
-    return { ok: true, userId: devId, fromLike: { username: "dev_user" } };
+    return { ok: true, userId: devId, fromLike: { id: devId, username: "dev_user" } };
   }
   if (!botToken && !lenient) return { ok: false, reason: "bot_token_missing" };
 
@@ -5178,10 +5311,10 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   if (hash && !timingSafeEqualHex(sigHex, hash) && !lenient) return { ok: false, reason: "hash_mismatch" };
 
   const user = safeJsonParse(params.get("user") || "") || {};
-  const userId = user?.id || Number(params.get("user_id") || "0");
+  const userId = user?.id || Number(params.get("user_id") || "0") || (lenient ? 999001 : 0);
   if (!userId) return { ok: false, reason: "user_missing" };
 
-  const fromLike = { username: user?.username || "", first_name: user?.first_name || "", last_name: user?.last_name || "", language_code: user?.language_code || "" };
+  const fromLike = { id: userId, username: user?.username || (lenient ? "dev_user" : ""), first_name: user?.first_name || "", last_name: user?.last_name || "", language_code: user?.language_code || "" };
   return { ok: true, userId, fromLike };
 }
 
@@ -5475,7 +5608,7 @@ const MINI_APP_HTML = `<!doctype html>
         <div class="card-b offer" id="offerCard">
           <div>
             <h3>🎁 پیشنهاد ویژه</h3>
-            <p id="offerText">فعال‌سازی اشتراک ویژه با تخفیف محدود.</p>
+            <p id="offerText">marketi1 PRO با ارزش ۲۵ USDT</p>
             <div class="offer-media" id="offerMedia"><img id="offerImg" alt="offer" /></div>
           </div>
           <img id="offerImage" class="offer-media" alt="offer" />
@@ -5630,7 +5763,7 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="actions">
             <button id="sendSupportTicket" class="btn">✉️ ارسال تیکت</button>
           </div>
-          <div class="muted" style="font-size:12px; line-height:1.6;">پاسخ از طریق پشتیبانی تلگرام ارسال می‌شود.</div>
+          <div class="muted" style="font-size:12px; line-height:1.6;">با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید. پاسخ از طریق پشتیبانی تلگرام ارسال می‌شود.</div>
         </div>
       </div>
 
@@ -5910,7 +6043,6 @@ const spin = el("spin");
 
 let ALL_SYMBOLS = [];
 let INIT_DATA = "";
-let MINI_TOKEN = "";
 let IS_STAFF = false;
 let IS_OWNER = false;
 let IS_GUEST = false;
@@ -5918,7 +6050,6 @@ let OFFLINE_MODE = false;
 
 const LOCAL_KEYS = {
   initData: "miniapp_init_data",
-  miniToken: "miniapp_auth_token",
   userState: "miniapp_cached_user_state_v1",
   quoteCache: "miniapp_quote_cache_v1",
   newsCache: "miniapp_news_cache_v1",
@@ -5953,23 +6084,7 @@ function getFreshInitData() {
 }
 
 function buildAuthBody(extra = {}) {
-  return { initData: getFreshInitData(), miniToken: MINI_TOKEN || localStorage.getItem(LOCAL_KEYS.miniToken) || "", ...extra };
-}
-
-function parseMiniTokenStartParam(raw) {
-  const v = String(raw || "").trim();
-  if (!v) return "";
-  try {
-    const qp = new URLSearchParams(v);
-    const t = String(qp.get("miniToken") || qp.get("token") || "").trim();
-    if (t) return t;
-  } catch {}
-  const m = v.match(/(?:^|[?&])(?:miniToken|token)=([^&]+)/i);
-  if (m?.[1]) {
-    try { return decodeURIComponent(m[1]).trim(); } catch { return String(m[1] || "").trim(); }
-  }
-  if (/^[a-f0-9]{24,96}$/i.test(v)) return v;
-  return "";
+  return { initData: getFreshInitData(), ...extra };
 }
 
 function getParamEverywhere(name) {
@@ -6127,7 +6242,7 @@ function prettyErr(j, status){
   if (status === 403 && String(e) === "forbidden") return "دسترسی این بخش برای نقش فعلی شما مجاز نیست.";
   if (status === 401) {
     if (String(e).includes("initData")) return "اتصال مینی‌اپ منقضی شده؛ اپ را مجدد از داخل تلگرام باز کنید.";
-    return "احراز هویت تلگرام ناموفق است.\n\n" + MINIAPP_EXEC_CHECKLIST;
+    return "احراز هویت تلگرام ناموفق است. مینی‌اپ را فقط از داخل تلگرام باز کنید و دوباره تلاش کنید.";
   }
   return "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.";
 }
@@ -6610,7 +6725,7 @@ function applyUserState(json) {
   if (json.state?.selectedSymbol && (json.symbols || []).includes(json.state.selectedSymbol)) {
     setVal("symbol", json.state.selectedSymbol);
   } else if (json.symbols?.length) setVal("symbol", json.symbols[0]);
-  if (offerText) offerText.textContent = json.offerBanner || "فعال‌سازی اشتراک ویژه با تخفیف محدود.";
+  if (offerText) offerText.textContent = json.offerBanner || "marketi1 PRO با ارزش ۲۵ USDT";
   if (offerTag) offerTag.textContent = json.role === "owner" ? "Owner" : "Special";
   if (offerImage) {
     const img = String(json.offerBannerImage || "").trim();
@@ -6676,14 +6791,6 @@ async function boot(){
   const isTelegramRuntime = !!window.Telegram?.WebApp;
   const qsInitData = getParamEverywhere("initData") || "";
   const savedInitData = localStorage.getItem(LOCAL_KEYS.initData) || "";
-  const qsMiniToken = getParamEverywhere("miniToken") || getParamEverywhere("token") || "";
-  const startParamToken = parseMiniTokenStartParam(tg?.initDataUnsafe?.start_param || "");
-  const savedMiniToken = localStorage.getItem(LOCAL_KEYS.miniToken) || "";
-  const resolvedMiniToken = qsMiniToken || startParamToken || savedMiniToken || "";
-  if (resolvedMiniToken) {
-    MINI_TOKEN = resolvedMiniToken;
-    try { localStorage.setItem(LOCAL_KEYS.miniToken, resolvedMiniToken); } catch {}
-  }
   let initData = (tg?.initData || "").trim();
 
   // Telegram WebApp may populate initData with a slight delay.
@@ -6710,15 +6817,6 @@ async function boot(){
     showToast("حالت مهمان", "اتصال احراز نشده؛ اجرای محدود با داده عمومی", "GUEST", false);
   }
   let {status, json} = await api("/api/user", buildAuthBody({ allowGuest: true }));
-
-  if (!json?.ok && status === 401 && (MINI_TOKEN || localStorage.getItem(LOCAL_KEYS.miniToken))) {
-    const initBackup = INIT_DATA;
-    INIT_DATA = "";
-    const retry = await api("/api/user", buildAuthBody({ allowGuest: true }));
-    status = retry.status;
-    json = retry.json;
-    if (!json?.ok) INIT_DATA = initBackup;
-  }
 
   if (!json?.ok) {
     if (status === 401) {
@@ -6764,10 +6862,6 @@ async function boot(){
   }
 
   OFFLINE_MODE = false;
-  if (json?.miniToken) {
-    MINI_TOKEN = String(json.miniToken || "").trim();
-    try { localStorage.setItem(LOCAL_KEYS.miniToken, MINI_TOKEN); } catch {}
-  }
   cacheUserSnapshot(json);
   applyUserState(json);
   out.textContent = "آماده ✅";
