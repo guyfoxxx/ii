@@ -23,10 +23,43 @@ export default {
       }
 
       // ===== MINI APP APIs =====
+
+      // ===== AUTH (easy) =====
+      if (url.pathname === "/api/auth/login" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
+        const v = await authMiniappRequest(request, body, env);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
+        const now = Math.floor(Date.now() / 1000);
+        const maxAge = Number(env.SESSION_MAX_AGE || 7 * 24 * 3600);
+        const payload = {
+          uid: v.userId,
+          un: v.fromLike?.username || "",
+          fn: v.fromLike?.first_name || "",
+          ln: v.fromLike?.last_name || "",
+          iat: now,
+          exp: now + maxAge,
+        };
+
+        const token = await makeSessionToken(payload, env);
+        const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+        if (token) headers.set("set-cookie", setSessionCookie(token, env));
+
+        return new Response(JSON.stringify({ ok: true, token: token || "" }), { status: 200, headers });
+      }
+
+      if (url.pathname === "/api/auth/logout" && request.method === "POST") {
+        const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+        headers.set("set-cookie", clearSessionCookie());
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+      }
+
       if (url.pathname === "/api/user" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         if (!v.ok) {
           if (miniappGuestEnabled(env)) {
             return jsonResponse(await buildMiniappGuestPayload(env));
@@ -68,7 +101,7 @@ export default {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -539,7 +572,7 @@ ${reply}`;
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -684,7 +717,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
         if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
@@ -741,7 +774,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
         if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
@@ -766,7 +799,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
         if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
@@ -791,7 +824,7 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyMiniappAuth(body, env);
+        const v = await authMiniappRequest(request, body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -5120,6 +5153,162 @@ function jsonResponse(obj, status = 200) {
 }
 
 
+function extractInitDataFromRequest(request) {
+  try {
+    const url = new URL(request.url);
+    const q = url.searchParams.get("initData") || url.searchParams.get("init_data");
+    if (q) return q;
+
+    const auth = request.headers.get("authorization") || request.headers.get("Authorization");
+    if (auth) {
+      const m = auth.match(/^Bearer\s+(.+)$/i);
+      if (m && m[1]) return m[1].trim();
+    }
+
+    const h = request.headers.get("x-telegram-initdata") || request.headers.get("x-initdata");
+    if (h) return String(h).trim();
+  } catch (_) {}
+  return "";
+}
+
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  const parts = String(header).split(";");
+  for (const p of parts) {
+    const i = p.indexOf("=");
+    if (i === -1) continue;
+    const k = p.slice(0, i).trim();
+    const v = p.slice(i + 1).trim();
+    if (!k) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+function b64urlEncode(bytes) {
+  let bin = "";
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
+  return btoa(bin).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+function b64urlDecodeToBytes(s) {
+  s = String(s || "").replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function hmacSha256(secret, data) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
+  return new Uint8Array(sig);
+}
+
+async function makeSessionToken(payload, env) {
+  const secret = env.SESSION_SECRET || env.MINIAPP_SESSION_SECRET || "";
+  if (!secret) return "";
+  const header = { alg: "HS256", typ: "JWT" };
+  const enc = (o) => b64urlEncode(new TextEncoder().encode(JSON.stringify(o)));
+  const h = enc(header);
+  const p = enc(payload);
+  const data = `${h}.${p}`;
+  const sig = await hmacSha256(secret, data);
+  return `${data}.${b64urlEncode(sig)}`;
+}
+
+async function verifySessionToken(token, env) {
+  const secret = env.SESSION_SECRET || env.MINIAPP_SESSION_SECRET || "";
+  if (!secret) return { ok: false, reason: "no_session_secret" };
+  token = String(token || "").trim();
+  const parts = token.split(".");
+  if (parts.length !== 3) return { ok: false, reason: "bad_token" };
+  const [h, p, s] = parts;
+  const data = `${h}.${p}`;
+  let sig;
+  try { sig = b64urlDecodeToBytes(s); } catch (_) { return { ok: false, reason: "bad_token_sig" }; }
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+
+  const ok = await crypto.subtle.verify("HMAC", key, sig, new TextEncoder().encode(data));
+  if (!ok) return { ok: false, reason: "bad_token_sig" };
+
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(b64urlDecodeToBytes(p)));
+  } catch (_) {
+    return { ok: false, reason: "bad_token_payload" };
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (payload?.exp && now > payload.exp) return { ok: false, reason: "token_expired" };
+  if (!payload?.uid) return { ok: false, reason: "token_missing_uid" };
+
+  return { ok: true, payload };
+}
+
+function extractSessionTokenFromRequest(request) {
+  const auth = request.headers.get("authorization") || request.headers.get("Authorization");
+  if (auth) {
+    const m = auth.match(/^Bearer\s+(.+)$/i);
+    if (m && m[1]) return m[1].trim();
+  }
+
+  const cookies = parseCookies(request.headers.get("cookie") || request.headers.get("Cookie"));
+  if (cookies.mq_session) return cookies.mq_session;
+
+  const h = request.headers.get("x-session-token") || request.headers.get("x-mq-session");
+  if (h) return String(h).trim();
+
+  return "";
+}
+
+async function authMiniappRequest(request, body, env) {
+  const tok = extractSessionTokenFromRequest(request);
+  if (tok) {
+    const vt = await verifySessionToken(tok, env);
+    if (vt.ok) {
+      const pl = vt.payload;
+      const fromLike = {
+        id: pl.uid,
+        username: pl.un || "",
+        first_name: pl.fn || "",
+        last_name: pl.ln || "",
+      };
+      return { ok: true, userId: pl.uid, fromLike, via: "session" };
+    }
+  }
+
+  const initData = (body && body.initData) ? body.initData : extractInitDataFromRequest(request);
+  const v = await verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+  if (!v.ok) return v;
+  return { ...v, via: "initData" };
+}
+
+function setSessionCookie(token, env) {
+  const maxAge = Number(env.SESSION_MAX_AGE || 7 * 24 * 3600);
+  return `mq_session=${token}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=None`;
+}
+
+function clearSessionCookie() {
+  return `mq_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None`;
+}
+
 function miniappGuestEnabled(env) {
   const v = String(env.MINIAPP_GUEST_READONLY || "1").trim().toLowerCase();
   return !(v === "0" || v === "false" || v === "no");
@@ -5146,10 +5335,6 @@ async function buildMiniappGuestPayload(env) {
 }
 
 
-async function verifyMiniappAuth(body, env) {
-  const initData = body?.initData;
-  return verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
-}
 
 /* ========================== TELEGRAM MINI APP initData verification ========================== */
 async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientRaw) {
