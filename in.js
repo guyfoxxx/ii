@@ -16,7 +16,7 @@ export default {
         url.pathname !== "/health" &&
         !url.pathname.startsWith("/api/") &&
         !url.pathname.startsWith("/telegram/") &&
-        !url.pathname.endsWith(".js")
+        !/\.[^/]+$/.test(url.pathname)
       ) {
         return htmlResponse(MINI_APP_HTML);
       }
@@ -965,7 +965,7 @@ const BTN = {
   NEWS_ANALYSIS: "🧠 تحلیل خبر",
 
   WALLET: "💳 ولت",
-  WALLET_BALANCE: "💰 موجودی",
+  WALLET_BALANCE: "📜 تاریخچه تراکنشات",
   WALLET_DEPOSIT: "➕ واریز",
   WALLET_WITHDRAW: "➖ برداشت",
 
@@ -1565,6 +1565,11 @@ async function getOfferBanner(env) {
   if (!env.BOT_KV) return (env.SPECIAL_OFFER_TEXT || "").toString().trim();
   const raw = await env.BOT_KV.get("settings:offer_banner");
   return (raw || env.SPECIAL_OFFER_TEXT || "").toString().trim();
+}
+
+async function setOfferBanner(env, text) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
 }
 
 async function getOfferBannerImage(env) {
@@ -3748,15 +3753,31 @@ async function handleUpdate(update, env) {
     if (text === "/wallet" || text === BTN.WALLET) {
       const wallet = await getWallet(env);
       const txt =
-        `💳 ولت و پرداخت\n\n` +
-        (wallet ? `آدرس ولت:\n${wallet}\n\n` : "") +
-        `برای مشاهده موجودی، واریز یا برداشت از دکمه‌ها استفاده کن.`;
+        `💳 ولت
+
+🏷 marketi1 PRO
+💵 با ارزش ۲۵ USDT
+
+` +
+        (wallet ? `آدرس ولت درگاه:
+${wallet}
+
+` : "") +
+        `بخش‌های ولت، واریز و تاریخچه تراکنشات از دکمه‌های زیر در دسترس است.`;
       return tgSendMessage(env, chatId, txt, walletMenuKeyboard());
     }
 
     if (text === BTN.WALLET_BALANCE) {
       const bal = Number(st.wallet?.balance || 0);
-      return tgSendMessage(env, chatId, `💰 موجودی فعلی: ${bal}`, walletMenuKeyboard());
+      const txs = Array.isArray(st.wallet?.transactions) ? st.wallet.transactions.slice(-5).reverse() : [];
+      const txText = txs.length
+        ? txs.map((t, i) => `${i + 1}) ${t?.txHash || "—"} | ${Number(t?.amount || 0)} USDT | ${t?.createdAt || "—"}`).join(String.fromCharCode(10))
+        : "—";
+      return tgSendMessage(env, chatId, `📜 تاریخچه تراکنشات
+
+💰 موجودی: ${bal} USDT
+
+${txText}`, walletMenuKeyboard());
     }
 
     if (text === BTN.WALLET_DEPOSIT) {
@@ -3775,7 +3796,8 @@ ${wallet}
 Memo/Tag: ${memo}
 
 ` +
-        `TxID پرداخت را همینجا بفرست (در صورت نیاز: <txid> <amount>).`;
+        `«واریزی فقط به آدرس ولت درگاه ممکن است
+در لیست زیر باید از واریز هش واریزی را ارسال کنید.»`;
       return tgSendMessage(env, chatId, txt, kb([[BTN.BACK, BTN.HOME]]));
     }
 
@@ -3794,20 +3816,21 @@ Memo/Tag: ${memo}
       const { link, share, points, invites } = inviteShareText(st, env);
       if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
       const txt =
-        `🤝 دعوت دوستان
+        `🤝 دعوت
 
 ` +
-        `🔗 لینک رفرال اختصاصی: <a href="${escapeHtml(link)}">باز کردن لینک دعوت</a>
+        `✅ دعوت موفق: ${invites}
+🎁 امتیاز شما: ${points}
 
 ` +
-        (share ? `برای اشتراک‌گذاری سریع: <a href="${escapeHtml(share)}">ارسال لینک</a>
+        `🔗 لینک رفرال قابل کپی: <a href="${escapeHtml(link)}">کپی/باز کردن لینک</a>
+` +
+        (share ? `🚀 اشتراک سریع: <a href="${escapeHtml(share)}">ارسال سریع لینک</a>
 
-` : "") +
-        `🎁 امتیاز فعلی: ${points}
-👥 دعوت موفق: ${invites}
-
-ℹ️ هر دعوت موفق ۳ امتیاز.
-هر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
+` : `
+`) +
+        `«با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتیاز بدست می آورید
+در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید»`;
       return tgSendMessageHtml(env, chatId, txt, mainMenuKeyboard(env));
     }
 
@@ -3823,7 +3846,7 @@ Memo/Tag: ${memo}
       return tgSendMessage(
         env,
         chatId,
-        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.\n\nپیام مستقیم: ${handle}${walletLine}`,
+        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.\nبا ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.\n\nپیام مستقیم: ${handle}${walletLine}`,
         kb([[BTN.SUPPORT_FAQ, BTN.SUPPORT_TICKET], [BTN.SUPPORT_CUSTOM_PROMPT], [BTN.HOME]])
       );
     }
@@ -4030,7 +4053,7 @@ ${finalUrl}`, kbInline);
       return tgSendMessage(
         env,
         chatId,
-        `✅ تعیین سطح انجام شد.\n\nسطح: ${st.profile.level}\nپیشنهاد بازار: ${marketFa}\n\nتنظیمات پیشنهادی:\n⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}\n\nیادداشت:\n${st.profile.levelNotes || "—"}\n\nاگر می‌خوای دوباره تعیین‌سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
+        `✅ تعیین سطح انجام شد.\n\nسطح: ${st.profile.level}\nپیشنهاد بازار: ${marketFa}\n\nتنظیمات پیشنهادی:\n⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}\n\nیادداشت:\n${st.profile.levelNotes || "—"}\n\n${buildOnboardingNudge(st)}\n\nاگر می‌خوای دوباره تعیین‌سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
         mainMenuKeyboard(env)
       );
     }
@@ -4478,6 +4501,14 @@ function inviteShareText(st, env) {
   const link = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "";
   const share = link ? `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent("با لینک من عضو شو و اشتراک هدیه بگیر ✅")}` : "";
   return { link, share, points: Number(st?.referral?.points || 0), invites: Number(st?.referral?.successfulInvites || 0) };
+}
+
+function buildOnboardingNudge(st) {
+  const symbol = String(st?.selectedSymbol || st?.profile?.preferredSymbol || "BTCUSDT").toUpperCase();
+  const tf = String(st?.timeframe || "H4").toUpperCase();
+  const risk = String(st?.risk || "متوسط");
+  return `🚀 شروع سریع پیشنهادی:
+یک تحلیل کوتاه برای ${symbol} روی ${tf} با سطح ریسک ${risk} بگیر تا خروجی متناسب با پروفایلت را ببینی.`;
 }
 
 /* ========================== FLOWS ========================== */
@@ -5031,10 +5062,25 @@ function escapeHtml(s) {
 
 /* ========================== MINI APP INLINE ASSETS ========================== */
 function htmlResponse(html, status = 200) {
-  return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8" } });
+  return new Response(html, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+    },
+  });
 }
 function jsResponse(js, status = 200) {
-  return new Response(js, { status, headers: { "content-type": "application/javascript; charset=utf-8" } });
+  return new Response(js, {
+    status,
+    headers: {
+      "content-type": "application/javascript; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+    },
+  });
 }
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json; charset=utf-8" } });
@@ -5608,7 +5654,7 @@ const MINI_APP_HTML = `<!doctype html>
           </div>
 
           <div class="field">
-            <div class="label">پرامپت سبک‌ها (JSON)</div>
+            <div class="label">پرامپت پایه + سبک‌ها (JSON)</div>
             <textarea id="stylePromptJson" class="control" placeholder='{"پرایس_اکشن":"...","ict":"...","atr":"..."}'></textarea>
             <div class="admin-row">
               <input id="stylePromptJsonFile" type="file" accept="application/json,.json" class="control" />
@@ -5833,13 +5879,52 @@ const MINI_APP_HTML = `<!doctype html>
         <div class="badge" id="toastB">—</div>
       </div>
 
+      <script src="https://telegram.org/js/telegram-web-app.js"></script>
       <script src="app.js"></script>
 </body>
 </html>`;
 
-const MINI_APP_JS = `const tg = window.Telegram?.WebApp;
-if (tg) tg.ready();
-if (tg?.expand) tg.expand();
+const MINI_APP_JS = `async function injectTelegramSdkOnce() {
+  if (window.Telegram?.WebApp) return;
+  if (window.__miniAppTelegramSdkPromise) return window.__miniAppTelegramSdkPromise;
+  window.__miniAppTelegramSdkPromise = new Promise((resolve) => {
+    const done = () => {
+      if (window.Telegram?.WebApp) return resolve();
+      let attempts = 0;
+      const tick = () => {
+        if (window.Telegram?.WebApp || attempts >= 20) return resolve();
+        attempts += 1;
+        setTimeout(tick, 100);
+      };
+      tick();
+    };
+
+    const existing = document.querySelector('script[src="https://telegram.org/js/telegram-web-app.js"]');
+    if (existing) {
+      done();
+      return;
+    }
+
+    const s = document.createElement("script");
+    s.src = "https://telegram.org/js/telegram-web-app.js";
+    s.async = true;
+    s.onload = done;
+    s.onerror = () => resolve();
+    document.head.appendChild(s);
+    setTimeout(resolve, 4000);
+  });
+  return window.__miniAppTelegramSdkPromise;
+}
+
+async function ensureTelegramReady() {
+  await injectTelegramSdkOnce();
+  const tg = window.Telegram?.WebApp;
+  if (tg) {
+    tg.ready();
+    tg.expand?.();
+  }
+  return { tg, isTelegramRuntime: !!tg };
+}
 
 const out = document.getElementById("out");
 const meta = document.getElementById("meta");
@@ -5894,6 +5979,7 @@ let NEWS_TIMER = null;
 const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
 
 function getFreshInitData() {
+  const tg = window.Telegram?.WebApp;
   const latestTg = (tg?.initData || "").trim();
   if (latestTg) {
     INIT_DATA = latestTg;
@@ -5903,7 +5989,39 @@ function getFreshInitData() {
 }
 
 function buildAuthBody(extra = {}) {
-  return { initData: getFreshInitData(), miniToken: MINI_TOKEN || localStorage.getItem(LOCAL_KEYS.miniToken) || "", ...extra };
+  const initData = getFreshInitData();
+  if (initData) return { initData, ...extra };
+  const miniToken = MINI_TOKEN || localStorage.getItem(LOCAL_KEYS.miniToken) || "";
+  if (miniToken) return { miniToken, ...extra };
+  if (extra?.allowGuest) return { ...extra, allowGuest: true };
+  return { ...extra };
+}
+
+function isTelegramLikelyContext() {
+  const ua = String(navigator.userAgent || "").toLowerCase();
+  const hasTgData = !!(window.Telegram || getParamEverywhere("tgWebAppData") || getParamEverywhere("tgWebAppVersion"));
+  return ua.includes("telegram") || hasTgData;
+}
+
+function showOpenInTelegramState(msg) {
+  out.textContent = msg;
+  const box = document.createElement("div");
+  box.style.marginTop = "10px";
+  const btn = document.createElement("button");
+  btn.className = "btn";
+  btn.type = "button";
+  btn.textContent = "کپی لینک برای باز کردن داخل Telegram";
+  btn.onclick = async () => {
+    const link = window.location.href;
+    try {
+      await navigator.clipboard.writeText(link);
+      showToast("لینک کپی شد", "آن را در Telegram باز کنید", "COPY", false);
+    } catch {
+      showToast("کپی نشد", "لینک را دستی کپی کنید", "LINK", false);
+    }
+  };
+  box.appendChild(btn);
+  out.appendChild(box);
 }
 
 function parseMiniTokenStartParam(raw) {
@@ -6626,10 +6744,14 @@ function analyzeCacheKey(symbol) {
   return String(symbol || "").toUpperCase();
 }
 
+// تست دستی: داخل تلگرام tg/initData آماده می‌شود و /api/user باید ok باشد.
+// خارج تلگرام پیام "داخل تلگرام باز کنید" نمایش داده می‌شود و حالت محدود/مهمان فعال می‌ماند.
 async function boot(){
   out.textContent = "⏳ در حال آماده‌سازی…";
   pillTxt.textContent = "Connecting…";
   showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
+
+  const { tg, isTelegramRuntime } = await ensureTelegramReady();
 
   const preCached = readCachedUserSnapshot();
   if (preCached) {
@@ -6640,7 +6762,8 @@ async function boot(){
     setupNewsPolling();
   }
 
-  const isTelegramRuntime = !!window.Telegram?.WebApp;
+  const devModeEnabled = String(window.MINIAPP_DEV_MODE || "").trim() === "1";
+  const maybeTelegram = isTelegramRuntime || isTelegramLikelyContext();
   const qsInitData = getParamEverywhere("initData") || "";
   const savedInitData = localStorage.getItem(LOCAL_KEYS.initData) || "";
   const qsMiniToken = getParamEverywhere("miniToken") || getParamEverywhere("token") || "";
@@ -6669,14 +6792,21 @@ async function boot(){
     localStorage.setItem(LOCAL_KEYS.initData, qsInitData);
   } else if (savedInitData) {
     INIT_DATA = savedInitData;
-  } else if (!isTelegramRuntime) {
+  } else if (!isTelegramRuntime && devModeEnabled) {
     const devInit = "dev:999001";
     INIT_DATA = devInit;
     localStorage.setItem(LOCAL_KEYS.initData, devInit);
     showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
   } else {
     INIT_DATA = "";
-    showToast("حالت مهمان", "اتصال احراز نشده؛ اجرای محدود با داده عمومی", "GUEST", false);
+    if (!isTelegramRuntime && maybeTelegram) {
+      showToast("اتصال تلگرام کامل نشد", "لطفاً مینی‌اپ را دوباره از داخل Telegram باز کنید.", "WAIT", false);
+    } else if (!isTelegramRuntime) {
+      showToast("داخل تلگرام باز کنید", "این صفحه باید داخل Telegram WebView باز شود.", "BLOCKED", false);
+      showOpenInTelegramState("این صفحه باید داخل تلگرام باز شود.");
+    } else {
+      showToast("حالت مهمان", "اتصال احراز نشده؛ اجرای محدود با داده عمومی", "GUEST", false);
+    }
   }
   let {status, json} = await api("/api/user", buildAuthBody({ allowGuest: true }));
 
@@ -6687,6 +6817,16 @@ async function boot(){
     status = retry.status;
     json = retry.json;
     if (!json?.ok) INIT_DATA = initBackup;
+  }
+
+  if (!json?.ok && status === 401 && isTelegramRuntime && tg?.initData && !INIT_DATA) {
+    INIT_DATA = tg.initData.trim();
+    if (INIT_DATA) {
+      try { localStorage.setItem(LOCAL_KEYS.initData, INIT_DATA); } catch {}
+      const retryTg = await api("/api/user", buildAuthBody({ allowGuest: true }));
+      status = retryTg.status;
+      json = retryTg.json;
+    }
   }
 
   if (!json?.ok) {
