@@ -3772,7 +3772,7 @@ async function handleUpdate(update, env) {
 ➕ واریز
 
 ` +
-        `marketi1 PRO
+        `marketiQ PRO
 با ارزش ۲۵ USDT
 
 ` +
