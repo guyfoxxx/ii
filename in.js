@@ -5,6 +5,7 @@ export default {
       env.__BASE_URL = url.origin;
 
       if (url.pathname === "/health") return new Response("ok", { status: 200 });
+      if (url.pathname === "/favicon.ico") return new Response("", { status: 204 });
 
       // ===== MINI APP (inline) =====
       // Serve app.js from root and nested miniapp paths (e.g. /miniapp/app.js)

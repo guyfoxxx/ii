@@ -4,6 +4,7 @@ export default {
       const url = new URL(request.url);
 
       if (url.pathname === "/health") return new Response("ok", { status: 200 });
+      if (url.pathname === "/favicon.ico") return new Response("", { status: 204 });
 
       // ===== MINI APP (inline) =====
       // Serve app.js from root and nested miniapp paths (e.g. /miniapp/app.js)
