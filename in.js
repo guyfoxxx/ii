@@ -641,6 +641,17 @@ TxID: ${txid}
         }
 
         if (!Array.isArray(candles) || candles.length === 0) {
+          if (Array.isArray(levels) && levels.length) {
+            const svg = buildLevelsOnlySvg(symbol, tf, levels);
+            return new Response(svg, {
+              status: 200,
+              headers: {
+                "Content-Type": "image/svg+xml; charset=utf-8",
+                "Cache-Control": "public, max-age=30",
+                "X-Chart-Fallback": "levels_only_svg",
+              },
+            });
+          }
           return jsonResponse({ ok: false, error: "no_market_data" }, 404);
         }
 
@@ -820,9 +831,9 @@ TxID: ${txid}
           try {
             if (String(env.QUICKCHART || "") !== "0") {
               const tf = st.timeframe || "H4";
-              levels = extractLevels(result);
-              const origin = new URL(request.url).origin;
               const candles = await getMarketCandlesWithFallback(env, symbol, tf).catch(() => []);
+              levels = refineLevelsByCandles(extractLevels(result), candles);
+              const origin = new URL(request.url).origin;
               if (Array.isArray(candles) && candles.length) {
                 chartUrl = `${origin}/api/chart?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&levels=${encodeURIComponent(levels.join(","))}`;
                 quickChartSpec = buildQuickChartSpec(candles, symbol, tf, levels);
@@ -1927,8 +1938,10 @@ function contactKeyboard() {
 }
 
 function getMiniappUrl(env) {
-  const u = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || "").toString().trim();
-  return u;
+  // Canonical Mini App URL (also configured in BotFather)
+  const fallback = "https://sniperim.mad-pyc.workers.dev/";
+  const u = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || fallback).toString().trim();
+  return u.endsWith("/") ? u : (u + "/");
 }
 async function miniappInlineKeyboard(env, st, from) {
   const url = getMiniappUrl(env);
@@ -3867,14 +3880,20 @@ ${summary || "تحلیل خبری در دسترس نیست."}`, mainMenuKeyboard
       if (!url) {
         return tgSendMessage(env, chatId, `⚠️ لینک مینی‌اپ تنظیم نشده.
 
-در Wrangler / داشبورد یک متغیر ENV به نام MINIAPP_URL یا PUBLIC_BASE_URL بگذار (مثلاً https://<your-worker-domain>/ ) و دوباره Deploy کن.`, mainMenuKeyboard(env));
+پیش‌فرض سیستم روی https://sniperim.mad-pyc.workers.dev/ است؛ اگر دامنه دیگری می‌خواهی، در Wrangler / داشبورد مقدار MINIAPP_URL یا PUBLIC_BASE_URL را ست کن و Deploy بزن.`, mainMenuKeyboard(env));
       }
       const token = await issueMiniappToken(env, st.userId, from);
       const finalUrl = token ? appendQuery(url, { miniToken: token }) : url;
-      const kbInline = { inline_keyboard: [[{ text: BTN.MINIAPP, web_app: { url: finalUrl } }]] };
+      const kbInline = {
+        inline_keyboard: [
+          [{ text: "🧩 ورود داخل تلگرام", web_app: { url: finalUrl } }],
+          [{ text: "🔗 اتصال جایگزین", url: finalUrl }],
+        ],
+      };
       return tgSendMessage(env, chatId, `🧩 مینی‌اپ فعال شد.
 
-از دکمه زیر وارد شوید. اگر دکمه باز نشد، این لینک را مستقیم باز کنید:
+روش جدید اتصال: ابتدا دکمه «ورود داخل تلگرام» را بزن.
+اگر باز نشد، دکمه «اتصال جایگزین» را بزن یا لینک زیر را باز کن:
 ${finalUrl}`, kbInline);
     }
 
@@ -4872,11 +4891,49 @@ function buildLevelsOnlySvg(symbol, timeframe, levels = []) {
 }
 
 function extractLevels(text) {
-  const nums = (String(text || "").match(/\b\d{1,6}(?:\.\d{1,6})?\b/g) || [])
+  const src = String(text || "");
+  const allNums = (src.match(/\b\d{1,7}(?:\.\d{1,6})?\b/g) || [])
     .map(Number)
-    .filter(n => Number.isFinite(n));
-  const uniq = [...new Set(nums)].sort((a,b)=>a-b);
-  return uniq.slice(0, 6);
+    .filter((n) => Number.isFinite(n) && n > 0);
+
+  const keyLines = src
+    .split(/\n+/)
+    .filter((ln) => /(?:support|resistance|zone|entry|sl|tp|حمایت|مقاومت|زون|ورود|حد\s*ضرر|حد\s*سود)/i.test(ln));
+  const hinted = (keyLines.join("\n").match(/\b\d{1,7}(?:\.\d{1,6})?\b/g) || [])
+    .map(Number)
+    .filter((n) => Number.isFinite(n) && n > 0);
+
+  const base = hinted.length ? hinted : allNums;
+  const cleanNums = base.filter((n) => n > 0.0000001 && n < 10000000);
+  cleanNums.sort((a, b) => a - b);
+
+  const merged = [];
+  for (const v of cleanNums) {
+    if (!merged.length) { merged.push(v); continue; }
+    const prev = merged[merged.length - 1];
+    const tol = Math.max(0.0001, prev * 0.0025);
+    if (Math.abs(v - prev) <= tol) {
+      merged[merged.length - 1] = Number(((prev + v) / 2).toFixed(6));
+    } else {
+      merged.push(v);
+    }
+  }
+  return merged.slice(0, 10);
+}
+
+function refineLevelsByCandles(levels, candles) {
+  const lv = (Array.isArray(levels) ? levels : []).map(Number).filter((n) => Number.isFinite(n) && n > 0);
+  if (!lv.length) return [];
+  if (!Array.isArray(candles) || !candles.length) return lv.slice(0, 8);
+  const highs = candles.map((x) => Number(x?.h)).filter((n) => Number.isFinite(n));
+  const lows = candles.map((x) => Number(x?.l)).filter((n) => Number.isFinite(n));
+  if (!highs.length || !lows.length) return lv.slice(0, 8);
+  const hi = Math.max(...highs), lo = Math.min(...lows);
+  const minV = lo * 0.7;
+  const maxV = hi * 1.3;
+  const filtered = lv.filter((n) => n >= minV && n <= maxV);
+  if (!filtered.length) return extractLevelsFromCandles(candles).slice(0, 8);
+  return [...new Set(filtered.map((n) => Number(n.toFixed(6))))].sort((a,b)=>a-b).slice(0, 8);
 }
 
 function extractLevelsFromCandles(candles) {
@@ -5553,6 +5610,9 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="field">
             <div class="label">پرامپت سبک‌ها (JSON)</div>
             <textarea id="stylePromptJson" class="control" placeholder='{"پرایس_اکشن":"...","ict":"...","atr":"..."}'></textarea>
+            <div class="admin-row">
+              <input id="stylePromptJsonFile" type="file" accept="application/json,.json" class="control" />
+            </div>
             <div class="actions">
               <button id="saveStylePrompts" class="btn">ذخیره JSON سبک‌ها</button>
             </div>
@@ -5596,6 +5656,9 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="field">
             <div class="label">پرامپت‌های اختصاصی (JSON)</div>
             <textarea id="customPromptsJson" class="control" placeholder='[{"id":"p1","title":"VIP","text":"..."}]'></textarea>
+            <div class="admin-row">
+              <input id="customPromptsJsonFile" type="file" accept="application/json,.json" class="control" />
+            </div>
             <div class="actions">
               <button id="saveCustomPrompts" class="btn">ذخیره پرامپت‌های اختصاصی</button>
             </div>
@@ -5999,7 +6062,11 @@ async function api(path, body){
       await new Promise((res) => setTimeout(res, 350 * (i + 1)));
     }
   }
-  return { status: 599, json: { ok: false, error: String(lastErr?.message || lastErr || "network_error") } };
+  const errText = String(lastErr?.message || lastErr || "network_error");
+  const normalized = errText.toLowerCase().includes("timeout") || errText.toLowerCase().includes("abort")
+    ? "request_timeout"
+    : errText;
+  return { status: 599, json: { ok: false, error: normalized } };
 }
 
 async function adminApi(path, body){
@@ -6680,7 +6747,7 @@ async function boot(){
   IS_OWNER = json.role === "owner";
   IS_GUEST = !!json.guest;
 
-  const adminTabBtn = document.querySelector(".tab-btn[data-tab="admin"]");
+  const adminTabBtn = document.querySelector('.tab-btn[data-tab="admin"]');
   if (adminTabBtn) adminTabBtn.style.display = IS_STAFF ? "inline-flex" : "none";
 
   if (IS_STAFF && adminCard) {
@@ -6826,21 +6893,25 @@ el("analyze").addEventListener("click", async () => {
   if (chartCard && chartImg) {
       const u = json.chartUrl || "";
       const fallbackSvg = json.zonesSvg || "";
-      if (fallbackSvg) {
-        renderChartFallbackSvg(fallbackSvg);
-      } else if (u) {
+      const activeSymbol = val("symbol") || "-";
+      const activeTf = val("timeframe") || "H4";
+      const cm = el("chartMeta");
+      if (u) {
         chartImg.onerror = () => {
           chartImg.onerror = null;
           chartImg.removeAttribute("src");
           chartCard.style.display = "none";
+          if (fallbackSvg) renderChartFallbackSvg(fallbackSvg);
         };
         chartImg.src = u;
         chartCard.style.display = "block";
-        const cm = el("chartMeta");
-        if (cm) cm.textContent = "QuickChart";
+        if (cm) cm.textContent = "Candlestick | " + activeSymbol + " | " + activeTf;
+      } else if (fallbackSvg) {
+        renderChartFallbackSvg(fallbackSvg);
       } else {
         chartImg.removeAttribute("src");
         chartCard.style.display = "none";
+        if (cm) cm.textContent = "QuickChart";
       }
     }
   updateMeta(json.state, json.quota);
@@ -6889,6 +6960,19 @@ el("saveStylePrompts")?.addEventListener("click", async () => {
   const stylePrompts = safeJsonParse(raw, {});
   const { json } = await adminApi("/api/admin/style-prompts", { stylePrompts });
   if (json?.ok) showToast("ذخیره شد ✅", "JSON سبک‌ها بروزرسانی شد", "ADM", false);
+});
+
+el("stylePromptJsonFile")?.addEventListener("change", async (ev) => {
+  const f = ev?.target?.files?.[0];
+  if (!f) return;
+  const txt = await f.text().catch(() => "");
+  const parsed = safeJsonParse(txt, null);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    showToast("خطا", "فایل JSON سبک‌ها معتبر نیست", "ADM", false);
+    return;
+  }
+  if (el("stylePromptJson")) el("stylePromptJson").value = JSON.stringify(parsed, null, 2);
+  showToast("بارگذاری شد ✅", "JSON سبک‌ها از فایل لود شد", "ADM", false);
 });
 
 el("addStyle")?.addEventListener("click", async () => {
@@ -7130,6 +7214,19 @@ el("saveCustomPrompts")?.addEventListener("click", async () => {
     showToast("ذخیره شد ✅", "پرامپت‌های اختصاصی بروزرسانی شد", "ADM", false);
     fillCustomPrompts(json.customPrompts || []);
   }
+});
+
+el("customPromptsJsonFile")?.addEventListener("change", async (ev) => {
+  const f = ev?.target?.files?.[0];
+  if (!f) return;
+  const txt = await f.text().catch(() => "");
+  const parsed = safeJsonParse(txt, null);
+  if (!Array.isArray(parsed)) {
+    showToast("خطا", "فایل JSON پرامپت اختصاصی باید آرایه باشد", "ADM", false);
+    return;
+  }
+  if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(parsed, null, 2);
+  showToast("بارگذاری شد ✅", "JSON پرامپت اختصاصی از فایل لود شد", "ADM", false);
 });
 
 el("sendCustomPrompt")?.addEventListener("click", async () => {
