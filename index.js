@@ -257,7 +257,7 @@ ${reply}`;
 
         if (url.pathname === "/api/admin/offer") {
           if (typeof body.offerBanner === "string" && env.BOT_KV) {
-            await setOfferBannerSafe(env, body.offerBanner);
+            await setOfferBanner(env, body.offerBanner);
           }
           if (typeof body.offerBannerImage === "string") {
             try {
@@ -1081,25 +1081,19 @@ function isStaff(from, env) {
 }
 
 function isOwner(from, env) {
-  const uid = String(from?.userId || from?.id || "").trim();
-  const ownerIds = String(env.OWNER_USER_IDS || env.OWNER_IDS || "").split(",").map((x) => String(x || "").trim()).filter(Boolean);
-  if (uid && ownerIds.includes(uid)) return true;
-
   const u = normHandle(from?.username);
+  if (!u) return false;
   const raw = (env.OWNER_HANDLES || "").toString().trim();
-  if (!u || !raw) return false;
+  if (!raw) return false;
   const set = new Set(raw.split(",").map(normHandle).filter(Boolean));
   return set.has(u);
 }
 
 function isAdmin(from, env) {
-  const uid = String(from?.userId || from?.id || "").trim();
-  const adminIds = String(env.ADMIN_USER_IDS || env.ADMIN_IDS || "").split(",").map((x) => String(x || "").trim()).filter(Boolean);
-  if (uid && adminIds.includes(uid)) return true;
-
   const u = normHandle(from?.username);
+  if (!u) return false;
   const raw = (env.ADMIN_HANDLES || "").toString().trim();
-  if (!u || !raw) return false;
+  if (!raw) return false;
   const set = new Set(raw.split(",").map(normHandle).filter(Boolean));
   return set.has(u);
 }
@@ -1579,9 +1573,6 @@ async function setOfferBannerImage(env, dataUrl) {
   await env.BOT_KV.put("settings:offer_banner_image", clean);
 }
 
-
-// Compatibility alias for editor diagnostics in mirrored index.js files.
-const setOfferBannerSafe = async (env, text) => setOfferBanner(env, text);
 async function getCommissionSettings(env) {
   if (!env.BOT_KV) return { globalPercent: 0, overrides: {} };
   const g = await env.BOT_KV.get("settings:commission:globalPercent");
@@ -3093,7 +3084,6 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
       lastErr = e;
       markProviderFailure(p, env, "market");
       console.error("market provider failed:", p, e?.message || e);
-      markProviderFailure(p, env);
     }
   }
 
@@ -3167,7 +3157,7 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
       markProviderFailure(p, env, "market");
     } catch (e) {
       lastErr = e;
-      markProviderFailure(p, env);
+      markProviderFailure(p, env, "market");
     }
   }
   throw lastErr || new Error("market_data_alt_failed");
@@ -3778,7 +3768,7 @@ Memo/Tag: ${memo}
     }
 
     if (text === "/invite" || text === BTN.INVITE) {
-      const { link, share, points, invites } = inviteShareText(st, env);
+      const { link, share } = inviteShareText(st, env);
       if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
       const txt =
         `🤝 دعوت دوستان
@@ -3788,13 +3778,7 @@ Memo/Tag: ${memo}
 
 ` +
         (share ? `برای اشتراک‌گذاری سریع: <a href="${escapeHtml(share)}">ارسال لینک</a>
-
-` : "") +
-        `🎁 امتیاز فعلی: ${points}
-👥 دعوت موفق: ${invites}
-
-ℹ️ هر دعوت موفق ۳ امتیاز.
-هر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
+` : "");
       return tgSendMessageHtml(env, chatId, txt, mainMenuKeyboard(env));
     }
 
@@ -4438,19 +4422,15 @@ async function sendSettingsSummary(env, chatId, st, from) {
 function profileText(st, from, env) {
   const quota = isStaff(from, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
   const adminTag = isStaff(from, env) ? "✅ ادمین/اونر" : "👤 کاربر";
-  const level = st.profile?.level ? `
-سطح: ${st.profile.level}` : "";
+  const level = st.profile?.level ? `\nسطح: ${st.profile.level}` : "";
+  const pts = st.referral?.points || 0;
+  const inv = st.referral?.successfulInvites || 0;
 
-  return `👤 پروفایل
+  const botUser = env.BOT_USERNAME ? String(env.BOT_USERNAME).replace(/^@/, "") : "";
+  const code = (st.referral?.codes || [])[0] || "";
+  const deep = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "-";
 
-وضعیت: ${adminTag}
-🆔 ID: ${st.userId}
-نام: ${st.profile?.name || "-"}
-یوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}
-شماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}
-
-📅 امروز(Tehran): ${kyivDateString()}
-سهمیه امروز: ${quota}`;
+  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Tehran): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
 }
 
 function inviteShareText(st, env) {
@@ -4458,7 +4438,7 @@ function inviteShareText(st, env) {
   const code = (st.referral?.codes || [])[0] || "";
   const link = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "";
   const share = link ? `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent("با لینک من عضو شو و اشتراک هدیه بگیر ✅")}` : "";
-  return { link, share, points: Number(st?.referral?.points || 0), invites: Number(st?.referral?.successfulInvites || 0) };
+  return { link, share };
 }
 
 /* ========================== FLOWS ========================== */
@@ -5054,7 +5034,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const initRaw = String(initData || "").trim();
   if (lenient && initRaw.startsWith("dev:")) {
     const devId = Number(initRaw.split(":")[1] || "0") || 999001;
-    return { ok: true, userId: devId, fromLike: { username: "dev_user", userId: String(devId), id: devId } };
+    return { ok: true, userId: devId, fromLike: { username: "dev_user" } };
   }
   if (!botToken && !lenient) return { ok: false, reason: "bot_token_missing" };
 
@@ -5083,7 +5063,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const userId = user?.id || Number(params.get("user_id") || "0");
   if (!userId) return { ok: false, reason: "user_missing" };
 
-  const fromLike = { username: user?.username || "", userId: String(userId), id: Number(userId) || undefined };
+  const fromLike = { username: user?.username || "" };
   return { ok: true, userId, fromLike };
 }
 
@@ -6588,10 +6568,8 @@ async function boot(){
 
   // Telegram WebApp may populate initData with a slight delay.
   if (isTelegramRuntime && !initData) {
-    for (let i = 0; i < 8 && !initData; i++) {
-      await new Promise((r) => setTimeout(r, 300));
-      initData = (tg?.initData || "").trim();
-    }
+    await new Promise((r) => setTimeout(r, 350));
+    initData = (tg?.initData || "").trim();
   }
 
   if (initData) {
