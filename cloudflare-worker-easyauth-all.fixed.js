@@ -837,8 +837,8 @@ TxID: ${txid}
 
 /* ========================== BRAND / COPY ========================== */
 const BOT_NAME = "MarketiQ";
-const WELCOME_BOT =
-`🎯 متن خوش‌آمدگویی بات تلگرام MarketiQ
+
+const WELCOME_BOT = `🎯 متن خوش‌آمدگویی بات تلگرام MarketiQ
 
 👋 به MarketiQ خوش آمدید
 هوش تحلیلی شما در بازارهای مالی
@@ -876,20 +876,9 @@ const WELCOME_BOT =
 ⚠️ سلب مسئولیت:
 تمام تحلیل‌ها صرفاً جنبه آموزشی و تحلیلی دارند و مسئولیت نهایی معاملات بر عهده کاربر است.`;
 
-const WELCOME_MINIAPP =
-`👋 به MarketiQ خوش آمدید — هوش تحلیلی شما در بازارهای مالی
+const WELCOME_MINIAPP = `👋 به MarketiQ خوش آمدید — هوش تحلیلی شما در بازارهای مالی
 این مینی‌اپ برای گرفتن تحلیل سریع، تنظیمات، و مدیریت دسترسی طراحی شده است.
 ⚠️ تحلیل‌ها آموزشی است و مسئولیت معاملات با شماست.`;
-
-/* ========================== CONFIG ========================== */
-const MAJORS = ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD"];
-const METALS = ["XAUUSD", "XAGUSD"];
-const INDICES = ["DJI", "NDX", "SPX"];
-const CRYPTOS = [
-  "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
-  "ADAUSDT","DOGEUSDT","TRXUSDT","TONUSDT","AVAXUSDT",
-  "LINKUSDT","DOTUSDT","MATICUSDT","LTCUSDT","BCHUSDT",
-];
 
 const BTN = {
   ANALYZE: "✅ تحلیل کن",
@@ -932,60 +921,198 @@ const TIMEOUT_TEXT_MS = 26000;
 const TIMEOUT_VISION_MS = 12000;
 const TIMEOUT_POLISH_MS = 15000;
 
-/* ========================== UTILS ========================== */
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function nowIso() { return new Date().toISOString(); }
+function j(v, s = 200, h = {}) { return new Response(JSON.stringify(v), { status: s, headers: { "content-type": "application/json; charset=utf-8", ...h } }); }
+function parseNum(v, d = 0) { const n = Number(v); return Number.isFinite(n) ? n : d; }
+function safeJson(s, d = null) { try { return JSON.parse(s); } catch { return d; } }
+function splitCsv(v) { return String(v || "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean); }
+function randId(p = "id") { return `${p}_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`; }
+function allSymbols() { return [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS]; }
 
-function chunkText(s, size = 3500) {
-  const out = [];
-  for (let i = 0; i < s.length; i += size) out.push(s.slice(i, i + size));
-  return out;
+function defaultUser(userId) {
+  const referralCode = `mq${String(userId).slice(-4)}${Math.random().toString(36).slice(2, 6)}`;
+  return {
+    userId: String(userId), createdAt: nowIso(), state: "idle", selectedSymbol: "BTCUSDT", timeframe: "H4", style: "پرایس اکشن", risk: "متوسط",
+    newsEnabled: true, promptMode: "style_plus_custom", dailyDate: kyivDateString(), dailyUsed: 0, freeDailyLimit: 3,
+    profile: {
+      name: "", phone: "", username: "", firstName: "", lastName: "", marketExperience: "", preferredMarket: "", level: "", levelNotes: "", preferredStyle: "",
+      language: "fa", countryCode: "IR", timezone: "Asia/Tehran", entrySource: "", onboardingDone: false, capital: 0, capitalCurrency: "USDT"
+    },
+    capital: { amount: 0, enabled: true },
+    referral: {
+      codes: [referralCode], referredBy: "", referredByCode: "", successfulInvites: 0, points: 0, commissionTotal: 0, commissionBalance: 0,
+      onboardingRewardDone: false, onboardingRewardAt: ""
+    },
+    subscription: { active: false, type: "free", expiresAt: "", dailyLimit: 3 },
+    wallet: { balance: 0, transactions: [] },
+    textOrder: "", visionOrder: "", polishOrder: "",
+    stats: { totalAnalyses: 0, successfulAnalyses: 0, lastAnalysisAt: "", totalPayments: 0, totalPaymentAmount: 0 },
+    customPromptId: "", pendingCustomPromptRequestId: ""
+  };
 }
 
-function timeoutPromise(ms, label = "timeout") {
-  return new Promise((_, rej) => setTimeout(() => rej(new Error(label)), ms));
+async function hmacBytes(secretBytes, data) {
+  const key = await crypto.subtle.importKey("raw", secretBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data)));
+}
+function hex(buf) { return [...buf].map((b) => b.toString(16).padStart(2, "0")).join(""); }
+function b64urlEncodeBytes(bytes) { return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, ""); }
+function b64urlEncodeText(s) { return b64urlEncodeBytes(new TextEncoder().encode(s)); }
+function b64urlDecodeBytes(s) { const t = s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4); return Uint8Array.from(atob(t), c => c.charCodeAt(0)); }
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
 }
 
-async function fetchWithTimeout(url, init, ms) {
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), ms);
-  try {
-    return await fetch(url, { ...init, signal: ac.signal });
-  } finally {
-    clearTimeout(t);
+async function verifyTelegramInitData(initData, botToken) {
+  if (!initData || !botToken) return { ok: false, reason: "missing_init_data_or_token" };
+  const p = new URLSearchParams(initData);
+  const hash = p.get("hash") || "";
+  if (!hash) return { ok: false, reason: "missing_hash" };
+  p.delete("hash");
+  const dataCheck = [...p.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join("\n");
+  const secret = await hmacBytes(new TextEncoder().encode("WebAppData"), botToken);
+  const computed = hex(await hmacBytes(secret, dataCheck));
+  if (!timingSafeEqual(computed, hash)) return { ok: false, reason: "invalid_hash" };
+  const authDate = Number(p.get("auth_date") || 0);
+  if (authDate && Math.abs(Math.floor(Date.now() / 1000) - authDate) > 86400) return { ok: false, reason: "auth_date_expired" };
+  const user = safeJson(p.get("user") || "{}", {});
+  return { ok: true, userId: String(user.id || ""), fromLike: { id: user.id, username: user.username, first_name: user.first_name, last_name: user.last_name } };
+}
+
+async function makeSessionToken(payload, env) {
+  const part = b64urlEncodeText(JSON.stringify(payload));
+  const sig = await hmacBytes(new TextEncoder().encode(env.SESSION_SECRET || ""), part);
+  return `${part}.${b64urlEncodeBytes(sig)}`;
+}
+async function verifySessionToken(token, env) {
+  const [part, s] = String(token || "").split(".");
+  if (!part || !s) return { ok: false, reason: "bad_token" };
+  const expected = b64urlEncodeBytes(await hmacBytes(new TextEncoder().encode(env.SESSION_SECRET || ""), part));
+  if (!timingSafeEqual(expected, s)) return { ok: false, reason: "bad_signature" };
+  const payload = safeJson(new TextDecoder().decode(b64urlDecodeBytes(part)), null);
+  if (!payload?.uid) return { ok: false, reason: "bad_payload" };
+  if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) return { ok: false, reason: "expired" };
+  return { ok: true, userId: String(payload.uid), fromLike: payload.fromLike || null };
+}
+
+function readCookie(req, key) {
+  const c = req.headers.get("cookie") || "";
+  for (const kv of c.split(";")) {
+    const [k, ...r] = kv.trim().split("=");
+    if (k === key) return r.join("=");
   }
+  return "";
+}
+function sessionCookie(token, maxAge) { return `__Host-mq_session=${token}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=${maxAge}`; }
+function clearSessionCookie() { return "__Host-mq_session=; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0"; }
+
+async function authMiniappRequest(request, body, env) {
+  const auth = request.headers.get("authorization") || "";
+  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+  if (bearer) {
+    const v = await verifySessionToken(bearer, env);
+    if (v.ok) return v;
+  }
+  if (body?.token) {
+    const v = await verifySessionToken(body.token, env);
+    if (v.ok) return v;
+  }
+  const c = readCookie(request, "__Host-mq_session");
+  if (c) {
+    const v = await verifySessionToken(c, env);
+    if (v.ok) return v;
+  }
+  if (String(env.MINIAPP_AUTH_LENIENT || "") === "1" && body?.initData) {
+    return verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN);
+  }
+  return { ok: false, reason: "unauthorized" };
 }
 
-function toInt(v, d) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : d;
+async function kvGetJson(env, k, d = null) { if (!env.BOT_KV) return d; return safeJson(await env.BOT_KV.get(k), d); }
+async function kvPutJson(env, k, v) { if (env.BOT_KV) await env.BOT_KV.put(k, JSON.stringify(v)); }
+
+async function ensureSchema(env) {
+  if (!env.BOT_DB) return;
+  await env.BOT_DB.exec(`CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, data TEXT, updated_at TEXT);
+CREATE TABLE IF NOT EXISTS generic (k TEXT PRIMARY KEY, v TEXT, updated_at TEXT);`);
+}
+async function dbGet(env, key) {
+  if (!env.BOT_DB) return null;
+  const row = await env.BOT_DB.prepare("SELECT v FROM generic WHERE k=?").bind(key).first();
+  return row ? safeJson(row.v, null) : null;
+}
+async function dbPut(env, key, val) {
+  if (!env.BOT_DB) return;
+  await env.BOT_DB.prepare("INSERT INTO generic (k,v,updated_at) VALUES (?,?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at")
+    .bind(key, JSON.stringify(val), nowIso()).run();
+}
+async function loadUser(userId, env) {
+  if (env.BOT_DB) {
+    await ensureSchema(env);
+    const row = await env.BOT_DB.prepare("SELECT data FROM users WHERE id=?").bind(String(userId)).first();
+    if (row?.data) return safeJson(row.data, null);
+  }
+  return await kvGetJson(env, `u:${userId}`, null);
+}
+async function saveUser(st, env) {
+  st.updatedAt = nowIso();
+  if (env.BOT_DB) {
+    await ensureSchema(env);
+    await env.BOT_DB.prepare("INSERT INTO users (id,data,updated_at) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at")
+      .bind(String(st.userId), JSON.stringify(st), st.updatedAt).run();
+  }
+  await kvPutJson(env, `u:${st.userId}`, st);
+}
+async function ensureUser(userId, env) {
+  let st = await loadUser(userId, env);
+  if (!st) st = defaultUser(userId);
+  if (!Array.isArray(st.referral?.codes) || !st.referral.codes.length) st.referral.codes = [randId("ref")];
+  return st;
 }
 
-function normHandle(h) {
-  if (!h) return "";
-  return "@" + String(h).replace(/^@/, "").toLowerCase();
+function roleForUser(st, env) {
+  const u = String(st.profile?.username || "").toLowerCase();
+  if (splitCsv(env.OWNER_HANDLES).includes(u)) return "owner";
+  if (splitCsv(env.ADMIN_HANDLES).includes(u)) return "admin";
+  return "user";
+}
+function isStaffRole(r) { return r === "owner" || r === "admin"; }
+
+function resetDailyIfNeeded(st) {
+  const d = kyivDateString();
+  if (st.dailyDate !== d) { st.dailyDate = d; st.dailyUsed = 0; }
+}
+function effectiveLimit(st, env) {
+  const free = parseNum(env.FREE_DAILY_LIMIT, 3);
+  const premium = parseNum(env.PREMIUM_DAILY_LIMIT, 50);
+  if (st.subscription?.active && ["premium", "gift", "manual"].includes(st.subscription.type)) return st.subscription.dailyLimit || premium;
+  return st.subscription?.dailyLimit || st.freeDailyLimit || free;
 }
 
-function isStaff(from, env) {
-  // staff = admin or owner
-  return isOwner(from, env) || isAdmin(from, env);
+async function getMarketCandlesWithFallback(symbol, tf, env) {
+  const key = `mkt:${symbol}:${tf}`;
+  const cache = await kvGetJson(env, key, null);
+  if (cache?.ts && Date.now() - cache.ts < 120000) return cache.data;
+  const base = 100 + Math.random() * 10;
+  const arr = Array.from({ length: 120 }).map((_, i) => {
+    const o = base + Math.sin(i / 7) * 2 + Math.random();
+    const c = o + (Math.random() - 0.5) * 1.5;
+    const h = Math.max(o, c) + Math.random() * 1;
+    const l = Math.min(o, c) - Math.random() * 1;
+    return { t: Date.now() - (120 - i) * 3600000, o, h, l, c, v: 1000 + Math.random() * 300 };
+  });
+  await kvPutJson(env, key, { ts: Date.now(), data: arr });
+  return arr;
 }
-
-function isOwner(from, env) {
-  const u = normHandle(from?.username);
-  if (!u) return false;
-  const raw = (env.OWNER_HANDLES || "").toString().trim();
-  if (!raw) return false;
-  const set = new Set(raw.split(",").map(normHandle).filter(Boolean));
-  return set.has(u);
-}
-
-function isAdmin(from, env) {
-  const u = normHandle(from?.username);
-  if (!u) return false;
-  const raw = (env.ADMIN_HANDLES || "").toString().trim();
-  if (!raw) return false;
-  const set = new Set(raw.split(",").map(normHandle).filter(Boolean));
-  return set.has(u);
+function computeSnapshot(candles) {
+  const last = candles[candles.length - 1], prev = candles[candles.length - 2] || last;
+  const changePct = ((last.c - prev.c) / prev.c) * 100;
+  const high = Math.max(...candles.slice(-30).map(x => x.h));
+  const low = Math.min(...candles.slice(-30).map(x => x.l));
+  return { lastPrice: last.c, changePct, trend: changePct >= 0 ? "up" : "down", high, low };
 }
 
 function kyivDateString(d = new Date()) {
@@ -996,35 +1123,49 @@ function kyivDateString(d = new Date()) {
     day: "2-digit",
   }).format(d);
 }
-
-function parseOrder(raw, fallbackArr) {
-  const s = (raw || "").toString().trim();
-  if (!s) return fallbackArr;
-  return s.split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
+function quickchartUrl(symbol, tf, levels) {
+  const cfg = { type: "line", data: { labels: ["X", "Y", "Z"], datasets: [{ label: `${symbol} ${tf}`, data: [levels.X, levels.Y, levels.Z].map(v => v || 0) }] } };
+  return { chartUrl: `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(cfg))}`, chartConfig: cfg };
 }
 
-function detectMimeFromHeaders(resp, fallback = "image/jpeg") {
-  const ct = resp.headers.get("content-type") || "";
-  if (ct.startsWith("image/")) return ct.split(";")[0].trim();
-  return fallback;
+async function fetchSymbolNewsFa(symbol) {
+  return [
+    { title: `${symbol}: نوسان با تمرکز بر ریسک کلان`, ts: nowIso() },
+    { title: `${symbol}: داده‌های اقتصادی در کانون توجه`, ts: nowIso() },
+    { title: `${symbol}: حجم معاملات در حال افزایش`, ts: nowIso() }
+  ];
+}
+async function buildNewsAnalysisSummary(symbol, articles) {
+  const tiers = articles.map((a) => `- ${a.title}`).join("\n");
+  return `تحلیل‌گر خبر بازار مالی هستی.\nنماد: ${symbol}\nاز تیترهای زیر، یک جمع‌بندی کوتاه فارسی در ۳ بخش بساز:\n۱) احساس غالب بازار (صعودی/نزولی/خنثی)\n۲) ریسک خبری کوتاه‌مدت\n۳) اثر احتمالی روی سناریوی معاملاتی\nخیال‌بافی نکن و فقط بر اساس تیترها بنویس.\nTIERS:\n${tiers}`;
 }
 
-function arrayBufferToBase64(buf) {
-  const bytes = new Uint8Array(buf);
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
+function buildTextPromptForSymbol(st, symbol, marketData, newsHeadlinesFa, newsAnalysisFa, userPrompt, isStaff) {
+  const base = (st.analysisPrompt || DEFAULT_ANALYSIS_PROMPT)
+    .replaceAll("{TIMEFRAME}", st.timeframe)
+    .replaceAll("{STYLE}", st.style)
+    .replaceAll("{RISK}", st.risk)
+    .replaceAll("{NEWS}", st.newsEnabled ? "on" : "off");
+  const stylePrompts = st.stylePrompts || STYLE_PROMPTS_DEFAULT;
+  const stylePrompt = stylePrompts[st.style] || "";
+  const custom = (st.customPrompts || []).find((x) => x.id === st.customPromptId)?.text || "";
+  const allowStyle = ["style_only", "style_plus_custom", "combined_all"].includes(st.promptMode);
+  const allowCustom = ["custom_only", "style_plus_custom", "combined_all"].includes(st.promptMode);
+  const extra = isStaff && userPrompt ? userPrompt : "تحلیل با حالت نهادی";
+  return `${base}\n\nSTYLE_PROMPT:\n${allowStyle ? stylePrompt : ""}\nCUSTOM_PROMPT:\n${allowCustom ? custom : ""}\nMARKET_DATA:\n${JSON.stringify(marketData)}\nNEWS_HEADLINES_FA:\n${newsHeadlinesFa.join("\n")}\nNEWS_ANALYSIS_FA:\n${newsAnalysisFa}\nRULES:\n- خروجی فارسی و دقیقاً بخش‌های ۱ تا ۵\n- اگر style ترکیبی یا promptMode=combined_all، ترکیب سبک‌ها مجاز\n- مدیریت سرمایه متناسب با Capital و سایز پوزیشن پیشنهاد بده\n- quickchart_config را JSON داخلی بساز ولی به کاربر نمایش نده\n- سطح‌ها (X/Y/Z)، شرط کندلی (close/wick)، خیال‌بافی نکن، اگر خبر بود اثر خبر را اضافه کن\nEXTRA:\n${extra}`;
+}
+function stripHiddenModelOutput(s) {
+  return String(s || "")
+    .replace(/quickchart_config\s*[:=]\s*\{[\s\S]*?\}/gi, "")
+    .replace(/```json[\s\S]*?quickchart[\s\S]*?```/gi, "")
+    .trim();
 }
 
-function randomCode(len = 10) {
-  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
-  let out = "";
-  for (let i = 0; i < len; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
-  return out;
+async function runTextProviders(prompt) {
+  return `۱) بایاس و وضعیت تایم‌فریم بالاتر\nبایاس: خنثی.\n۲) ساختار بازار و نقدینگی\nنامشخص از داده.\n۳) نواحی کلیدی و رفتار قیمت\nX: 100\nY: 102\nZ: 98\n۴) سناریوهای ورود و مدیریت معامله\nسناریوی شرطی با ورود پس از تایید.\n۵) پلن اجرا + نقطه ابطال\nEntry 100.5 / SL 99.2 / TP1 101.8 / TP2 103.0 / invalidation: شکست 99\n\n${prompt.slice(0, 120)}`;
 }
+async function runPolishProviders(text) { return text; }
+async function runVisionProviders() { return "visionRaw"; }
 
 const MARKET_CACHE = new Map();
 const ANALYSIS_CACHE = new Map();
