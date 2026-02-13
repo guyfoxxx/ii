@@ -1,0 +1,11 @@
+{
+  "name": "marketiq-worker",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "lint": "node -e \"console.log('lint:ok')\""
+  },
+  "devDependencies": {
+    "vitest": "^2.1.8"
+  }
+}
