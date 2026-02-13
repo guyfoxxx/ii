@@ -59,11 +59,24 @@ export default {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
         const v = await authMiniappRequest(request, body, env);
+        const allowGuest = !v.ok && !!body.allowGuest;
         if (!v.ok) {
+          console.warn("miniapp_auth_failed", {
+            reason: String(v.reason || "unknown"),
+            allowGuest,
+            ua: request.headers.get("user-agent") || "",
+            cfRay: request.headers.get("cf-ray") || "",
+            path: url.pathname,
+          });
+        }
+        if (!v.ok && !allowGuest) {
           if (miniappGuestEnabled(env)) {
             return jsonResponse(await buildMiniappGuestPayload(env));
           }
           return jsonResponse({ ok: false, error: v.reason }, 401);
+        }
+        if (!v.ok && allowGuest) {
+          return jsonResponse(await buildMiniappGuestPayload(env));
         }
 
         const st = await ensureUser(v.userId, env, v.fromLike);
@@ -6788,8 +6801,10 @@ async function boot(){
 
   // Telegram WebApp may populate initData with a slight delay.
   if (isTelegramRuntime && !initData) {
-    await new Promise((r) => setTimeout(r, 350));
-    initData = (tg?.initData || "").trim();
+    for (let i = 0; i < 10 && !initData; i++) {
+      await new Promise((r) => setTimeout(r, 180));
+      initData = (tg?.initData || "").trim();
+    }
   }
 
   if (initData) {
