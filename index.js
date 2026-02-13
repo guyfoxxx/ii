@@ -3751,9 +3751,11 @@ async function handleUpdate(update, env) {
     if (text === "/wallet" || text === BTN.WALLET) {
       const wallet = await getWallet(env);
       const txt =
-        `💳 ولت و پرداخت\n\n` +
-        (wallet ? `آدرس ولت:\n${wallet}\n\n` : "") +
-        `برای مشاهده موجودی، واریز یا برداشت از دکمه‌ها استفاده کن.`;
+        `💳 ولت\n\n` +
+        `Marketi1 PRO با ارزش ۲۵ USDT\n\n` +
+        (wallet ? `آدرس ولت درگاه:\n${wallet}\n\n` : "") +
+        `📜 تاریخچه تراکنشات، واریز و برداشت را از دکمه‌های زیر مدیریت کنید.\n\n` +
+        `«واریزی فقط به آدرس ولت درگاه ممکن است\nدر لیست زیر باید از واریز هش واریزی را ارسال کنید.»`;
       return tgSendMessage(env, chatId, txt, walletMenuKeyboard());
     }
 
@@ -3771,11 +3773,18 @@ async function handleUpdate(update, env) {
         `➕ واریز
 
 ` +
-        (wallet ? `آدرس ولت:
+        `Marketi1 PRO با ارزش ۲۵ USDT
+
+` +
+        (wallet ? `آدرس ولت درگاه:
 ${wallet}
 ` : "") +
         `
 Memo/Tag: ${memo}
+
+` +
+        `«واریزی فقط به آدرس ولت درگاه ممکن است
+در لیست زیر باید از واریز هش واریزی را ارسال کنید.»
 
 ` +
         `TxID پرداخت را همینجا بفرست (در صورت نیاز: <txid> <amount>).`;
@@ -3796,15 +3805,25 @@ Memo/Tag: ${memo}
     if (text === "/invite" || text === BTN.INVITE) {
       const { link, share } = inviteShareText(st, env);
       if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
+      const pts = Number(st?.referral?.points || 0);
+      const inv = Number(st?.referral?.successfulInvites || 0);
       const txt =
         `🤝 دعوت دوستان
 
 ` +
-        `🔗 لینک رفرال اختصاصی: <a href="${escapeHtml(link)}">باز کردن لینک دعوت</a>
+        `✅ دعوت موفق: ${inv}
+` +
+        `🎁 امتیاز شما: ${pts}
 
 ` +
-        (share ? `برای اشتراک‌گذاری سریع: <a href="${escapeHtml(share)}">ارسال لینک</a>
-` : "");
+        `🔗 لینک رفرال (قابل کپی):
+<a href="${escapeHtml(link)}">${escapeHtml(link)}</a>
+
+` +
+        (share ? `🚀 اشتراک سریع لینک: <a href="${escapeHtml(share)}">ارسال لینک</a>
+
+` : "") +
+        `«با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتیاز بدست می آورید در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید»`;
       return tgSendMessageHtml(env, chatId, txt, mainMenuKeyboard(env));
     }
 
@@ -3820,7 +3839,7 @@ Memo/Tag: ${memo}
       return tgSendMessage(
         env,
         chatId,
-        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.\n\nپیام مستقیم: ${handle}${walletLine}`,
+        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.\n«با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.»\n\nپیام مستقیم: ${handle}${walletLine}`,
         kb([[BTN.SUPPORT_FAQ, BTN.SUPPORT_TICKET], [BTN.SUPPORT_CUSTOM_PROMPT], [BTN.HOME]])
       );
     }
@@ -4017,10 +4036,12 @@ ${MINIAPP_EXEC_CHECKLIST}`, kbInline);
       await saveUser(userId, st, env);
 
       const marketFa = ({crypto:"کریپتو", forex:"فارکس", metals:"فلزات", stocks:"سهام"})[result.recommendedMarket] || "کریپتو";
+      const sampleSymbol = String(st.selectedSymbol || st.profile?.preferredSymbol || "BTCUSDT").toUpperCase();
+      const sampleHint = `نمونه تحلیل کوتاه (${sampleSymbol} / ${st.timeframe}): اگر قیمت بالای ناحیه تعادلی تثبیت شود، سناریوی ادامه روند فعال است؛ در شکست ساختار خلاف جهت، سناریوی جایگزین اجرا می‌شود.`;
       return tgSendMessage(
         env,
         chatId,
-        `✅ تعیین سطح انجام شد.\n\nسطح: ${st.profile.level}\nپیشنهاد بازار: ${marketFa}\n\nتنظیمات پیشنهادی:\n⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}\n\nیادداشت:\n${st.profile.levelNotes || "—"}\n\nاگر می‌خوای دوباره تعیین‌سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
+        `✅ تعیین سطح انجام شد.\n\nسطح: ${st.profile.level}\nپیشنهاد بازار: ${marketFa}\n\nتنظیمات پیشنهادی:\n⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}\n\nیادداشت:\n${st.profile.levelNotes || "—"}\n\n🧠 ${sampleHint}\n\nبرای دریافت تحلیل کامل، از منوی اصلی روی «📈 سیگنال‌ها» یا «تحلیل» بزن.`,
         mainMenuKeyboard(env)
       );
     }
@@ -5396,7 +5417,7 @@ const MINI_APP_HTML = `<!doctype html>
         <div class="card-b offer" id="offerCard">
           <div>
             <h3>🎁 پیشنهاد ویژه</h3>
-            <p id="offerText">فعال‌سازی اشتراک ویژه با تخفیف محدود.</p>
+            <p id="offerText">marketi1 PRO با ارزش ۲۵ USDT</p>
             <div class="offer-media" id="offerMedia"><img id="offerImg" alt="offer" /></div>
           </div>
           <img id="offerImage" class="offer-media" alt="offer" />
@@ -5551,7 +5572,7 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="actions">
             <button id="sendSupportTicket" class="btn">✉️ ارسال تیکت</button>
           </div>
-          <div class="muted" style="font-size:12px; line-height:1.6;">پاسخ از طریق پشتیبانی تلگرام ارسال می‌شود.</div>
+          <div class="muted" style="font-size:12px; line-height:1.6;">با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید. پاسخ از طریق پشتیبانی تلگرام ارسال می‌شود.</div>
         </div>
       </div>
 
@@ -6513,7 +6534,7 @@ function applyUserState(json) {
   if (json.state?.selectedSymbol && (json.symbols || []).includes(json.state.selectedSymbol)) {
     setVal("symbol", json.state.selectedSymbol);
   } else if (json.symbols?.length) setVal("symbol", json.symbols[0]);
-  if (offerText) offerText.textContent = json.offerBanner || "فعال‌سازی اشتراک ویژه با تخفیف محدود.";
+  if (offerText) offerText.textContent = json.offerBanner || "marketi1 PRO با ارزش ۲۵ USDT";
   if (offerTag) offerTag.textContent = json.role === "owner" ? "Owner" : "Special";
   if (offerImage) {
     const img = String(json.offerBannerImage || "").trim();
