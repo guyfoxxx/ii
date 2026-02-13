@@ -33,7 +33,9 @@ export default {
           return jsonResponse({ ok: false, error: v.reason }, 401);
         }
 
-        const st = await ensureUser(v.userId, env);
+        const st = await ensureUser(v.userId, env, v.fromLike);
+        applyLocaleFromTelegramUser(st, v.fromLike || {});
+        if (env.BOT_KV) await saveUser(v.userId, st, env);
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
         const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
         const miniToken = await issueMiniappToken(env, v.userId, v.fromLike || {});
@@ -259,7 +261,9 @@ ${reply}`;
           if (typeof body.offerBanner === "string" && env.BOT_KV) {
             await setOfferBanner(env, body.offerBanner);
           }
-          if (typeof body.offerBannerImage === "string") {
+          if (body.clearOfferBannerImage) {
+            await setOfferBannerImage(env, "");
+          } else if (typeof body.offerBannerImage === "string") {
             try {
               await setOfferBannerImage(env, body.offerBannerImage);
             } catch (e) {
@@ -616,7 +620,7 @@ TxID: ${txid}
         const tf = String(url.searchParams.get("tf") || "H4").trim().toUpperCase();
         const levelsRaw = String(url.searchParams.get("levels") || "").trim();
         const levels = levelsRaw
-          ? levelsRaw.split(",").map((x) => Number(x)).filter((n) => Number.isFinite(n)).slice(0, 6)
+          ? levelsRaw.split(",").map((x) => Number(x)).filter((n) => Number.isFinite(n)).slice(0, 8)
           : [];
 
         if (!symbol || !isSymbol(symbol)) {
@@ -784,13 +788,19 @@ TxID: ${txid}
         const v = await verifyMiniappAuth(body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
-        const st = await ensureUser(v.userId, env);
+        const st = await ensureUser(v.userId, env, v.fromLike);
         const symbol = String(body.symbol || "").trim();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
 
-        // lightweight onboarding gate for mini-app: block only if absolutely no identity fields exist
-        const hasAnyIdentity = !!(st.profile?.name || st.profile?.phone || st.profile?.username || v.fromLike?.username);
-        if (!hasAnyIdentity) {
+        const isOnboardingReady = !!(
+          st.profile?.onboardingDone &&
+          st.profile?.name &&
+          st.profile?.phone &&
+          st.profile?.preferredStyle &&
+          st.profile?.preferredMarket &&
+          Number(st.profile?.capital || 0) > 0
+        );
+        if (!isOnboardingReady) {
           return jsonResponse({ ok: false, error: "onboarding_required" }, 403);
         }
 
@@ -817,12 +827,14 @@ TxID: ${txid}
           let levels = [];
           let quickChartSpec = null;
           let zonesSvg = "";
+          let chartCandlesCount = 0;
           try {
             if (String(env.QUICKCHART || "") !== "0") {
               const tf = st.timeframe || "H4";
               levels = extractLevels(result);
               const origin = new URL(request.url).origin;
               const candles = await getMarketCandlesWithFallback(env, symbol, tf).catch(() => []);
+              chartCandlesCount = Array.isArray(candles) ? candles.length : 0;
               if (Array.isArray(candles) && candles.length) {
                 chartUrl = `${origin}/api/chart?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&levels=${encodeURIComponent(levels.join(","))}`;
                 quickChartSpec = buildQuickChartSpec(candles, symbol, tf, levels);
@@ -839,10 +851,19 @@ TxID: ${txid}
           } catch (e) {
             console.error("zones svg build error:", e?.message || e);
           }
-          const quickchartConfig = { symbol, timeframe: st.timeframe || "H4", levels };
-          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec, quickchartConfig, zonesSvg });
+          const tf = st.timeframe || "H4";
+          const quickchartConfig = { symbol, timeframe: tf, levels };
+          const chartMeta = { timeframe: tf, candles: chartCandlesCount, zones: levels.length };
+          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec, quickchartConfig, chartMeta, zonesSvg });
         } catch (e) {
           console.error("api/analyze error:", e);
+          const msg = String(e?.message || e || "");
+          if (msg.includes("api_analyze_timeout") || msg.includes("text_") || msg.includes("timeout")) {
+            let candles = [];
+            try { candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4"); } catch {}
+            const fallback = buildLocalFallbackAnalysis(symbol, st, candles, msg || "analysis_timeout");
+            return jsonResponse({ ok: true, result: fallback, state: st, quota: isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`, fallback: true, reason: msg || "timeout" });
+          }
           return jsonResponse({ ok: false, error: "server_error" }, 500);
         }
       }
@@ -973,7 +994,7 @@ const BTN = {
 };
 
 const TYPING_INTERVAL_MS = 4000;
-const TIMEOUT_TEXT_MS = 26000;
+const TIMEOUT_TEXT_MS = 38000;
 const TIMEOUT_VISION_MS = 12000;
 const TIMEOUT_POLISH_MS = 15000;
 
@@ -1032,15 +1053,41 @@ function applyLocaleDefaults(st) {
   st.profile.countryCode = st.profile.countryCode || loc.country;
   st.profile.timezone = st.profile.timezone || loc.tz;
 
-  if (!st.timeframe) st.timeframe = (loc.country === "IR" ? "H1" : "H4");
-  if (!st.risk) st.risk = "متوسط";
-  if (!st.style) st.style = "پرایس اکشن";
+  const policy = localePolicy(st.profile.language, st.profile.countryCode);
+  if (!st.timeframe) st.timeframe = policy.timeframe;
+  if (!st.risk) st.risk = policy.risk;
+  if (!st.style) st.style = policy.style;
   if (st.profile.preferredStyle && ALLOWED_STYLE_LIST.includes(st.profile.preferredStyle)) {
     st.style = st.profile.preferredStyle;
   }
   if (typeof st.newsEnabled !== "boolean") st.newsEnabled = true;
   if (!st.promptMode) st.promptMode = "style_plus_custom";
   return st;
+}
+
+function localePolicy(language = "fa", country = "IR") {
+  const lang = String(language || "fa").toLowerCase();
+  const c = String(country || "IR").toUpperCase();
+  if (c === "IR") return { timeframe: "H1", risk: "متوسط", style: "پرایس اکشن" };
+  if (lang.startsWith("ar")) return { timeframe: "H1", risk: "متوسط", style: "ترکیبی" };
+  if (lang.startsWith("tr") || lang.startsWith("ru")) return { timeframe: "H4", risk: "متوسط", style: "ICT" };
+  return { timeframe: "H4", risk: "medium", style: "پرایس اکشن" };
+}
+
+function applyLocaleFromTelegramUser(st, fromLike = {}) {
+  st.profile = st.profile || {};
+  const langRaw = String(fromLike?.language_code || "").trim().toLowerCase();
+  if (!st.profile.language && langRaw) st.profile.language = langRaw.split("-")[0];
+  if (!st.profile.countryCode && langRaw.includes("-")) st.profile.countryCode = langRaw.split("-")[1].toUpperCase();
+  if (!st.profile.countryCode) st.profile.countryCode = st.profile.language === "fa" ? "IR" : "INT";
+  if (!st.profile.timezone) {
+    const tzMap = { fa: "Asia/Tehran", ar: "Asia/Riyadh", tr: "Europe/Istanbul", ru: "Europe/Moscow", en: "UTC" };
+    st.profile.timezone = tzMap[st.profile.language] || "UTC";
+  }
+  const policy = localePolicy(st.profile.language, st.profile.countryCode);
+  if (!st.timeframe) st.timeframe = policy.timeframe;
+  if (!st.risk) st.risk = policy.risk;
+  if (!st.style) st.style = policy.style;
 }
 
 async function finalizeOnboardingRewards(env, st) {
@@ -1550,6 +1597,11 @@ async function getOfferBanner(env) {
   return (raw || env.SPECIAL_OFFER_TEXT || "").toString().trim();
 }
 
+async function setOfferBanner(env, text) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
+}
+
 async function getOfferBannerImage(env) {
   if (!env.BOT_KV) return (env.SPECIAL_OFFER_IMAGE || "").toString().trim();
   const raw = await env.BOT_KV.get("settings:offer_banner_image");
@@ -1568,8 +1620,10 @@ async function setOfferBannerImage(env, dataUrl) {
     await env.BOT_KV.delete("settings:offer_banner_image");
     return;
   }
-  if (!clean.startsWith("data:image/")) throw new Error("bad_offer_image_format");
-  if (clean.length > 1_500_000) throw new Error("offer_image_too_large");
+  const isDataImage = clean.startsWith("data:image/");
+  const isHttpUrl = /^https?:\/\//i.test(clean);
+  if (!isDataImage && !isHttpUrl) throw new Error("bad_offer_image_format");
+  if (isDataImage && clean.length > 1_500_000) throw new Error("offer_image_too_large");
   await env.BOT_KV.put("settings:offer_banner_image", clean);
 }
 
@@ -1917,9 +1971,17 @@ function contactKeyboard() {
   };
 }
 
+const DEFAULT_MINIAPP_URL = "https://sniperim.mad-pyc.workers.dev/";
+
 function getMiniappUrl(env) {
-  const u = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || "").toString().trim();
-  return u;
+  const configured = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || "").toString().trim();
+  const raw = configured || DEFAULT_MINIAPP_URL;
+  try {
+    const u = new URL(raw);
+    return u.toString();
+  } catch {
+    return DEFAULT_MINIAPP_URL;
+  }
 }
 async function miniappInlineKeyboard(env, st, from) {
   const url = getMiniappUrl(env);
@@ -2139,6 +2201,7 @@ async function ensureUser(userId, env, from) {
   if (from?.username) st.profile.username = String(from.username);
   if (from?.first_name) st.profile.firstName = String(from.first_name);
   if (from?.last_name) st.profile.lastName = String(from.last_name);
+  applyLocaleFromTelegramUser(st, from || {});
   if (st.profile?.phone) applyLocaleDefaults(st);
 
   const today = kyivDateString();
@@ -2209,6 +2272,13 @@ async function tgSendMessage(env, chatId, text, replyMarkup) {
     reply_markup: replyMarkup,
     disable_web_page_preview: true,
   });
+}
+
+async function tgSendLongMessage(env, chatId, text, replyMarkup) {
+  const parts = chunkText(String(text || ""), 3500);
+  for (const part of parts) {
+    await tgSendMessage(env, chatId, part, replyMarkup);
+  }
 }
 
 async function tgSendMessageHtml(env, chatId, html, replyMarkup) {
@@ -3447,7 +3517,7 @@ ${newsAnalysisBlock}
 ` : ``) +
     `RULES:
 ` +
-    `- خروجی فقط فارسی و دقیقاً بخش‌های ۱ تا ۵
+    `- خروجی به زبان کاربر باشد (Lang=${st.profile?.language || "fa"}) و دقیقاً بخش‌های ۱ تا ۵
 ` +
     (st.style === "ترکیبی" || promptMode === "combined_all"
       ? `- از ترکیب سبک‌ها (پرایس اکشن، اسمارت‌مانی، ساختار بازار، حجم، سناریو) استفاده کن
@@ -4316,8 +4386,7 @@ async function startOnboarding(env, chatId, from, st) {
     await saveUser(st.userId, st, env);
     return tgSendMessage(env, chatId, "🎯 سبک ترجیحی‌ات را انتخاب کن:", optionsKeyboard(ALLOWED_STYLE_LIST));
   }
-  const flags = await getAdminFlags(env);
-  if (flags.capitalModeEnabled && !Number(st.profile?.capital || 0)) {
+  if (!Number(st.profile?.capital || 0)) {
     st.state = "onb_capital";
     await saveUser(st.userId, st, env);
     return tgSendMessage(env, chatId, "💼 سرمایه تقریبی‌ات را وارد کن (عدد). مثال: 1000", kb([[BTN.BACK, BTN.HOME]]));
@@ -4681,6 +4750,14 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
   } catch (e) {
     console.error("runSignalTextFlow error:", e);
     t.stop = true;
+    const msg = String(e?.message || e || "");
+    if (msg.includes("timeout") || msg.includes("text_")) {
+      let candles = [];
+      try { candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4"); } catch {}
+      const fallback = buildLocalFallbackAnalysis(symbol, st, candles, msg || "signal_timeout");
+      await tgSendLongMessage(env, chatId, fallback, kb([[BTN.HOME]]));
+      return false;
+    }
     await tgSendMessage(env, chatId, "⚠️ فعلاً امکان انجام این عملیات نیست. لطفاً بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
     return false;
   }
@@ -4747,14 +4824,21 @@ async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
     console.error("text providers failed (retry compact):", e?.message || e);
     try {
       const compactBlock = buildMarketBlock(candles, 40);
-      const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env, newsBlock);      draft = await runTextProviders(compactPrompt, env, st.textOrder);
+      const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env, newsBlock);
+      draft = await runTextProviders(compactPrompt, env, st.textOrder);
     } catch (e2) {
       console.error("text providers failed (fallback local):", e2?.message || e2);
       draft = buildLocalFallbackAnalysis(symbol, st, candles, e2?.message || "text_provider_timeout");
     }
   }
-  const polished = await runPolishProviders(draft, env, st.polishOrder);
-  const clean = stripHiddenModelOutput(polished);
+  let polished = draft;
+  try {
+    polished = await runPolishProviders(draft, env, st.polishOrder);
+  } catch (e) {
+    console.error("polish flow failed:", e?.message || e);
+    polished = draft;
+  }
+  const clean = stripHiddenModelOutput(polished || draft);
   if (useCache && clean) await setAnalysisCache(env, cacheKey, clean);
   return clean;
 }
@@ -4852,11 +4936,44 @@ function buildLevelsOnlySvg(symbol, timeframe, levels = []) {
 }
 
 function extractLevels(text) {
-  const nums = (String(text || "").match(/\b\d{1,6}(?:\.\d{1,6})?\b/g) || [])
-    .map(Number)
-    .filter(n => Number.isFinite(n));
-  const uniq = [...new Set(nums)].sort((a,b)=>a-b);
-  return uniq.slice(0, 6);
+  const src = String(text || "");
+  const lines = src.split(/\r?\n/);
+  const weighted = [];
+  const plain = [];
+
+  const scoreLine = (ln) => {
+    const l = ln.toLowerCase();
+    let score = 0;
+    if (/زون|zone|support|resistance|sr|flip|entry|tp|sl|target/.test(l)) score += 4;
+    if (/\d/.test(l)) score += 1;
+    return score;
+  };
+
+  for (const ln of lines) {
+    const nums = (ln.match(/\b\d{1,6}(?:\.\d{1,8})?\b/g) || [])
+      .map(Number)
+      .filter((n) => Number.isFinite(n) && n > 0);
+    if (!nums.length) continue;
+    const sc = scoreLine(ln);
+    for (const n of nums) {
+      if (sc >= 4) weighted.push(n);
+      else plain.push(n);
+    }
+  }
+
+  const all = [...weighted, ...plain]
+    .filter((n) => Number.isFinite(n))
+    .filter((n) => n >= 0.00001 && n <= 1_000_000)
+    .sort((a, b) => a - b);
+
+  const dedup = [];
+  for (const n of all) {
+    const prev = dedup[dedup.length - 1];
+    if (prev == null || Math.abs(prev - n) > Math.max(1e-6, Math.abs(prev) * 0.0005)) {
+      dedup.push(Number(n.toFixed(6)));
+    }
+  }
+  return dedup.slice(0, 8);
 }
 
 function extractLevelsFromCandles(candles) {
@@ -5063,7 +5180,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const userId = user?.id || Number(params.get("user_id") || "0");
   if (!userId) return { ok: false, reason: "user_missing" };
 
-  const fromLike = { username: user?.username || "" };
+  const fromLike = { username: user?.username || "", first_name: user?.first_name || "", last_name: user?.last_name || "", language_code: user?.language_code || "" };
   return { ok: true, userId, fromLike };
 }
 
@@ -5576,6 +5693,9 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="field">
             <div class="label">پرامپت‌های اختصاصی (JSON)</div>
             <textarea id="customPromptsJson" class="control" placeholder='[{"id":"p1","title":"VIP","text":"..."}]'></textarea>
+            <div class="admin-row">
+              <input id="customPromptsJsonFile" type="file" accept="application/json,.json" class="control" />
+            </div>
             <div class="actions">
               <button id="saveCustomPrompts" class="btn">ذخیره پرامپت‌های اختصاصی</button>
             </div>
@@ -5613,16 +5733,15 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="field admin-tab" data-tab="content">
             <div class="label">بنر پیشنهاد (نمایش داخل مینی‌اپ)</div>
             <textarea id="offerBannerInput" class="control" placeholder="متن بنر پیشنهاد..."></textarea>
-            <input id="offerBannerImageInput" type="file" accept="image/*" class="control" />
+            <input id="offerImageFile" type="file" accept="image/*" class="control" />
             <div class="muted" style="font-size:12px;">برای حذف تصویر، فایل را خالی بگذار و ذخیره کن.</div>
             <div class="actions">
               <button id="saveOfferBanner" class="btn">ذخیره بنر</button>
             </div>
             <div class="admin-row">
-              <input id="offerImageFile" type="file" accept="image/*" class="control" />
+              <input id="offerBannerImageUrlInput" class="control" placeholder="یا لینک تصویر بنر..." />
               <button id="clearOfferImage" class="btn ghost">حذف تصویر</button>
             </div>
-            <input id="offerBannerImageInput" class="control" placeholder="یا لینک تصویر بنر..." />
           </div>
 
           <div class="field admin-tab" data-tab="content">
@@ -5772,6 +5891,11 @@ const reportBlock = document.getElementById("reportBlock");
 const roleLabel = document.getElementById("roleLabel");
 const energyToday = document.getElementById("energyToday");
 const remainingAnalyses = document.getElementById("remainingAnalyses");
+const remainingText = document.getElementById("remainingText");
+const energyText = document.getElementById("energyText");
+const energyFill = document.getElementById("energyFill");
+const offerMedia = document.getElementById("offerMedia");
+const offerImg = document.getElementById("offerImg");
 
 function el(id){ return document.getElementById(id); }
 function val(id){ return el(id).value; }
@@ -5990,7 +6114,7 @@ async function adminApi(path, body){
 function prettyErr(j, status){
   const e = j?.error || "نامشخص";
   if (status === 429 && String(e).startsWith("quota_exceeded")) return "سهمیه امروز تمام شد.";
-  if (status === 403 && String(e) === "onboarding_required") return "ابتدا حداقل نام یا یوزرنیم خود را تکمیل کنید.";
+  if (status === 403 && String(e) === "onboarding_required") return "لطفاً آنبوردینگ را کامل کن: نام، شماره، سرمایه، تعیین‌سطح و سبک.";
   if (status === 403 && String(e) === "forbidden") return "دسترسی این بخش برای نقش فعلی شما مجاز نیست.";
   if (status === 401) {
     if (String(e).includes("initData")) return "اتصال مینی‌اپ منقضی شده؛ اپ را مجدد از داخل تلگرام باز کنید.";
@@ -6170,10 +6294,10 @@ function pickTicketReplyTemplate(){
 }
 
 function updateMeta(state, quota){
-  const q = String(quota || "-");
+  const qRaw = String(quota || "-");
   let energy = "—";
   let remainTxt = "∞";
-  const m = q.match(/^(\d+)\/(\d+)$/);
+  const m = qRaw.match(/^(\d+)\/(\d+)$/);
   if (m) {
     const used = Number(m[1] || 0);
     const lim = Math.max(1, Number(m[2] || 1));
@@ -6181,19 +6305,19 @@ function updateMeta(state, quota){
     const pct = Math.max(0, Math.min(100, Math.round((remain / lim) * 100)));
     energy = pct + "%";
     remainTxt = String(remain);
-  } else if (q === "∞") {
+  } else if (qRaw === "∞") {
     energy = "100%";
     remainTxt = "∞";
   }
-  meta.textContent = "انرژی: " + energy + " | تحلیل باقی‌مانده: " + remainTxt + " | سهمیه: " + q;
+  meta.textContent = "انرژی: " + energy + " | تحلیل باقی‌مانده: " + remainTxt + " | سهمیه: " + qRaw;
   sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
   const q = String(quota || "");
-  const m = q.match(/(\d+)\s*\/\s*(\d+)/);
+  const m2 = q.match(/(\d+)\s*\/\s*(\d+)/);
   let used = 0;
   let limit = 0;
-  if (m) {
-    used = Number(m[1] || 0);
-    limit = Number(m[2] || 0);
+  if (m2) {
+    used = Number(m2[1] || 0);
+    limit = Number(m2[2] || 0);
   }
   const remaining = Math.max(0, limit - used);
   const pct = limit > 0 ? Math.max(0, Math.min(100, Math.round((remaining / limit) * 100))) : 100;
@@ -6672,7 +6796,7 @@ async function boot(){
     });
 
     if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
-    if (el("offerBannerImageInput")) el("offerBannerImageInput").value = json.offerBannerImage || "";
+    if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = json.offerBannerImage || "";
     if (IS_OWNER && el("walletAddressInput")) el("walletAddressInput").value = json.wallet || "";
 
     await loadAdminBootstrap();
@@ -6690,7 +6814,7 @@ async function loadAdminBootstrap(){
   if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(json.customPrompts || [], null, 2);
   if (el("freeDailyLimit")) el("freeDailyLimit").value = String(json.freeDailyLimit ?? "");
   if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
-  if (el("offerBannerImageInput")) el("offerBannerImageInput").value = json.offerBannerImage || "";
+  if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = json.offerBannerImage || "";
   if (el("welcomeBotInput")) el("welcomeBotInput").value = json.welcomeBot || "";
   if (el("welcomeMiniappInput")) el("welcomeMiniappInput").value = json.welcomeMiniapp || "";
 
@@ -6802,25 +6926,35 @@ el("analyze").addEventListener("click", async () => {
   const chartCard = el("chartCard");
   const chartImg = el("chartImg");
   if (chartCard && chartImg) {
-      const u = json.chartUrl || "";
-      const fallbackSvg = json.zonesSvg || "";
-      if (fallbackSvg) {
-        renderChartFallbackSvg(fallbackSvg);
-      } else if (u) {
-        chartImg.onerror = () => {
-          chartImg.onerror = null;
-          chartImg.removeAttribute("src");
-          chartCard.style.display = "none";
-        };
-        chartImg.src = u;
-        chartCard.style.display = "block";
-        const cm = el("chartMeta");
-        if (cm) cm.textContent = "QuickChart";
-      } else {
+    const u = json.chartUrl || "";
+    const fallbackSvg = json.zonesSvg || "";
+    const tf = json?.quickchartConfig?.timeframe || val("timeframe") || "H4";
+    const zones = Array.isArray(json?.levels) ? json.levels.length : 0;
+    const candleCount = Number(json?.chartMeta?.candles || 0);
+    const cm = el("chartMeta");
+    if (u) {
+      chartImg.onerror = () => {
+        chartImg.onerror = null;
+        if (fallbackSvg) {
+          renderChartFallbackSvg(fallbackSvg);
+          const cmFallback = el("chartMeta");
+          if (cmFallback) cmFallback.textContent = "Zones SVG | TF: " + tf + " | zones: " + zones;
+          return;
+        }
         chartImg.removeAttribute("src");
         chartCard.style.display = "none";
-      }
+      };
+      chartImg.src = u;
+      chartCard.style.display = "block";
+      if (cm) cm.textContent = "Candlestick | TF: " + tf + " | candles: " + candleCount + " | zones: " + zones;
+    } else if (fallbackSvg) {
+      renderChartFallbackSvg(fallbackSvg);
+      if (cm) cm.textContent = "Zones SVG | TF: " + tf + " | zones: " + zones;
+    } else {
+      chartImg.removeAttribute("src");
+      chartCard.style.display = "none";
     }
+  }
   updateMeta(json.state, json.quota);
   showToast("آماده ✅", "خروجی دریافت شد", "OK", false);
   setTimeout(hideToast, 1200);
@@ -6910,9 +7044,12 @@ el("saveFreeLimit")?.addEventListener("click", async () => {
 el("saveOfferBanner")?.addEventListener("click", async () => {
   const offerBanner = el("offerBannerInput")?.value || "";
   let offerBannerImage = undefined;
-  const file = el("offerBannerImageInput")?.files?.[0];
+  const file = el("offerImageFile")?.files?.[0];
+  const imageUrl = String(el("offerBannerImageUrlInput")?.value || "").trim();
   if (file) {
     offerBannerImage = await fileToDataUrl(file);
+  } else if (imageUrl) {
+    offerBannerImage = imageUrl;
   }
   const { json } = await adminApi("/api/admin/offer", { offerBanner, offerBannerImage });
   if (json?.ok) {
@@ -6939,7 +7076,7 @@ el("offerImageFile")?.addEventListener("change", async (ev) => {
   const reader = new FileReader();
   reader.onload = () => {
     const dataUrl = typeof reader.result === "string" ? reader.result : "";
-    if (el("offerBannerImageInput")) el("offerBannerImageInput").value = dataUrl;
+    if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = dataUrl;
     if (offerImg) offerImg.src = dataUrl;
     if (offerMedia) offerMedia.classList.toggle("show", !!dataUrl);
   };
@@ -6949,7 +7086,7 @@ el("offerImageFile")?.addEventListener("change", async (ev) => {
 el("clearOfferImage")?.addEventListener("click", async () => {
   const offerBanner = el("offerBannerInput")?.value || "";
   const { json } = await adminApi("/api/admin/offer", { offerBanner, clearOfferBannerImage: true });
-  if (el("offerBannerImageInput")) el("offerBannerImageInput").value = "";
+  if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = "";
   if (el("offerImageFile")) el("offerImageFile").value = "";
   if (offerImg) offerImg.src = "";
   if (offerMedia) offerMedia.classList.remove("show");
@@ -7099,6 +7236,23 @@ el("saveCapitalToggle")?.addEventListener("click", async () => {
   }
 });
 
+
+el("customPromptsJsonFile")?.addEventListener("change", async (ev) => {
+  const file = ev?.target?.files?.[0];
+  if (!file) return;
+  try {
+    const txt = await file.text();
+    const parsed = safeJsonParse(txt, null);
+    if (!Array.isArray(parsed)) {
+      showToast("خطا", "فایل JSON باید آرایه باشد", "ADM", false);
+      return;
+    }
+    if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(parsed, null, 2);
+    showToast("بارگذاری شد ✅", "JSON پرامپت آماده ذخیره است", "ADM", false);
+  } catch {
+    showToast("خطا", "خواندن فایل JSON ناموفق بود", "ADM", false);
+  }
+});
 
 el("saveCustomPrompts")?.addEventListener("click", async () => {
   const raw = el("customPromptsJson")?.value || "[]";
