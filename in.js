@@ -641,6 +641,17 @@ TxID: ${txid}
         }
 
         if (!Array.isArray(candles) || candles.length === 0) {
+          if (Array.isArray(levels) && levels.length) {
+            const svg = buildLevelsOnlySvg(symbol, tf, levels);
+            return new Response(svg, {
+              status: 200,
+              headers: {
+                "Content-Type": "image/svg+xml; charset=utf-8",
+                "Cache-Control": "public, max-age=30",
+                "X-Chart-Fallback": "levels_only_svg",
+              },
+            });
+          }
           return jsonResponse({ ok: false, error: "no_market_data" }, 404);
         }
 
@@ -5999,7 +6010,11 @@ async function api(path, body){
       await new Promise((res) => setTimeout(res, 350 * (i + 1)));
     }
   }
-  return { status: 599, json: { ok: false, error: String(lastErr?.message || lastErr || "network_error") } };
+  const errText = String(lastErr?.message || lastErr || "network_error");
+  const normalized = errText.toLowerCase().includes("timeout") || errText.toLowerCase().includes("abort")
+    ? "request_timeout"
+    : errText;
+  return { status: 599, json: { ok: false, error: normalized } };
 }
 
 async function adminApi(path, body){
@@ -6680,7 +6695,7 @@ async function boot(){
   IS_OWNER = json.role === "owner";
   IS_GUEST = !!json.guest;
 
-  const adminTabBtn = document.querySelector(".tab-btn[data-tab="admin"]");
+  const adminTabBtn = document.querySelector('.tab-btn[data-tab="admin"]');
   if (adminTabBtn) adminTabBtn.style.display = IS_STAFF ? "inline-flex" : "none";
 
   if (IS_STAFF && adminCard) {
@@ -6826,21 +6841,25 @@ el("analyze").addEventListener("click", async () => {
   if (chartCard && chartImg) {
       const u = json.chartUrl || "";
       const fallbackSvg = json.zonesSvg || "";
-      if (fallbackSvg) {
-        renderChartFallbackSvg(fallbackSvg);
-      } else if (u) {
+      const activeSymbol = val("symbol") || "-";
+      const activeTf = val("timeframe") || "H4";
+      const cm = el("chartMeta");
+      if (u) {
         chartImg.onerror = () => {
           chartImg.onerror = null;
           chartImg.removeAttribute("src");
           chartCard.style.display = "none";
+          if (fallbackSvg) renderChartFallbackSvg(fallbackSvg);
         };
         chartImg.src = u;
         chartCard.style.display = "block";
-        const cm = el("chartMeta");
-        if (cm) cm.textContent = "QuickChart";
+        if (cm) cm.textContent = "Candlestick | " + activeSymbol + " | " + activeTf;
+      } else if (fallbackSvg) {
+        renderChartFallbackSvg(fallbackSvg);
       } else {
         chartImg.removeAttribute("src");
         chartCard.style.display = "none";
+        if (cm) cm.textContent = "QuickChart";
       }
     }
   updateMeta(json.state, json.quota);
