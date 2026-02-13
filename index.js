@@ -257,7 +257,7 @@ ${reply}`;
 
         if (url.pathname === "/api/admin/offer") {
           if (typeof body.offerBanner === "string" && env.BOT_KV) {
-            await setOfferBannerSafe(env, body.offerBanner);
+            await setOfferBanner(env, body.offerBanner);
           }
           if (typeof body.offerBannerImage === "string") {
             try {
@@ -641,17 +641,6 @@ TxID: ${txid}
         }
 
         if (!Array.isArray(candles) || candles.length === 0) {
-          if (Array.isArray(levels) && levels.length) {
-            const svg = buildLevelsOnlySvg(symbol, tf, levels);
-            return new Response(svg, {
-              status: 200,
-              headers: {
-                "Content-Type": "image/svg+xml; charset=utf-8",
-                "Cache-Control": "public, max-age=30",
-                "X-Chart-Fallback": "levels_only_svg",
-              },
-            });
-          }
           return jsonResponse({ ok: false, error: "no_market_data" }, 404);
         }
 
@@ -1092,25 +1081,19 @@ function isStaff(from, env) {
 }
 
 function isOwner(from, env) {
-  const uid = String(from?.userId || from?.id || "").trim();
-  const ownerIds = String(env.OWNER_USER_IDS || env.OWNER_IDS || "").split(",").map((x) => String(x || "").trim()).filter(Boolean);
-  if (uid && ownerIds.includes(uid)) return true;
-
   const u = normHandle(from?.username);
+  if (!u) return false;
   const raw = (env.OWNER_HANDLES || "").toString().trim();
-  if (!u || !raw) return false;
+  if (!raw) return false;
   const set = new Set(raw.split(",").map(normHandle).filter(Boolean));
   return set.has(u);
 }
 
 function isAdmin(from, env) {
-  const uid = String(from?.userId || from?.id || "").trim();
-  const adminIds = String(env.ADMIN_USER_IDS || env.ADMIN_IDS || "").split(",").map((x) => String(x || "").trim()).filter(Boolean);
-  if (uid && adminIds.includes(uid)) return true;
-
   const u = normHandle(from?.username);
+  if (!u) return false;
   const raw = (env.ADMIN_HANDLES || "").toString().trim();
-  if (!u || !raw) return false;
+  if (!raw) return false;
   const set = new Set(raw.split(",").map(normHandle).filter(Boolean));
   return set.has(u);
 }
@@ -1590,9 +1573,6 @@ async function setOfferBannerImage(env, dataUrl) {
   await env.BOT_KV.put("settings:offer_banner_image", clean);
 }
 
-
-// Compatibility alias for editor diagnostics in mirrored index.js files.
-const setOfferBannerSafe = async (env, text) => setOfferBanner(env, text);
 async function getCommissionSettings(env) {
   if (!env.BOT_KV) return { globalPercent: 0, overrides: {} };
   const g = await env.BOT_KV.get("settings:commission:globalPercent");
@@ -3104,7 +3084,6 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
       lastErr = e;
       markProviderFailure(p, env, "market");
       console.error("market provider failed:", p, e?.message || e);
-      markProviderFailure(p, env);
     }
   }
 
@@ -3178,7 +3157,7 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
       markProviderFailure(p, env, "market");
     } catch (e) {
       lastErr = e;
-      markProviderFailure(p, env);
+      markProviderFailure(p, env, "market");
     }
   }
   throw lastErr || new Error("market_data_alt_failed");
@@ -3789,7 +3768,7 @@ Memo/Tag: ${memo}
     }
 
     if (text === "/invite" || text === BTN.INVITE) {
-      const { link, share, points, invites } = inviteShareText(st, env);
+      const { link, share } = inviteShareText(st, env);
       if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
       const txt =
         `🤝 دعوت دوستان
@@ -3799,13 +3778,7 @@ Memo/Tag: ${memo}
 
 ` +
         (share ? `برای اشتراک‌گذاری سریع: <a href="${escapeHtml(share)}">ارسال لینک</a>
-
-` : "") +
-        `🎁 امتیاز فعلی: ${points}
-👥 دعوت موفق: ${invites}
-
-ℹ️ هر دعوت موفق ۳ امتیاز.
-هر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
+` : "");
       return tgSendMessageHtml(env, chatId, txt, mainMenuKeyboard(env));
     }
 
@@ -4449,19 +4422,15 @@ async function sendSettingsSummary(env, chatId, st, from) {
 function profileText(st, from, env) {
   const quota = isStaff(from, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
   const adminTag = isStaff(from, env) ? "✅ ادمین/اونر" : "👤 کاربر";
-  const level = st.profile?.level ? `
-سطح: ${st.profile.level}` : "";
+  const level = st.profile?.level ? `\nسطح: ${st.profile.level}` : "";
+  const pts = st.referral?.points || 0;
+  const inv = st.referral?.successfulInvites || 0;
 
-  return `👤 پروفایل
+  const botUser = env.BOT_USERNAME ? String(env.BOT_USERNAME).replace(/^@/, "") : "";
+  const code = (st.referral?.codes || [])[0] || "";
+  const deep = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "-";
 
-وضعیت: ${adminTag}
-🆔 ID: ${st.userId}
-نام: ${st.profile?.name || "-"}
-یوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}
-شماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}
-
-📅 امروز(Tehran): ${kyivDateString()}
-سهمیه امروز: ${quota}`;
+  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Tehran): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
 }
 
 function inviteShareText(st, env) {
@@ -4469,7 +4438,7 @@ function inviteShareText(st, env) {
   const code = (st.referral?.codes || [])[0] || "";
   const link = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "";
   const share = link ? `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent("با لینک من عضو شو و اشتراک هدیه بگیر ✅")}` : "";
-  return { link, share, points: Number(st?.referral?.points || 0), invites: Number(st?.referral?.successfulInvites || 0) };
+  return { link, share };
 }
 
 /* ========================== FLOWS ========================== */
@@ -5065,7 +5034,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const initRaw = String(initData || "").trim();
   if (lenient && initRaw.startsWith("dev:")) {
     const devId = Number(initRaw.split(":")[1] || "0") || 999001;
-    return { ok: true, userId: devId, fromLike: { username: "dev_user", userId: String(devId), id: devId } };
+    return { ok: true, userId: devId, fromLike: { username: "dev_user" } };
   }
   if (!botToken && !lenient) return { ok: false, reason: "bot_token_missing" };
 
@@ -5094,7 +5063,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const userId = user?.id || Number(params.get("user_id") || "0");
   if (!userId) return { ok: false, reason: "user_missing" };
 
-  const fromLike = { username: user?.username || "", userId: String(userId), id: Number(userId) || undefined };
+  const fromLike = { username: user?.username || "" };
   return { ok: true, userId, fromLike };
 }
 
@@ -5803,6 +5772,11 @@ const reportBlock = document.getElementById("reportBlock");
 const roleLabel = document.getElementById("roleLabel");
 const energyToday = document.getElementById("energyToday");
 const remainingAnalyses = document.getElementById("remainingAnalyses");
+const energyText = document.getElementById("energyText");
+const remainingText = document.getElementById("remainingText");
+const energyFill = document.getElementById("energyFill");
+const offerMedia = document.getElementById("offerMedia");
+const offerImg = document.getElementById("offerImg");
 
 function el(id){ return document.getElementById(id); }
 function val(id){ return el(id).value; }
@@ -6010,11 +5984,7 @@ async function api(path, body){
       await new Promise((res) => setTimeout(res, 350 * (i + 1)));
     }
   }
-  const errText = String(lastErr?.message || lastErr || "network_error");
-  const normalized = errText.toLowerCase().includes("timeout") || errText.toLowerCase().includes("abort")
-    ? "request_timeout"
-    : errText;
-  return { status: 599, json: { ok: false, error: normalized } };
+  return { status: 599, json: { ok: false, error: String(lastErr?.message || lastErr || "network_error") } };
 }
 
 async function adminApi(path, body){
@@ -6205,23 +6175,6 @@ function pickTicketReplyTemplate(){
 }
 
 function updateMeta(state, quota){
-  const q = String(quota || "-");
-  let energy = "—";
-  let remainTxt = "∞";
-  const m = q.match(/^(\d+)\/(\d+)$/);
-  if (m) {
-    const used = Number(m[1] || 0);
-    const lim = Math.max(1, Number(m[2] || 1));
-    const remain = Math.max(0, lim - used);
-    const pct = Math.max(0, Math.min(100, Math.round((remain / lim) * 100)));
-    energy = pct + "%";
-    remainTxt = String(remain);
-  } else if (q === "∞") {
-    energy = "100%";
-    remainTxt = "∞";
-  }
-  meta.textContent = "انرژی: " + energy + " | تحلیل باقی‌مانده: " + remainTxt + " | سهمیه: " + q;
-  sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
   const q = String(quota || "");
   const m = q.match(/(\d+)\s*\/\s*(\d+)/);
   let used = 0;
@@ -6232,6 +6185,10 @@ function updateMeta(state, quota){
   }
   const remaining = Math.max(0, limit - used);
   const pct = limit > 0 ? Math.max(0, Math.min(100, Math.round((remaining / limit) * 100))) : 100;
+  const energy = q === "∞" ? "100%" : (limit > 0 ? (pct + "%") : "—");
+  const remainTxt = q === "∞" ? "∞" : (limit > 0 ? String(remaining) : "—");
+  meta.textContent = "انرژی: " + energy + " | تحلیل باقی‌مانده: " + remainTxt + " | سهمیه: " + (q || "-");
+  sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
   if (remainingText) remainingText.textContent = "تحلیل باقی‌مانده: " + (limit > 0 ? String(remaining) : "∞");
   if (energyText) energyText.textContent = "انرژی: " + (limit > 0 ? (pct + "%") : "نامحدود");
   if (energyFill) energyFill.style.width = (limit > 0 ? pct : 100) + "%";
@@ -6603,10 +6560,8 @@ async function boot(){
 
   // Telegram WebApp may populate initData with a slight delay.
   if (isTelegramRuntime && !initData) {
-    for (let i = 0; i < 8 && !initData; i++) {
-      await new Promise((r) => setTimeout(r, 300));
-      initData = (tg?.initData || "").trim();
-    }
+    await new Promise((r) => setTimeout(r, 350));
+    initData = (tg?.initData || "").trim();
   }
 
   if (initData) {
@@ -6847,6 +6802,12 @@ el("analyze").addEventListener("click", async () => {
       if (u) {
         chartImg.onerror = () => {
           chartImg.onerror = null;
+          if (fallbackSvg) {
+            renderChartFallbackSvg(fallbackSvg);
+            const cm = el("chartMeta");
+            if (cm) cm.textContent = "زون تحلیل + " + symbol + " (" + tf + ")";
+            return;
+          }
           chartImg.removeAttribute("src");
           chartCard.style.display = "none";
           if (fallbackSvg) renderChartFallbackSvg(fallbackSvg);
