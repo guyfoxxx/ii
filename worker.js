@@ -1,3 +1,4 @@
+// @ts-nocheck
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -1196,27 +1197,18 @@ Output:
 
 function normalizeStyleLabel(style) {
   const s = String(style || "").trim();
-  if (!s) return "";
+  if (!s) return "پرایس اکشن";
   const low = s.toLowerCase();
   if (low === "price action" || low === "priceaction") return "پرایس اکشن";
   if (low === "ict") return "ICT";
   if (low === "atr") return "ATR";
-  if (low === "combo" || low === "combined" || low === "all" || low === "ترکیبی") return "ترکیبی";
-  return s;
+  return ["پرایس اکشن", "ICT", "ATR"].includes(s) ? s : "پرایس اکشن";
 }
 
 function getStyleGuide(style) {
   const key = normalizeStyleLabel(style);
-  if (key === "ترکیبی") {
-    return [
-      "[پرایس اکشن]", STYLE_PROMPTS_DEFAULT["پرایس اکشن"] || "",
-      "[ICT]", STYLE_PROMPTS_DEFAULT["ICT"] || "",
-      "[ATR]", STYLE_PROMPTS_DEFAULT["ATR"] || "",
-    ].join("\n").trim();
-  }
-  return STYLE_PROMPTS_DEFAULT[key] || "";
+  return STYLE_PROMPTS_DEFAULT[key] || STYLE_PROMPTS_DEFAULT["پرایس اکشن"];
 }
-
 
 async function getAnalysisPrompt(env) {
   const raw = await getSettingText(env, "settings:analysis_prompt", DEFAULT_ANALYSIS_PROMPT);
@@ -1254,14 +1246,6 @@ async function getStylePrompt(env, style) {
   if (!env.BOT_KV) return "";
   const map = await getStylePromptMap(env);
   const key = normalizeStyleLabel(style);
-  if (key === "ترکیبی") {
-    const parts = [];
-    for (const s of ["پرایس اکشن", "ICT", "ATR"]) {
-      const v = (map?.[styleKey(s)] || "").toString().trim();
-      if (v) parts.push("[" + s + "]\n" + v);
-    }
-    return parts.join("\n\n");
-  }
   return (map?.[styleKey(key)] || "").toString();
 }
 async function setStylePrompt(env, style, prompt) {
@@ -3169,9 +3153,9 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
   const customPrompts = await getCustomPrompts(env);
   const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
   const promptMode = String(st.promptMode || "style_plus_custom").trim();
-  const includeStylePrompt = promptMode !== "custom_only";
-  const includeStyleGuide = promptMode === "combined_all" || promptMode === "style_only" || promptMode === "style_plus_custom";
-  const includeCustomPrompt = !!customPrompt?.text && (promptMode === "custom_only" || promptMode === "style_plus_custom" || promptMode === "combined_all");
+  const includeStylePrompt = true;
+  const includeStyleGuide = true;
+  const includeCustomPrompt = !!customPrompt?.text && promptMode !== "style_only";
   const newsAnalysisBlock = newsBlock ? await buildNewsAnalysisSummary(symbol, parseNewsBlockRows(newsBlock), env) : "";
   const base = baseRaw
      .split("{TIMEFRAME}").join(tf)
@@ -3203,8 +3187,11 @@ ${customPrompt.text}
 ` : ``) +
     `ASSET: ${symbol}
 ` +
-
-    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}, Capital=${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}
+    `TIMEFRAME: ${tf}
+` +
+    `USER_RISK: ${st.risk || "متوسط"}
+` +
+    `USER_CAPITAL: ${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}
 
 ` +
     `MARKET_DATA:
@@ -3250,9 +3237,9 @@ async function buildVisionPrompt(st, env) {
   const customPrompts = await getCustomPrompts(env);
   const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
   const promptMode = String(st.promptMode || "style_plus_custom").trim();
-  const includeStylePrompt = promptMode !== "custom_only";
-  const includeStyleGuide = promptMode === "combined_all" || promptMode === "style_only" || promptMode === "style_plus_custom";
-  const includeCustomPrompt = !!customPrompt?.text && (promptMode === "custom_only" || promptMode === "style_plus_custom" || promptMode === "combined_all");
+  const includeStylePrompt = true;
+  const includeStyleGuide = true;
+  const includeCustomPrompt = !!customPrompt?.text && promptMode !== "style_only";
   const base = baseRaw
      .split("{TIMEFRAME}").join(tf)
      .split("{STYLE}").join(st.style || "")
@@ -3276,7 +3263,11 @@ ${getStyleGuide(st.style)}
 ${customPrompt.text}
 
 ` : ``) +
-    `TASK: این تصویر چارت را تحلیل کن. دقیقاً خروجی ۱ تا ۵ بده و سطح‌ها را مشخص کن.
+    `ASSET: ${st.selectedSymbol || "UNKNOWN"}
+TIMEFRAME: ${tf}
+USER_RISK: ${st.risk || "متوسط"}
+USER_CAPITAL: ${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}
+TASK: این تصویر چارت را تحلیل کن. دقیقاً خروجی ۱ تا ۵ بده و سطح‌ها را مشخص کن.
 ` +
     `RULES: فقط فارسی، لحن افشاگر، خیال‌بافی نکن.
 `
@@ -5752,7 +5743,7 @@ async function api(path, body){
       const tm = setTimeout(() => ac.abort("timeout"), 12000 + (i * 4000));
       const r = await fetch(API_BASE + path, {
         method: "POST",
-        headers: {"content-type":"application/json", ...(window.__MQ_TOKEN ? { Authorization: `Bearer ${window.__MQ_TOKEN}` } : {})},
+        headers: {"content-type":"application/json", ...(window.__MQ_TOKEN ? { Authorization: "Bearer " + window.__MQ_TOKEN } : {})},
         credentials: "include",
         body: JSON.stringify(body),
         signal: ac.signal,
@@ -6769,7 +6760,7 @@ el("downloadReportPdf")?.addEventListener("click", async () => {
   try {
     showToast("در حال ساخت PDF…", "گزارش کامل", "PDF", true);
     const r = await fetch(API_BASE + "/api/admin/report/pdf", {      method: "POST",
-      headers: { "content-type": "application/json", ...(window.__MQ_TOKEN?{Authorization:`Bearer ${window.__MQ_TOKEN}`}:{}) },
+      headers: { "content-type": "application/json", ...(window.__MQ_TOKEN?{Authorization:"Bearer " + window.__MQ_TOKEN}:{}) },
       body: JSON.stringify({ initData: INIT_DATA, limit: 250 }),
     });
     if (!r.ok) throw new Error("http_" + r.status);
