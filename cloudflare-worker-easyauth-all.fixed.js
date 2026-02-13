@@ -1,233 +1,31 @@
+// @ts-nocheck
 export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
 
-      // ultra-light endpoints (no DB)
-      if (url.pathname === "/health") return new Response("ok", { status: 200 });
-      if (url.pathname === "/favicon.ico") return new Response("", { status: 204 });
-
-      
-function extractInitDataFromRequest(request) {
-  try {
-    const url = new URL(request.url);
-    // Accept initData via query for debugging: ?initData=...
-    const q = url.searchParams.get("initData") || url.searchParams.get("init_data");
-    if (q) return q;
-
-    // Accept via Authorization: Bearer <initData>
-    const auth = request.headers.get("authorization") || request.headers.get("Authorization");
-    if (auth) {
-      const m = auth.match(/^Bearer\s+(.+)$/i);
-      if (m && m[1]) return m[1].trim();
-    }
-
-    // Accept via custom header
-    const h = request.headers.get("x-telegram-initdata") || request.headers.get("x-initdata");
-    if (h) return String(h).trim();
-  } catch (_) {}
-  return "";
-}
-
-
-function parseCookies(header) {
-  const out = {};
-  if (!header) return out;
-  const parts = String(header).split(";");
-  for (const p of parts) {
-    const i = p.indexOf("=");
-    if (i === -1) continue;
-    const k = p.slice(0, i).trim();
-    const v = p.slice(i + 1).trim();
-    if (!k) continue;
-    out[k] = v;
-  }
-  return out;
-}
-
-function b64urlEncode(bytes) {
-  let bin = "";
-  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
-  return btoa(bin).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-}
-
-function b64urlDecodeToBytes(s) {
-  s = String(s || "").replace(/-/g, "+").replace(/_/g, "/");
-  while (s.length % 4) s += "=";
-  const bin = atob(s);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-async function hmacSha256(secret, data) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign", "verify"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
-  return new Uint8Array(sig);
-}
-
-async function makeSessionToken(payload, env) {
-  const secret = env.SESSION_SECRET || env.MINIAPP_SESSION_SECRET || "";
-  if (!secret) return "";
-  const header = { alg: "HS256", typ: "JWT" };
-  const enc = (o) => b64urlEncode(new TextEncoder().encode(JSON.stringify(o)));
-  const h = enc(header);
-  const p = enc(payload);
-  const data = `${h}.${p}`;
-  const sig = await hmacSha256(secret, data);
-  return `${data}.${b64urlEncode(sig)}`;
-}
-
-async function verifySessionToken(token, env) {
-  const secret = env.SESSION_SECRET || env.MINIAPP_SESSION_SECRET || "";
-  if (!secret) return { ok: false, reason: "no_session_secret" };
-  token = String(token || "").trim();
-  const parts = token.split(".");
-  if (parts.length !== 3) return { ok: false, reason: "bad_token" };
-  const [h, p, s] = parts;
-  const data = `${h}.${p}`;
-  let sig;
-  try { sig = b64urlDecodeToBytes(s); } catch (_) { return { ok: false, reason: "bad_token_sig" }; }
-
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["verify"]
-  );
-
-  const ok = await crypto.subtle.verify("HMAC", key, sig, new TextEncoder().encode(data));
-  if (!ok) return { ok: false, reason: "bad_token_sig" };
-
-  let payload;
-  try {
-    payload = JSON.parse(new TextDecoder().decode(b64urlDecodeToBytes(p)));
-  } catch (_) {
-    return { ok: false, reason: "bad_token_payload" };
-  }
-
-  const now = Math.floor(Date.now() / 1000);
-  if (payload?.exp && now > payload.exp) return { ok: false, reason: "token_expired" };
-  if (!payload?.uid) return { ok: false, reason: "token_missing_uid" };
-
-  return { ok: true, payload };
-}
-
-function extractSessionTokenFromRequest(request) {
-  // Authorization: Bearer <token>
-  const auth = request.headers.get("authorization") || request.headers.get("Authorization");
-  if (auth) {
-    const m = auth.match(/^Bearer\s+(.+)$/i);
-    if (m && m[1]) return m[1].trim();
-  }
-
-  // Cookie: mq_session=<token>
-  const cookies = parseCookies(request.headers.get("cookie") || request.headers.get("Cookie"));
-  if (cookies.mq_session) return cookies.mq_session;
-
-  // Custom header
-  const h = request.headers.get("x-session-token") || request.headers.get("x-mq-session");
-  if (h) return String(h).trim();
-
-  return "";
-}
-
-/**
- * Unified auth:
- * - Prefer session token (cookie/Bearer) if available
- * - Fallback to Telegram initData verification (body.initData OR request query/header)
- */
-async function authMiniappRequest(request, body, env) {
-  // 1) session token
-  const tok = extractSessionTokenFromRequest(request);
-  if (tok) {
-    const vt = await verifySessionToken(tok, env);
-    if (vt.ok) {
-      const pl = vt.payload;
-      const fromLike = {
-        id: pl.uid,
-        username: pl.un || "",
-        first_name: pl.fn || "",
-        last_name: pl.ln || "",
-      };
-      return { ok: true, userId: pl.uid, fromLike, via: "session" };
-    }
-  }
-
-  // 2) initData fallback
-  const initData = (body && body.initData) ? body.initData : extractInitDataFromRequest(request);
-  const v = await verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN, env);
-  if (!v.ok) return v;
-  return { ...v, via: "initData" };
-}
-
-function setSessionCookie(token, env) {
-  const maxAge = Number(env.SESSION_MAX_AGE || 7 * 24 * 3600);
-  // SameSite=None for Telegram in-app browser (cross-site contexts)
-  return `mq_session=${token}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=None`;
-}
-
-function clearSessionCookie() {
-  return `mq_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None`;
-}
-
-// load config from bot_db (cached)
-      env.__cfg = await loadMainConfig(env);
-
-      // ===== MINI APP (inline) =====
+      if (url.pathname === "/health") return new Response("ok", { status: 200 });      // ===== MINI APP (inline) =====
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "")) {
         return htmlResponse(MINI_APP_HTML);
       }
       if (request.method === "GET" && url.pathname === "/app.js") {
-        const js = MINI_APP_JS
-          .replace(/\\`/g, "`")
-          .replace(/\\\$\{/g, "${");
-        return jsResponse(js);
+        return jsResponse(MINI_APP_JS);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/auth/login") {
+        const body = await request.json().catch(() => ({}));
+        const v = await authMiniappRequest(request, body, env);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason || "unauthorized" }, 401);
+        const maxAge = Math.max(60, Number(env.SESSION_MAX_AGE || 604800));
+        const token = await makeSessionToken({ uid: String(v.userId), exp: Math.floor(Date.now()/1000) + maxAge, fromLike: v.fromLike || null }, env);
+        return new Response(JSON.stringify({ ok: true, token }), { status: 200, headers: { "content-type": "application/json; charset=utf-8", "set-cookie": buildSessionCookie(token, maxAge) } });
+      }
+      if (request.method === "POST" && url.pathname === "/api/auth/logout") {
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json; charset=utf-8", "set-cookie": clearSessionCookie() } });
       }
 
       // ===== MINI APP APIs =====
-      
-      // ===== AUTH (easy) =====
-      if (url.pathname === "/api/auth/login" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-
-        const v = await authMiniappRequest(request, body, env);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
-
-        const now = Math.floor(Date.now() / 1000);
-        const maxAge = Number(env.SESSION_MAX_AGE || 7 * 24 * 3600);
-        const payload = {
-          uid: v.userId,
-          un: v.fromLike?.username || "",
-          fn: v.fromLike?.first_name || "",
-          ln: v.fromLike?.last_name || "",
-          iat: now,
-          exp: now + maxAge,
-        };
-
-        const token = await makeSessionToken(payload, env);
-        const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
-        if (token) headers.set("set-cookie", setSessionCookie(token, env));
-
-        return new Response(JSON.stringify({ ok: true, token: token || "" }), { status: 200, headers });
-      }
-
-      if (url.pathname === "/api/auth/logout" && request.method === "POST") {
-        const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
-        headers.set("set-cookie", clearSessionCookie());
-        return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
-      }
-
-if (url.pathname === "/api/user" && request.method === "POST") {
+      if (url.pathname === "/api/user" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
         const v = await authMiniappRequest(request, body, env);
@@ -236,24 +34,24 @@ if (url.pathname === "/api/user" && request.method === "POST") {
         const st = await ensureUser(v.userId, env);
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
         const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
-        const marketSymbols = { forex: MAJORS, metals: METALS, indices: INDICES, crypto: CRYPTOS };
-
-        const cfg = cfgOf(env);
-        const styles = (cfg?.styles && Array.isArray(cfg.styles) && cfg.styles.length)
-          ? cfg.styles.filter(s => s && s.enabled !== false).map(s => String(s.label || "").trim()).filter(Boolean)
-          : Object.keys(STYLE_ANALYSIS_PROMPTS_DEFAULT || {});
+        const styles = await getStyleList(env);
+        const offerBanner = await getOfferBanner(env);
+        const customPrompts = await getCustomPrompts(env);
+        const role = isOwner(v.fromLike, env) ? "owner" : (isAdmin(v.fromLike, env) ? "admin" : "user");
 
         return jsonResponse({
           ok: true,
-          welcome: WELCOME_MINIAPP,
+          welcome: await getMiniappWelcomeText(env),
           state: st,
           quota,
           symbols,
-          marketSymbols,
           styles,
-          isAdmin: isAdmin(v.fromLike, env) || isStaff(v.fromLike, env),
-          walletAddress: (await getWallet(env)) || "",
-          subPlans: getSubPlans(env),
+          offerBanner,
+          customPrompts,
+          role,
+          isStaff: role !== "user",
+          wallet: (await getWallet(env)) || "",
+          botUsername: env.BOT_USERNAME ? String(env.BOT_USERNAME).replace(/^@/, "") : "",
         });
       }
 
@@ -268,346 +66,677 @@ if (url.pathname === "/api/user" && request.method === "POST") {
 
         // users can tweak only their preferences (admin-only prompt/wallet enforced elsewhere)
         if (typeof body.timeframe === "string") st.timeframe = body.timeframe;
-        if (typeof body.style === "string") st.style = normalizeStyleLabel(body.style);
+        if (typeof body.style === "string") {
+          const styles = await getStyleList(env);
+          if (styles.includes(body.style)) st.style = body.style;
+        }
         if (typeof body.risk === "string") st.risk = body.risk;
         if (typeof body.newsEnabled === "boolean") st.newsEnabled = body.newsEnabled;
+        if (typeof body.promptMode === "string") {
+          const pm = String(body.promptMode || "").trim();
+          const allowedPromptModes = ["style_only", "combined_all", "custom_only", "style_plus_custom"];
+          st.promptMode = allowedPromptModes.includes(pm) ? pm : (st.promptMode || "style_plus_custom");
+        }
+        if (typeof body.selectedSymbol === "string") {
+          const s = String(body.selectedSymbol || "").trim().toUpperCase();
+          if (!s || isSymbol(s)) st.selectedSymbol = s;
+        }
+        if (body.capitalAmount != null) {
+          const cap = Number(body.capitalAmount);
+          if (Number.isFinite(cap) && cap > 0) {
+            st.capital = st.capital || { amount: 0, enabled: true };
+            st.capital.amount = cap;
+          }
+        }
+        if (typeof body.customPromptId === "string") {
+          const prompts = await getCustomPrompts(env);
+          const id = body.customPromptId.trim();
+          st.customPromptId = prompts.find((p) => String(p?.id || "") === id) ? id : "";
+        }
 
-        if (getDB(env)) await saveUser(v.userId, st, env);
+        if (env.BOT_KV) await saveUser(v.userId, st, env);
 
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
         return jsonResponse({ ok: true, state: st, quota });
       }
 
-      // Wallet APIs (credit balance; manual/admin managed)
-      if (url.pathname === "/api/wallet/balance" && request.method === "POST") {
+      if (url.pathname.startsWith("/api/admin/") && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await authMiniappRequest(request, body, env);
+        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+        if (!isStaff(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
 
-        const st = await ensureUser(v.userId, env);
-        return jsonResponse({
-          ok: true,
-          balance: Number(st.wallet?.balance || 0),
-          currency: st.wallet?.currency || "USDT",
-          points: Number(st.referral?.points || 0),
-          subscription: st.subscription,
-          walletAddress: (await getWallet(env)) || "",
-          pendingSubTicket: st.subscription?.pendingTicket || "",
-        });
-      }
-
-      if (url.pathname === "/api/wallet/withdraw" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-
-        const v = await authMiniappRequest(request, body, env);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
-
-        const st = await ensureUser(v.userId, env);
-
-        const amount = Number(body.amount);
-        const address = String(body.address || "").trim();
-
-        if (!Number.isFinite(amount) || amount <= 0) return jsonResponse({ ok: false, error: "withdraw_bad_amount" }, 400);
-        if (!address) return jsonResponse({ ok: false, error: "withdraw_bad_address" }, 400);
-
-        if (Number(st.wallet?.balance || 0) < amount) {
-          return jsonResponse({ ok: false, error: "insufficient_funds" }, 400);
+        if (url.pathname === "/api/admin/bootstrap") {
+          const [prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals, tickets, adminFlags, welcomeBot, welcomeMiniapp] = await Promise.all([
+            getAnalysisPrompt(env),
+            getStyleList(env),
+            getCommissionSettings(env),
+            getOfferBanner(env),
+            listPayments(env, 25),
+            getStylePromptMap(env),
+            getCustomPrompts(env),
+            getFreeDailyLimit(env),
+            listWithdrawals(env, 100),
+            listSupportTickets(env, 100),
+            getAdminFlags(env),
+            getBotWelcomeText(env),
+            getMiniappWelcomeText(env),
+          ]);
+          return jsonResponse({ ok: true, prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals, tickets, adminFlags, welcomeBot, welcomeMiniapp });
         }
 
-        st.wallet.balance = Number(st.wallet.balance || 0) - amount;
-
-        const ticket = await createWithdrawTicket(env, {
-          userId: v.userId,
-          amount,
-          address,
-          from: v.fromLike,
-        });
-
-        await saveUser(v.userId, st, env);
-
-        return jsonResponse({
-          ok: true,
-          ticket,
-          balance: Number(st.wallet.balance || 0),
-          currency: st.wallet.currency || "USDT",
-        });
-      }
-
-      
-      // Subscription APIs (purchase request -> admin approve -> activate)
-      if (url.pathname === "/api/subscription/plans" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await authMiniappRequest(request, body, env);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
-        return jsonResponse({ ok: true, plans: getSubPlans(env) });
-      }
-
-      if (url.pathname === "/api/subscription/status" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await authMiniappRequest(request, body, env);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
-
-        const st = await ensureUser(v.userId, env);
-        let req = null;
-        if (st.subscription?.pendingTicket) req = await getSubRequest(env, st.subscription.pendingTicket);
-        return jsonResponse({ ok: true, subscription: st.subscription, pending: req || null });
-      }
-
-      if (url.pathname === "/api/subscription/request" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await authMiniappRequest(request, body, env);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
-
-        if (!getDB(env)) return jsonResponse({ ok: false, error: "kv_required" }, 500);
-
-        const st = await ensureUser(v.userId, env);
-        if (!st.profile?.name || !st.profile?.phone) return jsonResponse({ ok: false, error: "onboarding_required" }, 403);
-
-        if (st.subscription?.pendingTicket) {
-          return jsonResponse({ ok: false, error: "sub_pending_exists", ticket: st.subscription.pendingTicket }, 409);
+        if (url.pathname === "/api/admin/welcome") {
+          if (typeof body.welcomeBot === "string") await setBotWelcomeText(env, body.welcomeBot);
+          if (typeof body.welcomeMiniapp === "string") await setMiniappWelcomeText(env, body.welcomeMiniapp);
+          return jsonResponse({ ok: true, welcomeBot: await getBotWelcomeText(env), welcomeMiniapp: await getMiniappWelcomeText(env) });
         }
 
-        const plan = planFromLabel(env, body.planId);
-        if (!plan) return jsonResponse({ ok: false, error: "bad_plan" }, 400);
-
-        const payMethod = String(body.payMethod || "").trim(); // balance | txid
-        const txid = String(body.txid || "").trim();
-
-        const bal = Number(st.wallet?.balance || 0);
-        let paidFromBalance = false;
-
-        if (payMethod === "balance") {
-          if (bal < plan.price) return jsonResponse({ ok: false, error: "insufficient_funds" }, 400);
-          st.wallet.balance = bal - plan.price;
-          paidFromBalance = true;
-        } else {
-          if (!txid) return jsonResponse({ ok: false, error: "txid_required" }, 400);
-        }
-
-        const payload = {
-          userId: String(v.userId),
-          username: st.profile?.username || v.fromLike?.username || "",
-          planId: plan.id,
-          planTitle: plan.title,
-          planDays: plan.days,
-          dailyLimit: plan.dailyLimit,
-          amount: plan.price,
-          currency: plan.currency,
-          payMethod: paidFromBalance ? "balance" : "txid",
-          txid: paidFromBalance ? "" : txid,
-          paidFromBalance,
-        };
-
-        const ticket = await createSubTicket(env, payload);
-
-        st.subscription.pendingTicket = ticket;
-        st.subscription.pendingPlanId = plan.id;
-        st.subscription.pendingPayMethod = payload.payMethod;
-        st.subscription.pendingAmount = plan.price;
-        await saveUser(v.userId, st, env);
-
-        await notifyAdminsSubRequest(env, { ...payload, ticket });
-
-        return jsonResponse({ ok: true, ticket, balance: Number(st.wallet?.balance || 0), currency: st.wallet?.currency || "USDT" });
-      }
-
-
-      // ===== ADMIN APIs (MiniApp) =====
-      if (url.pathname === "/api/admin/config/get" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await authMiniappRequest(request, body, env);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
-
-        if (!(isAdmin(v.fromLike, env) || isStaff(v.fromLike, env))) return jsonResponse({ ok: false, error: "forbidden" }, 403);
-        const cfg = await loadMainConfig(env);
-        return jsonResponse({ ok: true, cfg });
-      }
-
-      if (url.pathname === "/api/admin/config/set" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await authMiniappRequest(request, body, env);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
-
-        if (!(isAdmin(v.fromLike, env) || isStaff(v.fromLike, env))) return jsonResponse({ ok: false, error: "forbidden" }, 403);
-        const db = getDB(env);
-        if (!db) return jsonResponse({ ok: false, error: "bot_db_missing" }, 500);
-
-        const current = await loadMainConfig(env);
-        const patch = body.patch || {};
-
-        const next = JSON.parse(JSON.stringify(current));
-
-        if (typeof patch.walletAddress === "string") next.walletAddress = patch.walletAddress.trim();
-
-        if (patch.limits && typeof patch.limits === "object") {
-          if (patch.limits.freeDailyLimit != null) next.limits.freeDailyLimit = toInt(patch.limits.freeDailyLimit, next.limits.freeDailyLimit);
-          if (patch.limits.premiumDailyLimit != null) next.limits.premiumDailyLimit = toInt(patch.limits.premiumDailyLimit, next.limits.premiumDailyLimit);
-        }
-
-        if (patch.commissions && typeof patch.commissions === "object") {
-          if (patch.commissions.globalPct != null) next.commissions.globalPct = Number(patch.commissions.globalPct);
-          if (patch.commissions.perUser && typeof patch.commissions.perUser === "object") {
-            const per = {};
-            for (const [k, v2] of Object.entries(patch.commissions.perUser)) {
-              const nk = normHandle(k);
-              const pv = Number(v2);
-              if (!nk || !Number.isFinite(pv)) continue;
-              per[nk] = pv;
-            }
-            next.commissions.perUser = { ...(next.commissions.perUser || {}), ...per };
+        if (url.pathname === "/api/admin/wallet") {
+          if (!isOwner(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+          if (!env.BOT_DB && !env.BOT_KV) return jsonResponse({ ok: false, error: "storage_missing" }, 500);
+          const wallet = typeof body.wallet === "string" ? body.wallet.trim() : null;
+          if (wallet !== null) {
+            await setWallet(env, wallet);
           }
+          return jsonResponse({ ok: true, wallet: await getWallet(env) });
+        }
+if (url.pathname === "/api/admin/tickets/list") {
+          const limit = Math.min(300, Math.max(1, Number(body.limit || 100)));
+          const tickets = await listSupportTickets(env, limit);
+          return jsonResponse({ ok: true, tickets });
         }
 
-        if (Array.isArray(patch.subPlans)) {
-          next.subPlans = patch.subPlans
-            .map(p => ({
-              id: String(p.id || "").trim(),
-              title: String(p.title || "").trim(),
-              days: toInt(p.days, 0),
-              price: Number(p.price),
-              currency: String(p.currency || current.subPlans?.[0]?.currency || "USDT").trim() || "USDT",
-              dailyLimit: toInt(p.dailyLimit, next.limits.premiumDailyLimit),
-            }))
-            .filter(p => p.id && p.title && p.days > 0 && Number.isFinite(p.price));
-        }
+        if (url.pathname === "/api/admin/tickets/update") {
+          const id = String(body.id || "").trim();
+          const status = String(body.status || "").trim();
+          const reply = String(body.reply || "").trim();
+          if (!id) return jsonResponse({ ok: false, error: "ticket_id_required" }, 400);
+          const allowed = ["pending", "answered", "closed"];
+          if (!allowed.includes(status)) return jsonResponse({ ok: false, error: "bad_status" }, 400);
 
-        if (Array.isArray(patch.styles)) {
-          next.styles = patch.styles.map(s => ({
-            id: String(s.id || stylePromptKey(s.label) || s.label || "").trim() || randomCode(8),
-            label: normalizeStyleLabel(s.label || ""),
-            enabled: s.enabled !== false,
-            prompt: String(s.prompt || "").trim(),
-          })).filter(s => s.label);
-        }
+          const nextStatus = reply ? (status === "pending" ? "answered" : status) : status;
 
-        const saved = await saveMainConfig(env, next);
-        return jsonResponse({ ok: true, cfg: saved });
-      }
-
-      if (url.pathname === "/api/admin/users/list" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await authMiniappRequest(request, body, env);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
-        if (!(isAdmin(v.fromLike, env) || isStaff(v.fromLike, env))) return jsonResponse({ ok: false, error: "forbidden" }, 403);
-
-        const db = getDB(env);
-        if (!db || typeof db.list !== "function") return jsonResponse({ ok: false, error: "list_not_supported" }, 500);
-
-        const limit = Math.min(50, Math.max(1, toInt(body.limit, 20)));
-        const cursor = body.cursor ? String(body.cursor) : undefined;
-
-        const res = await db.list({ prefix: "u:", limit, cursor });
-        const keys = res?.keys || [];
-        const users = [];
-
-        for (const k of keys) {
-          const raw = await db.get(k.name);
-          if (!raw) continue;
+          let updated = null;
           try {
-            const u = JSON.parse(raw);
-            users.push({
-              userId: u.userId,
-              name: u?.profile?.name || "",
-              username: u?.profile?.username || "",
-              phone: u?.profile?.phone || "",
-              dailyUsed: u.dailyUsed || 0,
-              dailyLimit: dailyLimit(env, u),
-              points: u?.referral?.points || 0,
-              invites: u?.referral?.successfulInvites || 0,
-              subscription: u?.subscription || {},
-              wallet: u?.wallet || {},
+            updated = await updateSupportTicket(env, id, {
+              status: nextStatus,
+              reply: reply || undefined,
+              updatedBy: normHandle(v.fromLike?.username),
             });
-          } catch {}
+          } catch (e) {
+            const msg = String(e?.message || e || "update_failed");
+            const http = msg.includes("not_found") ? 404 : 500;
+            return jsonResponse({ ok: false, error: msg }, http);
+          }
+
+          if (reply && updated?.userId) {
+            const chat = Number(updated.userId);
+            if (chat) {
+              const who = updated.username ? ("@" + String(updated.username).replace(/^@/, "")) : updated.userId;
+              const msg = `📩 پاسخ پشتیبانی
+
+شناسه تیکت: ${updated.id}
+کاربر: ${who}
+
+${reply}`;
+              await tgSendMessage(env, chat, msg);
+            }
+          }
+
+          return jsonResponse({ ok: true, ticket: updated });
         }
 
-        return jsonResponse({ ok: true, users, cursor: res?.cursor || null, listComplete: Boolean(res?.list_complete) });
-      }
-
-      if (url.pathname === "/api/admin/sub/pending" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await authMiniappRequest(request, body, env);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
-        if (!(isAdmin(v.fromLike, env) || isStaff(v.fromLike, env))) return jsonResponse({ ok: false, error: "forbidden" }, 403);
-
-        const db = getDB(env);
-        if (!db || typeof db.list !== "function") return jsonResponse({ ok: false, error: "list_not_supported" }, 500);
-
-        const res = await db.list({ prefix: "subreq:", limit: 50 });
-        const keys = res?.keys || [];
-        const items = [];
-        for (const k of keys) {
-          const ticket = String(k.name || "").replace("subreq:", "");
-          const req = await getSubRequest(env, ticket);
-          if (req && req.status === "pending") items.push(req);
+        if (url.pathname === "/api/admin/prompt") {
+          if (typeof body.prompt === "string") {
+            await setAnalysisPrompt(env, body.prompt);
+          }
+          const prompt = await getAnalysisPrompt(env);
+          return jsonResponse({ ok: true, prompt });
         }
-        // newest first
-        items.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
-        return jsonResponse({ ok: true, items });
-      }
-
-      if (url.pathname === "/api/admin/sub/approve" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await authMiniappRequest(request, body, env);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
-        if (!(isAdmin(v.fromLike, env) || isStaff(v.fromLike, env))) return jsonResponse({ ok: false, error: "forbidden" }, 403);
-
-        const ticket = String(body.ticket || "").trim();
-        if (!ticket) return jsonResponse({ ok: false, error: "bad_ticket" }, 400);
-
-        const r = await adminApproveSub(env, ticket, v.fromLike);
-        if (!r.ok) return jsonResponse({ ok: false, error: r.error || "failed" }, 400);
-        return jsonResponse({ ok: true, ...r });
-      }
-
-      if (url.pathname === "/api/admin/sub/reject" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await authMiniappRequest(request, body, env);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
-        if (!(isAdmin(v.fromLike, env) || isStaff(v.fromLike, env))) return jsonResponse({ ok: false, error: "forbidden" }, 403);
-
-        const ticket = String(body.ticket || "").trim();
-        if (!ticket) return jsonResponse({ ok: false, error: "bad_ticket" }, 400);
-        const reason = String(body.reason || "رد شد").trim();
-
-        const r = await adminRejectSub(env, ticket, v.fromLike, reason);
-        if (!r.ok) return jsonResponse({ ok: false, error: r.error || "failed" }, 400);
-        return jsonResponse({ ok: true, ...r });
-      }
-
-      if (url.pathname === "/api/admin/withdraw/list" && request.method === "POST") {
-        const body = await request.json().catch(() => null);
-        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await authMiniappRequest(request, body, env);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
-        if (!(isAdmin(v.fromLike, env) || isStaff(v.fromLike, env))) return jsonResponse({ ok: false, error: "forbidden" }, 403);
-
-        const db = getDB(env);
-        if (!db || typeof db.list !== "function") return jsonResponse({ ok: false, error: "list_not_supported" }, 500);
-
-        const res = await db.list({ prefix: "wd:", limit: 50 });
-        const keys = res?.keys || [];
-        const items = [];
-        for (const k of keys) {
-          const raw = await db.get(k.name);
-          if (!raw) continue;
-          try { items.push(JSON.parse(raw)); } catch {}
+if (url.pathname === "/api/admin/styles") {
+          const list = await getStyleList(env);
+          const action = String(body.action || "");
+          const style = String(body.style || "").trim();
+          let next = list.slice();
+          if (action === "add" && style) {
+            if (ALLOWED_STYLE_LIST.includes(style) && !next.includes(style)) next.push(style);
+          } else if (action === "remove" && style) {
+            next = next.filter((s) => s !== style);
+          }
+          if (env.BOT_KV) await setStyleList(env, next);
+          return jsonResponse({ ok: true, styles: await getStyleList(env) });
         }
-        items.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
-        return jsonResponse({ ok: true, items });
+
+        if (url.pathname === "/api/admin/style-prompts") {
+          const map = await getStylePromptMap(env);
+          if (typeof body.stylePrompts === "object" && body.stylePrompts) {
+            await setStylePromptMap(env, body.stylePrompts);
+          }
+          return jsonResponse({ ok: true, stylePrompts: await getStylePromptMap(env) });
+        }
+
+        if (url.pathname === "/api/admin/custom-prompts") {
+          if (Array.isArray(body.customPrompts)) {
+            await setCustomPrompts(env, body.customPrompts);
+          }
+          return jsonResponse({ ok: true, customPrompts: await getCustomPrompts(env) });
+        }
+
+        if (url.pathname === "/api/admin/free-limit") {
+          const limit = toInt(body.limit, 3);
+          await setFreeDailyLimit(env, limit);
+          return jsonResponse({ ok: true, freeDailyLimit: await getFreeDailyLimit(env) });
+        }
+
+        if (url.pathname === "/api/admin/features") {
+          if (!isOwner(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+          const flags = await getAdminFlags(env);
+          if (typeof body.capitalModeEnabled === "boolean") flags.capitalModeEnabled = body.capitalModeEnabled;
+          if (typeof body.profileTipsEnabled === "boolean") flags.profileTipsEnabled = body.profileTipsEnabled;
+          await setAdminFlags(env, flags);
+          return jsonResponse({ ok: true, adminFlags: await getAdminFlags(env) });
+        }
+
+
+        if (url.pathname === "/api/admin/offer") {
+          if (typeof body.offerBanner === "string") {
+            await setOfferBanner(env, body.offerBanner);
+          }
+          return jsonResponse({ ok: true, offerBanner: await getOfferBanner(env) });
+        }
+if (url.pathname === "/api/admin/commissions") {
+          const settings = await getCommissionSettings(env);
+          const action = String(body.action || "");
+          if (action === "setGlobal" && Number.isFinite(Number(body.percent))) {
+            settings.globalPercent = Number(body.percent);
+          }
+          if (action === "setOverride") {
+            const handle = normHandle(body.username);
+            const pct = Number(body.percent);
+            if (handle && Number.isFinite(pct)) settings.overrides[handle] = pct;
+          }
+          if (action === "removeOverride") {
+            const handle = normHandle(body.username);
+            if (handle) delete settings.overrides[handle];
+          }
+          await setCommissionSettings(env, settings);
+          return jsonResponse({ ok: true, commission: await getCommissionSettings(env) });
+        }
+
+        if (url.pathname === "/api/admin/users") {
+          if (!isOwner(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+          const users = await listUsers(env, Number(body.limit || 100));
+          const now = Date.now();
+          const report = users.map((u) => {
+            const createdAt = u.createdAt || "";
+            const usageDays = createdAt ? Math.max(1, Math.ceil((now - Date.parse(createdAt)) / (24 * 3600 * 1000))) : 0;
+            const lastTx = Array.isArray(u.wallet?.transactions) ? u.wallet.transactions[u.wallet.transactions.length - 1] : null;
+            return {
+              userId: u.userId,
+              username: u.profile?.username || "",
+              phone: u.profile?.phone || "",
+              createdAt,
+              usageDays,
+              totalAnalyses: u.stats?.successfulAnalyses || 0,
+              lastAnalysisAt: u.stats?.lastAnalysisAt || "",
+              paymentCount: u.stats?.totalPayments || 0,
+              paymentTotal: u.stats?.totalPaymentAmount || 0,
+              lastTxHash: lastTx?.txHash || "",
+              referralBy: u.referral?.referredBy || "",
+              referralInvites: u.referral?.successfulInvites || 0,
+              subscriptionActive: !!u.subscription?.active,
+              subscriptionType: u.subscription?.type || "free",
+              subscriptionExpiresAt: u.subscription?.expiresAt || "",
+              dailyLimit: dailyLimit(env, u),
+              dailyUsed: u.dailyUsed || 0,
+              customPromptId: u.customPromptId || "",
+            };
+          });
+          return jsonResponse({ ok: true, users: report });
+        }
+
+        if (url.pathname === "/api/admin/report/pdf") {
+          if (!isOwner(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+          const users = await listUsers(env, Math.min(300, Math.max(1, Number(body.limit || 200))));
+          const payments = await listPayments(env, 120);
+          const withdrawals = await listWithdrawals(env, 120);
+          const tickets = await listSupportTickets(env, 120);
+          const lines = buildAdminReportLines(env, users, payments, withdrawals, tickets);
+          const pdfBytes = buildSimplePdfFromText(lines.join("\n"));
+          return new Response(pdfBytes, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/pdf",
+              "Content-Disposition": `attachment; filename=admin-report-${Date.now()}.pdf`,
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        if (url.pathname === "/api/admin/payments/list") {
+          return jsonResponse({ ok: true, payments: await listPayments(env, 100) });
+        }
+        if (url.pathname === "/api/admin/capital/toggle") {
+          const username = String(body.username || "").trim();
+          const enabled = !!body.enabled;
+          const userId = await getUserIdByUsername(env, username);
+          if (!userId) return jsonResponse({ ok: false, error: "user_not_found" }, 404);
+          const st = await ensureUser(userId, env);
+          st.capital = st.capital || { amount: 0, enabled: true };
+          st.capital.enabled = enabled;
+          await saveUser(userId, st, env);
+          return jsonResponse({ ok: true, capital: st.capital });
+        }
+
+
+        if (url.pathname === "/api/admin/withdrawals/list") {
+          const withdrawals = await listWithdrawals(env, 200);
+          return jsonResponse({ ok: true, withdrawals });
+        }
+
+        if (url.pathname === "/api/admin/withdrawals/review") {
+          const id = String(body.id || "").trim();
+          const decision = String(body.decision || "").trim();
+          const txHash = String(body.txHash || "").trim();
+          if (!id || !["approved","rejected"].includes(decision)) return jsonResponse({ ok: false, error: "bad_request" }, 400);
+          const updated = await reviewWithdrawal(env, id, decision, txHash, v.fromLike);
+          return jsonResponse({ ok: true, withdrawal: updated });
+        }
+
+        if (url.pathname === "/api/admin/payments/decision") {
+          const paymentId = String(body.paymentId || "").trim();
+          const status = String(body.status || "").trim() === "approved" ? "approved" : "rejected";
+          const raw = env.BOT_KV ? await env.BOT_KV.get(`payment:${paymentId}`) : "";
+          if (!raw) return jsonResponse({ ok: false, error: "payment_not_found" }, 404);
+          let payment = null;
+          try { payment = JSON.parse(raw); } catch {}
+          if (!payment) return jsonResponse({ ok: false, error: "payment_bad_json" }, 500);
+          payment.status = status;
+          payment.reviewedAt = new Date().toISOString();
+          payment.reviewedBy = normHandle(v.fromLike?.username);
+          if (env.BOT_KV) await env.BOT_KV.put(`payment:${paymentId}`, JSON.stringify(payment));
+          return jsonResponse({ ok: true, payment });
+        }
+
+        // Backward-compat alias for older admin clients
+        if (url.pathname === "/api/admin/withdrawals/decision") {
+          const id = String(body.withdrawalId || body.id || "").trim();
+          const decisionRaw = String(body.status || body.decision || "").trim();
+          const decision = decisionRaw === "approved" ? "approved" : (decisionRaw === "rejected" ? "rejected" : "");
+          const txHash = String(body.txHash || "").trim();
+          if (!id || !decision) return jsonResponse({ ok: false, error: "bad_request" }, 400);
+          const updated = await reviewWithdrawal(env, id, decision, txHash, v.fromLike);
+          return jsonResponse({ ok: true, withdrawal: updated });
+        }
+
+
+
+        if (url.pathname === "/api/admin/payments/approve") {
+          const username = String(body.username || "").trim();
+          const userId = await getUserIdByUsername(env, username);
+          if (!userId) return jsonResponse({ ok: false, error: "user_not_found" }, 404);
+
+          const st = await ensureUser(userId, env);
+          const amountN = Number(body.amount);
+        const amount = (Number.isFinite(amountN) && amountN > 0) ? amountN : 25;
+          const days = toInt(body.days, 30);
+          const txHash = String(body.txHash || "").trim();
+          const premiumLimit = toInt(env.PREMIUM_DAILY_LIMIT, 50);
+          const now = new Date().toISOString();
+          const payment = {
+            id: `pay_${Date.now()}_${userId}`,
+            userId,
+            username,
+            amount,
+            txHash,
+            status: "approved",
+            createdAt: now,
+            approvedAt: now,
+            approvedBy: normHandle(v.fromLike?.username),
+          };
+
+          st.subscription.active = true;
+          st.subscription.type = "premium";
+          st.subscription.dailyLimit = premiumLimit;
+          st.subscription.expiresAt = futureISO(days);
+          st.stats.totalPayments = (st.stats.totalPayments || 0) + 1;
+          st.stats.totalPaymentAmount = (st.stats.totalPaymentAmount || 0) + amount;
+          st.wallet.transactions = Array.isArray(st.wallet.transactions) ? st.wallet.transactions : [];
+          if (txHash) {
+            st.wallet.transactions.push({ txHash, amount, createdAt: now });
+            st.wallet.transactions = st.wallet.transactions.slice(-10);
+          }
+
+          if (st.referral?.referredBy) {
+            const inviter = await ensureUser(String(st.referral.referredBy), env);
+            const commission = await getCommissionSettings(env);
+            const pct = resolveCommissionPercent(inviter.profile?.username, commission);
+            const reward = pct > 0 ? Math.round((amount * (pct / 100)) * 100) / 100 : 0;
+            inviter.referral.commissionTotal = (inviter.referral.commissionTotal || 0) + reward;
+            inviter.referral.commissionBalance = (inviter.referral.commissionBalance || 0) + reward;
+            await saveUser(inviter.userId, inviter, env);
+            payment.commission = { inviterId: inviter.userId, percent: pct, amount: reward };
+          }
+
+          await saveUser(userId, st, env);
+          await storePayment(env, payment);
+          return jsonResponse({ ok: true, payment, subscription: st.subscription });
+        }
+
+        if (url.pathname === "/api/admin/subscription/activate") {
+          const username = String(body.username || "").trim();
+          const userId = await getUserIdByUsername(env, username);
+          if (!userId) return jsonResponse({ ok: false, error: "user_not_found" }, 404);
+          const st = await ensureUser(userId, env);
+          const days = toInt(body.days, 30);
+          const premiumLimit = toInt(body.dailyLimit, toInt(env.PREMIUM_DAILY_LIMIT, 50));
+          st.subscription.active = true;
+          st.subscription.type = "manual";
+          st.subscription.dailyLimit = premiumLimit;
+          st.subscription.expiresAt = futureISO(days);
+          await saveUser(userId, st, env);
+          return jsonResponse({ ok: true, subscription: st.subscription });
+        }
+
+        if (url.pathname === "/api/admin/custom-prompts/requests") {
+          if (String(body.action || "") === "decide") {
+            const requestId = String(body.requestId || "").trim();
+            const statusRaw = String(body.status || "").trim();
+            const status = statusRaw === "approved" ? "approved" : "rejected";
+            const promptId = String(body.promptId || "").trim();
+
+            const requests = await listCustomPromptRequests(env, 200);
+            const req = requests.find((x) => x.id === requestId);
+            if (!req) return jsonResponse({ ok: false, error: "request_not_found" }, 404);
+
+            req.status = status;
+            if (status === "approved") {
+              req.promptId = promptId || req.promptId || "";
+              if (!req.promptId) return jsonResponse({ ok: false, error: "prompt_id_required" }, 400);
+            } else {
+              req.promptId = "";
+            }
+
+            req.decidedAt = new Date().toISOString();
+            req.decidedBy = normHandle(v.fromLike?.username);
+
+            await storeCustomPromptRequest(env, req);
+
+            if (req.status === "approved") {
+              const st = await ensureUser(req.userId, env);
+              st.customPromptId = String(req.promptId);
+              await saveUser(req.userId, st, env);
+            }
+
+            // notify user
+            const chat = Number(req.userId);
+            if (chat) {
+              const msg = req.status === "approved"
+                ? `✅ درخواست پرامپت اختصاصی شما تایید شد.
+
+شناسه پرامپت: ${req.promptId}
+
+از منوی تنظیمات می‌تونی پرامپت اختصاصی رو انتخاب کنی.`
+                : `❌ درخواست پرامپت اختصاصی شما رد شد.
+
+اگر سوالی داری، از بخش پشتیبانی تیکت بزن.`;
+              await tgSendMessage(env, chat, msg);
+            }
+
+            return jsonResponse({ ok: true, request: req });
+          }
+          return jsonResponse({ ok: true, requests: await listCustomPromptRequests(env, 200) });
+        }
+
+        if (url.pathname === "/api/admin/custom-prompts/send") {
+          const username = String(body.username || "").trim();
+          const promptId = String(body.promptId || "").trim();
+          const userId = await getUserIdByUsername(env, username);
+          if (!userId) return jsonResponse({ ok: false, error: "user_not_found" }, 404);
+          const prompts = await getCustomPrompts(env);
+          const match = prompts.find((p) => String(p?.id || "") === promptId);
+          if (!match) return jsonResponse({ ok: false, error: "prompt_not_found" }, 404);
+          await tgSendMessage(env, userId, `📌 پرامپت اختصاصی فعال شد:\n${match.title || match.id}\n\n${match.text || ""}`, mainMenuKeyboard(env));
+          return jsonResponse({ ok: true });
+        }
+
+        if (url.pathname === "/api/admin/payments/check") {
+          const payload = {
+            txHash: String(body.txHash || "").trim(),
+            address: String(body.address || "").trim(),
+            amount: Number(body.amount || 0),
+          };
+          const result = await verifyBlockchainPayment(payload, env);
+          return jsonResponse({ ok: true, result });
+        }
       }
-if (url.pathname === "/api/analyze" && request.method === "POST") {
+
+      if (url.pathname === "/api/support/ticket" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
+        const v = await authMiniappRequest(request, body, env);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
+        const st = await ensureUser(v.userId, env);
+        const text = String(body.text || "").trim();
+        const kind = String(body.kind || "general").trim();
+        if (text.length < 4) return jsonResponse({ ok: false, error: "ticket_too_short" }, 400);
+
+        const ticket = {
+          id: `t_${Date.now()}_${st.userId}`,
+          userId: String(st.userId),
+          username: st.profile?.username || "",
+          phone: st.profile?.phone || "",
+          text,
+          kind,
+          status: "pending",
+          createdAt: new Date().toISOString(),
+        };
+        await storeSupportTicket(env, ticket);
+
+        const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+        if (supportChatId) {
+          await tgSendMessage(env, supportChatId, `📩 تیکت جدید
+شناسه: ${ticket.id}
+نوع: ${kind}
+کاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}
+شماره: ${st.profile?.phone || "-"}
+متن:
+${text}`);
+        }
+
+
+        return jsonResponse({ ok: true, ticket, supportNotified: !!supportChatId });
+      }
+
+      if (url.pathname === "/api/wallet/deposit/notify" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+        const v = await authMiniappRequest(request, body, env);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
+        const st = await ensureUser(v.userId, env);
+        const txid = String(body.txid || body.txHash || "").trim();
+        const amountN = Number(body.amount);
+        const amount = (Number.isFinite(amountN) && amountN > 0) ? amountN : 25;
+        if (!txid) return jsonResponse({ ok: false, error: "txid_required" }, 400);
+
+        const payment = {
+          id: `dep_${Date.now()}_${st.userId}`,
+          userId: String(st.userId),
+          username: st.profile?.username || "",
+          amount,
+          txHash: txid,
+          status: "pending",
+          createdAt: new Date().toISOString(),
+          source: "user_txid",
+          planName: String(body.planName || "marketi1 PRO"),
+          network: String(body.network || "BEP20"),
+          currency: "USDT",
+        };
+        await storePayment(env, payment);
+
+        const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+        if (supportChatId) {
+          await tgSendMessage(env, supportChatId, `💳 درخواست واریز جدید
+کاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}
+TxID: ${txid}
+مبلغ: ${amount || "-"}
+شبکه: BEP20
+وضعیت: pending`);
+        }
+
+
+        return jsonResponse({ ok: true, payment, supportNotified: !!supportChatId });
+      }
+
+      if (url.pathname === "/api/chart" && request.method === "GET") {
+        const symbol = String(url.searchParams.get("symbol") || "").trim().toUpperCase();
+        const tf = String(url.searchParams.get("tf") || "H4").trim().toUpperCase();
+        const levelsRaw = String(url.searchParams.get("levels") || "").trim();
+        const levels = levelsRaw
+          ? levelsRaw.split(",").map((x) => Number(x)).filter((n) => Number.isFinite(n)).slice(0, 6)
+          : [];
+
+        if (!symbol || !isSymbol(symbol)) {
+          return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
+        }
+
+        let candles = [];
+        try {
+          candles = await getMarketCandlesWithFallback(env, symbol, tf);
+        } catch (e) {
+          console.error("api/chart market fallback failed:", e?.message || e);
+          candles = [];
+        }
+
+        if (!Array.isArray(candles) || candles.length === 0) {
+          const cacheKey = marketCacheKey(symbol, tf);
+          candles = await getMarketCacheStale(env, cacheKey);
+        }
+
+        if (!Array.isArray(candles) || candles.length === 0) {
+          return jsonResponse({ ok: false, error: "no_market_data" }, 404);
+        }
+
+        try {
+          const png = await renderQuickChartPng(env, candles, symbol, tf, levels);
+          return new Response(png, {
+            status: 200,
+            headers: {
+              "Content-Type": "image/png",
+              "Cache-Control": "public, max-age=60",
+            },
+          });
+        } catch (e) {
+          console.error("api/chart quickchart render failed:", e?.message || e);
+          const autoLevels = (Array.isArray(levels) && levels.length)
+            ? levels
+            : extractLevelsFromCandles(candles);
+          const svg = buildLevelsOnlySvg(symbol, tf, autoLevels);
+          return new Response(svg, {
+            status: 200,
+            headers: {
+              "Content-Type": "image/svg+xml; charset=utf-8",
+              "Cache-Control": "public, max-age=30",
+              "X-Chart-Fallback": "internal_svg",
+            },
+          });
+        }
+      }
+
+      if (url.pathname === "/api/quote" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
+        const v = await authMiniappRequest(request, body, env);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
+        const st = await ensureUser(v.userId, env);
+        const symbol = String(body.symbol || "").trim();
+        const tf = String(body.timeframe || st.timeframe || "H4").toUpperCase();
+        if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
+
+        let candles = [];
+        try {
+          candles = await getMarketCandlesWithFallback(env, symbol, tf);
+        } catch (e) {
+          console.error("api/quote market fallback failed:", e?.message || e);
+          candles = [];
+        }
+        if (!Array.isArray(candles) || !candles.length) {
+          candles = await getMarketCacheStale(env, marketCacheKey(symbol, tf));
+        }
+        if (!Array.isArray(candles) || !candles.length) {
+          return jsonResponse({ ok: false, error: "quote_unavailable" }, 404);
+        }
+
+        const snap = computeSnapshot(candles);
+        if (!snap || !Number.isFinite(Number(snap.lastPrice))) {
+          return jsonResponse({ ok: false, error: "quote_bad_data" }, 502);
+        }
+        const cp = Number(snap.changePct || 0);
+        const status = cp > 0.08 ? "up" : (cp < -0.08 ? "down" : "flat");
+        const quality = candles.length >= minCandlesForTimeframe(tf) ? "full" : "limited";
+
+        return jsonResponse({
+          ok: true,
+          symbol,
+          timeframe: tf,
+          price: Number(snap.lastPrice),
+          changePct: cp,
+          trend: snap.trend || "نامشخص",
+          sma20: snap.sma20,
+          sma50: snap.sma50,
+          lastTs: snap.lastTs,
+          candles: candles.length,
+          quality,
+          status,
+        });
+      }
+
+      if (url.pathname === "/api/news" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
+        const v = await authMiniappRequest(request, body, env);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
+        const symbol = String(body.symbol || "").trim().toUpperCase();
+        if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
+
+        try {
+          const articles = await fetchSymbolNewsFa(symbol, env);
+          return jsonResponse({ ok: true, symbol, articles, count: articles.length });
+        } catch (e) {
+          console.error("api/news failed:", e?.message || e);
+          return jsonResponse({ ok: false, error: "news_unavailable", symbol, articles: [] }, 502);
+        }
+      }
+
+      if (url.pathname === "/api/news/analyze" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
+
+        const v = await authMiniappRequest(request, body, env);
+        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+
+        const symbol = String(body.symbol || "").trim().toUpperCase();
+        if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
+
+        try {
+          const articles = await fetchSymbolNewsFa(symbol, env);
+          const summary = await buildNewsAnalysisSummary(symbol, articles, env);
+          return jsonResponse({ ok: true, symbol, summary, articles, count: articles.length });
+        } catch (e) {
+          console.error("api/news/analyze failed:", e?.message || e);
+          return jsonResponse({ ok: false, error: "news_analysis_unavailable", symbol, summary: "", articles: [] }, 502);
+        }
+      }
+      if (url.pathname === "/api/analyze" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
@@ -623,29 +752,53 @@ if (url.pathname === "/api/analyze" && request.method === "POST") {
           return jsonResponse({ ok: false, error: "onboarding_required" }, 403);
         }
 
-        if (getDB(env) && !canAnalyzeToday(st, v.fromLike, env)) {
+        if (env.BOT_KV && !canAnalyzeToday(st, v.fromLike, env)) {
           const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
           return jsonResponse({ ok: false, error: `quota_exceeded_${quota}` }, 429);
         }
 
-        if (getDB(env)) {
-          consumeDaily(st, v.fromLike, env);
-          await saveUser(v.userId, st, env);
-        }
-
         const userPrompt = typeof body.userPrompt === "string" ? body.userPrompt : "";
 
-// Optional per-request overrides (MiniApp wizard / quick analysis)
-const overrides = {};
-if (typeof body.timeframe === "string" && ["M15","H1","H4","D1"].includes(body.timeframe)) overrides.timeframe = body.timeframe;
-if (typeof body.style === "string") overrides.style = body.style;
-
         try {
-          const r = await runSignalTextFlowCompute(env, v.fromLike, st, symbol, userPrompt, overrides);
-          const result = r.text;
-          const chartUrl = r.chartUrl; 
+          const flowTimeoutMs = Math.max(15000, Number(env.SIGNAL_FLOW_TIMEOUT_MS || 70000));
+          const result = await Promise.race([
+            runSignalTextFlowReturnText(env, v.fromLike, st, symbol, userPrompt),
+            timeoutPromise(flowTimeoutMs, "api_analyze_timeout"),
+          ]);
+          if (env.BOT_KV) {
+            consumeDaily(st, v.fromLike, env);
+            recordAnalysisSuccess(st);
+            await saveUser(v.userId, st, env);
+          }
           const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
-          return jsonResponse({ ok: true, result, chartUrl, state: st, quota });
+          let chartUrl = "";
+          let levels = [];
+          let quickChartSpec = null;
+          let zonesSvg = "";
+          try {
+            if (String(env.QUICKCHART || "") !== "0") {
+              const tf = st.timeframe || "H4";
+              levels = extractLevels(result);
+              const origin = new URL(request.url).origin;
+              const candles = await getMarketCandlesWithFallback(env, symbol, tf).catch(() => []);
+              if (Array.isArray(candles) && candles.length) {
+                chartUrl = `${origin}/api/chart?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&levels=${encodeURIComponent(levels.join(","))}`;
+                quickChartSpec = buildQuickChartSpec(candles, symbol, tf, levels);
+              } else if (levels.length) {
+                chartUrl = buildQuickChartLevelsOnlyUrl(symbol, tf, levels);
+                quickChartSpec = { fallback: "levels_only", symbol, timeframe: tf, levels };
+              }
+            }
+          } catch (e) {
+            console.error("chartUrl build error:", e?.message || e);
+          }
+          try {
+            zonesSvg = buildZonesSvgFromAnalysis(result, symbol, st.timeframe || "H4");
+          } catch (e) {
+            console.error("zones svg build error:", e?.message || e);
+          }
+          const quickchartConfig = { symbol, timeframe: st.timeframe || "H4", levels };
+          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec, quickchartConfig, zonesSvg });
         } catch (e) {
           console.error("api/analyze error:", e);
           return jsonResponse({ ok: false, error: "server_error" }, 500);
@@ -673,6 +826,13 @@ if (typeof body.style === "string") overrides.style = body.style;
       console.error("fetch error:", e);
       return new Response("error", { status: 500 });
     }
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil((async () => {
+      try { await runDailySuggestions(env); } catch (e) { console.error("runDailySuggestions error:", e); }
+      try { await runDailyProfileNotifications(env); } catch (e) { console.error("runDailyProfileNotifications error:", e); }
+    })());
   },
 };
 
@@ -737,12 +897,22 @@ const BTN = {
   SIGNAL: "📈 سیگنال‌ها",
   SETTINGS: "⚙️ تنظیمات",
   PROFILE: "👤 پروفایل",
+  INVITE: "🤝 دعوت",
   SUPPORT: "🆘 پشتیبانی",
+  SUPPORT_TICKET: "✉️ ارسال تیکت",
+  SUPPORT_FAQ: "❓ سوالات آماده",
+  SUPPORT_CUSTOM_PROMPT: "🧠 درخواست پرامپت اختصاصی",
   EDUCATION: "📚 آموزش",
   LEVELING: "🧪 تعیین سطح",
   BACK: "⬅️ برگشت",
   HOME: "🏠 منوی اصلی",
   MINIAPP: "🧩 مینی‌اپ",
+
+  WALLET: "💳 ولت",
+  WALLET_BALANCE: "💰 موجودی",
+  WALLET_DEPOSIT: "➕ واریز",
+  WALLET_WITHDRAW: "➖ برداشت",
+  WALLET_HISTORY: "📜 تاریخچه تراکنشات",
 
   CAT_MAJORS: "💱 ماجورها",
   CAT_METALS: "🪙 فلزات",
@@ -753,21 +923,15 @@ const BTN = {
   SET_STYLE: "🎯 سبک",
   SET_RISK: "⚠️ ریسک",
   SET_NEWS: "📰 خبر",
+  SET_CAPITAL: "💼 سرمایه",
 
-  WALLET: "💳 ولت",
-  WALLET_DEPOSIT: "➕ واریز",
-  WALLET_WITHDRAW: "➖ برداشت",
-  WALLET_BALANCE: "📊 موجودی",
-
-  SUBSCRIPTION: "👑 اشتراک",
-  SUB_BUY: "🛒 خرید اشتراک",
-  SUB_STATUS: "📌 وضعیت اشتراک",
+  REQUEST_CUSTOM_PROMPT: "🧠 درخواست پرامپت اختصاصی",
 };
 
 const TYPING_INTERVAL_MS = 4000;
-const TIMEOUT_TEXT_MS = 11000;
+const TIMEOUT_TEXT_MS = 26000;
 const TIMEOUT_VISION_MS = 12000;
-const TIMEOUT_POLISH_MS = 9000;
+const TIMEOUT_POLISH_MS = 15000;
 
 /* ========================== UTILS ========================== */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -827,7 +991,7 @@ function isAdmin(from, env) {
 
 function kyivDateString(d = new Date()) {
   return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Kyiv",
+    timeZone: "Asia/Tehran",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -863,675 +1027,614 @@ function randomCode(len = 10) {
   return out;
 }
 
+const MARKET_CACHE = new Map();
+const ANALYSIS_CACHE = new Map();
 
-/* ========================== STORAGE (bot_db) ========================== */
-/**
- * bot_db can be:
- * - Cloudflare KV namespace (has get/put/list/delete)
- * - Cloudflare D1 database (has prepare)
- *
- * This wrapper normalizes both into KV-like methods used by the bot.
- */
-function getDB(env) {
-  if (!env) return null;
-
-  // If an older isolate cached a non-adapter object (e.g., raw D1), re-normalize it.
-  if (env.__mq_db) {
-    const cached = env.__mq_db;
-    if (typeof cached.get === "function" && typeof cached.put === "function") return cached;
-    if (typeof cached.prepare === "function") {
-      try {
-        const w = makeD1KVAdapter(cached);
-        env.__mq_db = w;
-        return w;
-      } catch (_) {
-        try { delete env.__mq_db; } catch (_) { env.__mq_db = null; }
-      }
-    } else {
-      try { delete env.__mq_db; } catch (_) { env.__mq_db = null; }
-    }
+function cacheGet(map, key) {
+  const hit = map.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt && hit.expiresAt <= Date.now()) {
+    map.delete(key);
+    return null;
   }
+  return hit.value;
+}
 
-  const raw = env.bot_db || env.BOT_DB || env.BOT_KV || null;
-  if (!raw) return null;
-
-  // KV namespace
-  if (typeof raw.get === "function" && typeof raw.put === "function" && typeof raw.list === "function") {
-    env.__mq_db = raw;
-    return raw;
+function cacheSet(map, key, value, ttlMs, maxSize = 500) {
+  map.set(key, { value, expiresAt: Date.now() + ttlMs });
+  if (map.size > maxSize) {
+    const [first] = map.keys();
+    if (first) map.delete(first);
   }
-
-  // D1 database
-  if (typeof raw.prepare === "function") {
-    const w = makeD1KVAdapter(raw);
-    env.__mq_db = w;
-    return w;
-  }
-
-  return null;
 }
 
-let __MQ_D1_READY = false;
-let __MQ_D1_SCHEMA = { keyCol: "k", valCol: "v", expCol: "exp", updatedCol: "updated_at" };
-
-async function ensureD1KV(d1) {
-  if (__MQ_D1_READY) return;
-
-  // 1) Try to create the expected schema (no-op if already exists)
-  const stmts = [
-    "CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT, exp INTEGER, updated_at INTEGER)",
-    "CREATE INDEX IF NOT EXISTS kv_k_idx ON kv(k)",
-    "CREATE INDEX IF NOT EXISTS kv_exp_idx ON kv(exp)"
-  ];
-
-  try {
-    if (typeof d1.exec === "function") {
-      await d1.exec(stmts.join("; "));
-    } else {
-      for (const s of stmts) await d1.prepare(s).run();
-    }
-  } catch (_) {
-    // ignore; we will introspect what exists
-  }
-
-  // 2) Introspect actual columns (handles older/alternate schemas)
-  try {
-    const info = await d1.prepare("PRAGMA table_info(kv)").all();
-    const rows = Array.isArray(info) ? info : (info && info.results) ? info.results : [];
-    const cols = new Set(rows.map(r => String(r.name || "").toLowerCase()).filter(Boolean));
-    const keyCol = cols.has("k") ? "k" : cols.has("key") ? "key" : cols.has("id") ? "id" : "k";
-
-    let valCol = cols.has("v") ? "v"
-      : cols.has("value") ? "value"
-      : cols.has("val") ? "val"
-      : cols.has("data") ? "data"
-      : null;
-
-    // If multiple value columns exist (e.g. both `v` and `value`), keep a secondary column in sync
-    let altValCol = null;
-    if (valCol === "v") {
-      if (cols.has("value")) altValCol = "value";
-      else if (cols.has("val")) altValCol = "val";
-      else if (cols.has("data")) altValCol = "data";
-    } else if (valCol === "value" && cols.has("v")) {
-      altValCol = "v";
-    }
-
-    const expCol = cols.has("exp") ? "exp" : (cols.has("expires_at") ? "expires_at" : null);
-    const updatedCol = cols.has("updated_at") ? "updated_at" : (cols.has("updated") ? "updated" : null);
-
-    // If there's no value column, attempt to add `v`
-    if (!valCol) {
-      try {
-        await d1.prepare("ALTER TABLE kv ADD COLUMN v TEXT").run();
-        valCol = "v";
-        if (!altValCol) {
-          if (cols.has("value")) altValCol = "value";
-          else if (cols.has("val")) altValCol = "val";
-          else if (cols.has("data")) altValCol = "data";
-        }
-      } catch (_) {
-        // last resort: still mark schema, operations may fail loudly
-        valCol = "v";
-      }
-    }
-
-    // Backfill / keep value columns in sync (best-effort, ignore errors)
-    try {
-      if (valCol === "v" && altValCol) {
-        // If we previously stored in `value` (or similar), copy into `v` when missing, and vice-versa.
-        await d1.prepare(`UPDATE kv SET v = ${altValCol} WHERE v IS NULL AND ${altValCol} IS NOT NULL`).run();
-        await d1.prepare(`UPDATE kv SET ${altValCol} = v WHERE ${altValCol} IS NULL AND v IS NOT NULL`).run();
-      }
-    } catch (_) {}
-
-    __MQ_D1_SCHEMA = { keyCol, valCol, altValCol, expCol, updatedCol };
-  } catch (_) {
-    __MQ_D1_SCHEMA = { keyCol: "k", valCol: "v", altValCol: null, expCol: "exp", updatedCol: "updated_at" };
-  }
-
-  __MQ_D1_READY = true;
+async function r2GetJson(bucket, key) {
+  if (!bucket) return null;
+  const obj = await bucket.get(key);
+  if (!obj) return null;
+  try { return await obj.json(); } catch { return null; }
 }
 
-function likeEscape(s) {
-  // Escape LIKE wildcards. Keys shouldn't contain these, but this makes prefix list robust.
-  return String(s || "").replace(/[\\%_]/g, "\\$&");
+async function r2PutJson(bucket, key, value, ttlMs) {
+  if (!bucket) return;
+  const body = JSON.stringify({ value, expiresAt: Date.now() + ttlMs });
+  await bucket.put(key, body, {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: { ttlMs: String(ttlMs || "") },
+  });
 }
 
-function makeD1KVAdapter(d1) {
-  const schema = __MQ_D1_SCHEMA || { keyCol: "k", valCol: "v", altValCol: null, expCol: "exp", updatedCol: "updated_at" };
-  const keyCol = schema.keyCol || "k";
-  const valCol = schema.valCol || "v";
-  const altValCol = schema.altValCol || null;
-  const expCol = schema.expCol || null;
-  const updatedCol = schema.updatedCol || null;
-
-  const q = (name) => `"${String(name).replace(/"/g, '""')}"`;
-
-  const colKey = q(keyCol);
-  const colVal = q(valCol);
-  const colAlt = altValCol && altValCol !== valCol ? q(altValCol) : null;
-  const colExp = expCol ? q(expCol) : null;
-  const colUpd = updatedCol ? q(updatedCol) : null;
-
-  return {
-    async get(key) {
-      const whereExp = colExp ? ` AND (${colExp} IS NULL OR ${colExp} > ?2)` : "";
-      const now = Math.floor(Date.now() / 1000);
-      const valExpr = colAlt ? `COALESCE(${colVal}, ${colAlt}) AS v` : `${colVal} AS v`;
-      const st = d1.prepare(`SELECT ${valExpr}${colExp ? `, ${colExp} AS exp` : ""}${colUpd ? `, ${colUpd} AS ts` : ""} FROM kv WHERE ${colKey} = ?1${whereExp} LIMIT 1`).bind(String(key), now);
-      const res = await st.first();
-      if (!res) return null;
-      return { k: String(key), v: res.v, exp: res.exp ?? null, ts: res.ts ?? null };
-    },
-
-    async put(k, v, exp = null) {
-      const nowSec = Math.floor(Date.now() / 1000);
-      const nowMs = Date.now();
-
-      const cols = [keyCol, valCol];
-      const vals = /** @type {any[]} */([String(k), String(v)]);
-      if (altValCol && altValCol !== valCol) {
-        cols.push(altValCol);
-        vals.push(String(v));
-      }
-      if (colExp) {
-        cols.push(expCol);
-        vals.push(exp == null ? null : Number(exp));
-      }
-      if (colUpd) {
-        cols.push(updatedCol);
-        // store ms if looks like *_at, else seconds
-        vals.push(String(updatedCol).toLowerCase().includes("_at") ? nowMs : nowSec);
-      }
-
-      const qCols = cols.map(q).join(", ");
-      const qs = cols.map((_, i) => `?${i + 1}`).join(", ");
-
-      const setParts = [`${colVal} = excluded.${colVal}`];
-      if (colAlt) setParts.push(`${colAlt} = excluded.${colAlt}`);
-      if (colExp) setParts.push(`${colExp} = excluded.${colExp}`);
-      if (colUpd) setParts.push(`${colUpd} = excluded.${colUpd}`);
-
-      const sql = `INSERT INTO kv (${qCols}) VALUES (${qs}) ON CONFLICT(${colKey}) DO UPDATE SET ${setParts.join(", ")}`;
-      await d1.prepare(sql).bind(...vals).run();
-      return true;
-    },
-
-    async delete(key) {
-      await d1.prepare(`DELETE FROM kv WHERE ${colKey} = ?1`).bind(String(key)).run();
-      return true;
-    },
-
-    async list(opts = {}) {
-      const limit = Math.max(1, Math.min(500, Number(opts.limit || 100)));
-      const prefix = typeof opts.prefix === "string" ? opts.prefix : "";
-      const cursor = typeof opts.cursor === "string" ? opts.cursor : null;
-
-      const params = [];
-      let where = "1=1";
-      if (prefix) {
-        params.push(likeEscape(prefix) + "%");
-        where += ` AND ${colKey} LIKE ?${params.length} ESCAPE '\\'`;
-      }
-      if (cursor) {
-        params.push(cursor);
-        where += ` AND ${colKey} > ?${params.length}`;
-      }
-      const sql = `SELECT ${colKey} AS k FROM kv WHERE ${where} ORDER BY ${colKey} ASC LIMIT ${limit}`;
-      const res = await d1.prepare(sql).bind(...params).all();
-      const keys = (res.results || []).map((r) => r.k);
-      const nextCursor = keys.length ? String(keys[keys.length - 1]) : null;
-      return { keys, cursor: nextCursor };
-    }
-  };
+async function getCachedR2Value(bucket, key) {
+  const payload = await r2GetJson(bucket, key);
+  if (!payload) return null;
+  if (payload.expiresAt && payload.expiresAt <= Date.now()) return null;
+  return payload.value;
 }
 
-
-const __MQ_CFG_CACHE = globalThis.__MQ_CFG_CACHE || { ts: 0, cfg: null };
-globalThis.__MQ_CFG_CACHE = __MQ_CFG_CACHE;
-
-const MQ_CFG_KEY = "cfg:main";
-
-function defaultMainConfig(env) {
-  const currency = (env.SUB_CURRENCY || "USDT").toString().trim() || "USDT";
-  const premiumLimit = toInt(env.PREMIUM_DAILY_LIMIT, 200);
-
-  const p1 = Number(env.SUB_PRICE_M1 ?? env.SUB_PRICE_1M ?? 10);
-  const p3 = Number(env.SUB_PRICE_M3 ?? env.SUB_PRICE_3M ?? 25);
-  const p12 = Number(env.SUB_PRICE_Y1 ?? env.SUB_PRICE_12M ?? 80);
-
-  const subPlans = [
-    { id: "m1", title: "⭐ ماهانه", days: 30, price: Number.isFinite(p1) ? p1 : 10, currency, dailyLimit: premiumLimit },
-    { id: "m3", title: "🔥 سه‌ماهه", days: 90, price: Number.isFinite(p3) ? p3 : 25, currency, dailyLimit: premiumLimit },
-    { id: "y1", title: "👑 سالانه", days: 365, price: Number.isFinite(p12) ? p12 : 80, currency, dailyLimit: premiumLimit },
-  ];
-
-  const styles = Object.keys(STYLE_ANALYSIS_PROMPTS_DEFAULT || {}).map(label => ({
-    id: stylePromptKey(label) || label,
-    label,
-    enabled: true,
-    prompt: STYLE_ANALYSIS_PROMPTS_DEFAULT[label] || "",
-  }));
-
-  return {
-    walletAddress: (env.WALLET_ADDRESS || "").toString().trim(),
-    limits: {
-      freeDailyLimit: toInt(env.FREE_DAILY_LIMIT, 50),
-      premiumDailyLimit: premiumLimit,
-    },
-    commissions: {
-      globalPct: Number(env.GLOBAL_COMMISSION_PCT ?? 0),
-      perUser: {},
-    },
-    subPlans,
-    styles,
-  };
+async function getCachedR2ValueAllowStale(bucket, key) {
+  const payload = await r2GetJson(bucket, key);
+  if (!payload) return null;
+  return payload.value;
 }
-
-function normalizeMainConfig(cfg, env) {
-  const d = defaultMainConfig(env);
-  const out = { ...d, ...(cfg || {}) };
-
-  out.limits = { ...d.limits, ...((cfg || {}).limits || {}) };
-  out.commissions = { ...d.commissions, ...((cfg || {}).commissions || {}) };
-  out.commissions.perUser = { ...((d.commissions || {}).perUser || {}), ...(((cfg || {}).commissions || {}).perUser || {}) };
-
-  if (!Array.isArray(out.subPlans) || !out.subPlans.length) out.subPlans = d.subPlans;
-  if (!Array.isArray(out.styles) || !out.styles.length) out.styles = d.styles;
-
-  // sanitize numeric
-  out.limits.freeDailyLimit = toInt(out.limits.freeDailyLimit, d.limits.freeDailyLimit);
-  out.limits.premiumDailyLimit = toInt(out.limits.premiumDailyLimit, d.limits.premiumDailyLimit);
-  out.commissions.globalPct = Number.isFinite(Number(out.commissions.globalPct)) ? Number(out.commissions.globalPct) : 0;
-
-  return out;
-}
-
-async function loadMainConfig(env) {
-  const ttl = toInt(env.CFG_CACHE_TTL_MS, 30000);
-  const now = Date.now();
-
-  if (__MQ_CFG_CACHE.cfg && (now - __MQ_CFG_CACHE.ts) < ttl) return __MQ_CFG_CACHE.cfg;
-
-  const db = getDB(env);
-  if (!db) {
-    const c = defaultMainConfig(env);
-    __MQ_CFG_CACHE.cfg = c; __MQ_CFG_CACHE.ts = now;
-    return c;
-  }
-
-  const raw = await db.get(MQ_CFG_KEY);
-  let cfg = null;
-  if (raw) {
-    try { cfg = JSON.parse(raw); } catch {}
-  }
-
-  const c = normalizeMainConfig(cfg, env);
-  __MQ_CFG_CACHE.cfg = c; __MQ_CFG_CACHE.ts = now;
-  return c;
-}
-
-async function saveMainConfig(env, cfg) {
-  const db = getDB(env);
-  if (!db) throw new Error("bot_db_missing");
-  const c = normalizeMainConfig(cfg, env);
-  await db.put(MQ_CFG_KEY, JSON.stringify(c));
-  __MQ_CFG_CACHE.cfg = c; __MQ_CFG_CACHE.ts = Date.now();
-  return c;
-}
-
-function cfgOf(env) {
-  return env?.__cfg || __MQ_CFG_CACHE.cfg || null;
-}
-
-function toAsciiDigits(input) {
-  const mapFa = { "۰":"0","۱":"1","۲":"2","۳":"3","۴":"4","۵":"5","۶":"6","۷":"7","۸":"8","۹":"9" };
-  const mapAr = { "٠":"0","١":"1","٢":"2","٣":"3","٤":"4","٥":"5","٦":"6","٧":"7","٨":"8","٩":"9" };
-  return String(input || "")
-    .replace(/[۰-۹]/g, (d) => mapFa[d] ?? d)
-    .replace(/[٠-٩]/g, (d) => mapAr[d] ?? d);
-}
-
 
 /* ========================== PROMPTS (ADMIN/OWNER ONLY) ========================== */
-const DEFAULT_ANALYSIS_PROMPT = `You are a professional market analyst.
+const DEFAULT_ANALYSIS_PROMPT = `SYSTEM: تحلیل‌گر بازار (سبک‌محور)
 
-TASK
-Analyze the market using the provided data for timeframe {TIMEFRAME}.
-Use clear structure, actionable levels, and strict invalidation.
+متغیرها:
+- STYLE_MODE: {STYLE}
+- RISK_PROFILE: {RISK}
+- NEWS_MODE: {NEWS}
+- TIMEFRAME: {TIMEFRAME}
 
-RULES
-- Output must be فارسی.
-- Exactly sections ۱ تا ۵ (no extra headings).
-- Use only provided OHLC / chart observations; خیال‌بافی نکن.
-- Always specify invalidation (ابطال).
+قوانین سخت:
+1) خروجی فقط فارسی باشد.
+2) فقط بر اساس داده‌های MARKET_DATA تحلیل کن؛ اگر داده کافی نیست، شفاف بگو و حدس نزن.
+3) ساختار خروجی باید دقیقاً مطابق STYLE_PROMPT انتخاب‌شده باشد (تیترها و بخش‌ها را رعایت کن).
+4) سطح‌های قیمتی را اگر از داده قابل استخراج است با عدد ارائه کن؛ اگر نه «نامشخص از داده».
+5) سناریومحور بنویس؛ هیچ توصیه قطعی «حتماً بخر/بفروش» نده.
+6) برای هر سناریو، شرط فعال‌سازی را واضح بگو (Close/Break/Retest/Wick Sweep).
 
-OUTPUT FORMAT (فارسی، دقیقاً ۱ تا ۵):
-۱. جهت و ساختار بازار (روی {TIMEFRAME})
-۲. سطوح و زون‌های کلیدی (S/R + عرضه/تقاضا + نقدینگی نزدیک)
-۳. تریگر/شرایط ورود (کندلی/شکست-برگشت/ری‌تست)
-۴. سناریوی معامله (Entry/SL/TP + نسبت ریسک/ریوارد)
-۵. مدیریت معامله + شرایط ابطال`;
+ریسک:
+- کم: فقط با تایید قوی + SL محافظه‌کار + TP پله‌ای.
+- متوسط: تایید استاندارد + SL پشت ناحیه + TP دو مرحله‌ای.
+- زیاد: ورود تهاجمی فقط اگر سناریو واضح است + حتماً هشدار «ریسک بالا».
 
-const SMARTMONEY_ANALYSIS_PROMPT = `SMART MONEY MODE: Institutional Liquidity Hunter
+NEWS_MODE:
+- اگر {NEWS} = "on" و NEWS_HEADLINES_FA موجود بود، اثر خبر را کوتاه داخل سناریوها اضافه کن.
+- اگر off، از خبر حرف نزن.
 
-ROLE: You are an elite “Liquidity Hunter Algorithm” tracking Smart Money.
-INPUT CONTEXT: {TIMEFRAME} Timeframe Chart.
-
-MINDSET
-Retail traders predict. Whales react.
-Focus on Liquidity Pools (Targets) and Imbalances (Magnets).
-Crucial: Determine what happens AT the target level (Reversal vs. Continuation).
-
-ANALYSIS PROTOCOL
-LIQUIDITY MAPPING: Where are the Stop Losses? (The Target).
-MANIPULATION DETECTOR: Identify recent traps/fake-outs.
-INSTITUTIONAL FOOTPRINT: Locate Order Blocks/FVGs (The Defense Wall).
-THE KILL ZONE: Predict the next move to the liquidity pool.
-REACTION LOGIC (THE MOST IMPORTANT PART): Analyze the specific target level. What specifically needs to happen for a “Reversal” (Sweep) vs a “Collapse” (Breakout)?
-
-OUTPUT FORMAT (STRICTLY PERSIAN - فارسی)
-Use a sharp, revealing, and “whistle-blower” tone.
-
-۱. نقشه پول‌های پارک‌شده (شکارگاه نهنگ‌ها):
-۲. تله‌های قیمتی اخیر (فریب بازار):
-۳. ردپای ورود پول هوشمند (دیوار بتنی):
-۴. سناریوی بی‌رحمانه بعدی (مسیر احتمالی):
-۵. استراتژی لحظه برخورد (ماشه نهایی):
-
-سناریوی بازگشت (Reversal):
-سناریوی سقوط/صعود (Continuation):`;
+نکته:
+- اگر لازم شد، یک جمع‌بندی کوتاه آخر بده.
+- quickchart_config را به شکل JSON داخلی بساز اما به کاربر نمایش نده.`;
 
 /* ========================== STYLE PROMPTS (DEFAULTS) ==========================
  * Users choose st.style (Persian labels) and we inject a style-specific guide
  * into the analysis prompt. Admin can still override the global base prompt via KV.
  */
 const STYLE_PROMPTS_DEFAULT = {
-  "پرایس اکشن": `You are a professional Price Action trader and market analyst.
-
-Analyze the given market (Symbol, Timeframe) using pure Price Action concepts only.
-Do NOT use indicators unless explicitly requested.
-
-Your analysis must include:
-
-1. Market Structure
-- Identify the current structure (Uptrend / Downtrend / Range)
-- Mark HH, HL, LH, LL
-- Specify whether structure is intact or broken (BOS / MSS)
-
-2. Key Levels
-- Strong Support & Resistance zones
-- Flip zones (SR → Resistance / Resistance → Support)
-- Psychological levels (if relevant)
-
-3. Candlestick Behavior
-- Identify strong rejection candles (Pin bar, Engulfing, Inside bar)
-- Explain what these candles indicate about buyers/sellers
-
-4. Entry Scenarios
-For each valid setup:
-- Entry zone
-- Stop Loss (logical, structure-based)
-- Take Profit targets (TP1 / TP2)
-- Risk to Reward (minimum 1:2)
-
-5. Bias & Scenarios
-- Main bias (Bullish / Bearish / Neutral)
-- Alternative scenario if price invalidates the setup
-
-6. Execution Plan
-- Is this a continuation or reversal trade?
-- What confirmation is required before entry?
-
-Explain everything step-by-step, clearly and professionally.
-Avoid overtrading. Focus on high-probability setups only.`,
-  "ICT": `You are an ICT (Inner Circle Trader) & Smart Money analyst.
-
-Analyze the market (Symbol, Timeframe) using ICT & Smart Money Concepts ONLY.
-
-Your analysis must include:
-
-1. Higher Timeframe Bias
-- Determine HTF bias (Daily / H4)
-- Identify Premium & Discount zones
-- Is price in equilibrium or imbalance?
-
-2. Liquidity Mapping
-- Identify:
-  - Equal Highs / Equal Lows
-  - Buy-side liquidity
-  - Sell-side liquidity
-- Mark likely stop-loss pools
-
-3. Market Structure
-- Identify:
-  - BOS (Break of Structure)
-  - MSS (Market Structure Shift)
-- Clarify whether the move is manipulation or expansion
-
-4. PD Arrays
-- Order Blocks (Bullish / Bearish)
-- Fair Value Gaps (FVG)
-- Liquidity Voids
-- Previous High / Low (PDH, PDL, PWH, PWL)
-
-5. Kill Zones (if intraday)
-- London Kill Zone
-- New York Kill Zone
-- Explain timing relevance
-
-6. Entry Model
-- Entry model used (e.g. Liquidity Sweep → MSS → FVG entry)
-- Entry price
-- Stop Loss (below/above OB or swing)
-- Take Profits (liquidity targets)
-
-7. Narrative
-- Explain the story:
-  - Who is trapped?
-  - Where did smart money enter?
-  - Where is price likely engineered to go?
-
-Provide a clear bullish/bearish execution plan and an invalidation point.`,
-  "ATR": `You are a quantitative trading assistant specializing in volatility-based strategies.
-
-Analyze the market (Symbol, Timeframe) using ATR (Average True Range) as the core tool.
-
-Your analysis must include:
-
-1. Volatility State
-- Current ATR value
-- Compare current ATR with historical average
-- Is volatility expanding or contracting?
-
-2. Market Condition
-- Trending or Ranging?
-- Is the market suitable for breakout or mean reversion?
-
-3. Trade Setup
-- Optimal Entry based on price structure
-- ATR-based Stop Loss:
-  - SL = Entry ± (ATR × Multiplier)
-- ATR-based Take Profit:
-  - TP1, TP2 based on ATR expansion
-
-4. Position Sizing
-- Risk per trade (%)
-- Position size calculation based on SL distance
-
-5. Trade Filtering
-- When NOT to trade based on ATR
-- High-risk volatility conditions (news, spikes)
-
-6. Risk Management
-- Max daily loss
-- Max consecutive losses
-- Trailing Stop logic using ATR
-
-7. Summary
-- Is this trade statistically justified?
-- Expected trade duration
-- Risk classification (Low / Medium / High)
-
-Keep the explanation practical and execution-focused.`,
+  "پرایس اکشن": `You are a professional Price Action market analyst. Use PURE price action only; indicators are forbidden unless explicitly requested.
+Output must be clear, step-by-step, execution-focused.
+Your analysis MUST include these labeled sections:
+1) Market Structure: trend (up/down/range), label HH/HL/LH/LL, and state (Intact / BOS / MSS).
+2) Key Levels: strong support zones, strong resistance zones, flip zones, psychological levels if relevant.
+3) Candlestick Behavior: pin bar / engulfing / inside bar; explain buyer vs seller intent.
+4) Entry Scenarios: entry zone, structure-based SL, TP1 & TP2, minimum R:R 1:2.
+5) Bias & Scenarios: main bias + alternative scenario with invalidation.
+6) Execution Plan: continuation vs reversal; required confirmation before entry.
+Avoid overtrading; only high-probability setups.`,
+  "ICT": `You are an ICT (Inner Circle Trader) & Smart Money Concepts analyst. Use ICT/SMC concepts ONLY. No indicators. No retail concepts.
+Provide a professional, precise, educational, step-by-step analysis.
+Required sections:
+1) Higher Timeframe Bias (Daily/H4): bias, premium/discount, equilibrium (50%), imbalance vs balance.
+2) Liquidity Mapping: EQH/EQL, buy-side/sell-side liquidity, stop-loss pools; where price is likely engineered.
+3) Market Structure: BOS and MSS/CHoCH; explain manipulation vs expansion.
+4) PD Arrays: bullish/bearish order blocks, FVG, liquidity voids, PDH/PDL, PWH/PWL.
+5) Kill Zones (intraday only): London/NY; explain timing.
+6) Entry Model: (e.g., sweep→MSS→FVG or sweep→OB); include entry, SL, liquidity-based targets, invalidation.
+7) Narrative: who is trapped, where smart money entered, where price is likely going.`,
+  "ATR": `You are a quantitative trading assistant focused on ATR-based volatility trading.
+Use ATR for risk and target sizing. Also consider price structure for entries.
+Required sections:
+1) Volatility State: current ATR value, compare to historical average, expansion vs contraction.
+2) Market Condition: trending vs ranging; breakout vs mean-reversion suitability.
+3) Trade Setup: structure-based entry; SL = Entry ± (ATR × multiplier); TP1/TP2 based on ATR expansion.
+4) Position Sizing: risk% and size based on SL distance.
+5) Trade Filtering: when NOT to trade; high-risk volatility conditions (news/spikes).
+6) Risk Management: max daily loss, max consecutive losses, ATR trailing stop logic.
+7) Summary: statistical justification, expected duration, risk classification.`,
 };
-
-const STYLE_ANALYSIS_PROMPTS_DEFAULT = {
-  "اسمارت‌مانی": SMARTMONEY_ANALYSIS_PROMPT,
-
-  "اسکالپ": `You are a professional intraday scalper and market analyst.
-
-Focus on fast, high-probability setups with tight invalidation and realistic intraday targets.
-Prefer: M15/H1 structure, session context (London/NY), recent liquidity, clean confirmations.
-
-Constraints:
-- No long explanations; be direct and executable.
-- Suggest entries only if there is a clear trigger near a defined zone.
-- Targets should be close and achievable intraday; always specify invalidation.
-
-OUTPUT FORMAT (فارسی، دقیقاً ۱ تا ۵):
-۱. جهت و ساختار کوتاه‌مدت (روی {TIMEFRAME})
-۲. زون‌های کلیدی (S/R + عرضه/تقاضا + نقدینگی نزدیک)
-۳. تریگرهای ورود اسکالپ (تایید کندلی/شکست-برگشت/ری‌تست)
-۴. سناریوهای معامله (Entry/SL/TP و نسبت ریسک/ریوارد)
-۵. پلن اجرای سریع + شرایط ابطال`,
-
-  "سوئینگ": `You are a professional swing trader and market analyst.
-
-Focus on multi-day/multi-week structure and higher-timeframe levels.
-Prefer: H4/D1 context, major S/R, ranges, trend legs, and clean invalidation points.
-
-Constraints:
-- Avoid scalp-level noise. Use fewer, higher-quality zones.
-- Targets can be broader (multiple R), but must be realistic and level-based.
-
-OUTPUT FORMAT (فارسی، دقیقاً ۱ تا ۵):
-۱. بایاس و ساختار میان‌مدت (روی {TIMEFRAME})
-۲. سطوح/زون‌های اصلی (حمایت/مقاومت‌های تاییدشده)
-۳. سناریوهای سوئینگ (سناریوی اصلی + آلترناتیو)
-۴. پلن ورود/خروج (Entry/SL/TP های پله‌ای)
-۵. مدیریت معامله + شرایط ابطال`,
-
-  "پرایس اکشن": `You are a professional Price Action trader and market analyst.
-
-Analyze the market using ONLY Price Action:
-- Market structure (HH/HL / LH/LL), trend vs range
-- Key S/R, supply/demand zones
-- Candle behavior (rejections, impulses, pin/engulf)
-Avoid indicators and avoid ICT-specific jargon.
-
-OUTPUT FORMAT (فارسی، دقیقاً ۱ تا ۵):
-۱. ساختار بازار و بایاس (روی {TIMEFRAME})
-۲. سطوح کلیدی و زون‌ها (حمایت/مقاومت + عرضه/تقاضا)
-۳. رفتار کندل/مومنتوم (نشانه‌های ادامه یا برگشت)
-۴. سناریوهای معاملاتی (Entry/SL/TP)
-۵. نکات اجرایی + شرایط ابطال`,
-
-  "ICT": `You are an ICT (Inner Circle Trader) style market analyst.
-
-Use ICT/SMC concepts:
-- Liquidity pools (equal highs/lows, sell-side/buy-side)
-- Market Structure Shift (MSS) / Break of Structure (BOS)
-- Order Blocks (OB), Fair Value Gap (FVG), Imbalance
-- Optimal Trade Entry (OTE) only if relevant
-Avoid generic indicator-based advice.
-
-OUTPUT FORMAT (فارسی، دقیقاً ۱ تا ۵):
-۱. نقشه نقدینگی و بایاس (روی {TIMEFRAME})
-۲. سطوح مهم: BOS/MSS + OB/FVG
-۳. سناریوی برداشت نقدینگی (قبل/بعد از سوئیپ)
-۴. پلن ورود/خروج (Entry/SL/TP + تایید)
-۵. مدیریت ریسک + شرایط ابطال`,
-
-  "ATR": `You are a professional trader using ATR-based risk and target planning.
-
-Use ATR (Average True Range) as the core tool for:
-- Stop distance (SL) and take profit (TP) planning
-- Position sizing logic and volatility-aware expectations
-You may reference ATR conceptually even if exact ATR value is not provided.
-
-OUTPUT FORMAT (فارسی، دقیقاً ۱ تا ۵):
-۱. جهت و ساختار بازار (روی {TIMEFRAME})
-۲. زون‌های کلیدی + نوسان (برد منطقی حرکت)
-۳. پلن SL/TP مبتنی بر ATR (مثلاً ۱×ATR، ۱.۵×ATR…)
-۴. سناریوهای ورود (Entry/SL/TP)
-۵. مدیریت ریسک + شرایط ابطال`,
-};
-
 
 function normalizeStyleLabel(style) {
   const s = String(style || "").trim();
   if (!s) return "";
   const low = s.toLowerCase();
-
-  if (low.includes("پرایس") || low.includes("price")) return "پرایس اکشن";
-  if (low.includes("اسمارت") || low.includes("smart")) return "اسمارت‌مانی";
-  if (low.includes("اسکال") || low.includes("scalp")) return "اسکالپ";
-  if (low.includes("سوئ") || low.includes("swing")) return "سوئینگ";
-
-  if (low === "ict" || low.includes("ict")) return "ICT";
-  if (low === "atr" || low.includes("atr")) return "ATR";
-
+  if (low === "price action" || low === "priceaction") return "پرایس اکشن";
+  if (low === "ict") return "ICT";
+  if (low === "atr") return "ATR";
+  if (low === "combo" || low === "combined" || low === "all" || low === "ترکیبی") return "ترکیبی";
   return s;
 }
 
 function getStyleGuide(style) {
   const key = normalizeStyleLabel(style);
+  if (key === "ترکیبی") {
+    return [
+      "[پرایس اکشن]", STYLE_PROMPTS_DEFAULT["پرایس اکشن"] || "",
+      "[ICT]", STYLE_PROMPTS_DEFAULT["ICT"] || "",
+      "[ATR]", STYLE_PROMPTS_DEFAULT["ATR"] || "",
+    ].join("\n").trim();
+  }
   return STYLE_PROMPTS_DEFAULT[key] || "";
 }
 
-function stylePromptKey(style) {
-  const label = normalizeStyleLabel(style);
-  const map = {
-    "اسکالپ": "scalp",
-    "سوئینگ": "swing",
-    "اسمارت‌مانی": "smartmoney",
-    "پرایس اکشن": "priceaction",
-    "ICT": "ict",
-    "ATR": "atr",
-  };
-  return map[label] || "";
-}
-
-async function getAnalysisPromptForStyle(env, style) {
-  const label = normalizeStyleLabel(style);
-  const key = stylePromptKey(label);
-
-  // 0) config (bot_db cfg:main) per-style prompt
-  const cfg = cfgOf(env);
-  if (cfg && Array.isArray(cfg.styles)) {
-    const it = cfg.styles.find(s => normalizeStyleLabel(s?.label) === label);
-    const pCfg = String(it?.prompt || "").trim();
-    if (pCfg) return pCfg;
-  }
-
-  // 1) legacy style-specific override (KV keys)
-  const kv = getDB(env);
-  if (kv && key) {
-    const pStyle = await kv.get(`settings:analysis_prompt:${key}`);
-    if (pStyle && pStyle.trim()) return pStyle;
-  }
-
-  // 2) built-in per-style prompt
-  if (STYLE_ANALYSIS_PROMPTS_DEFAULT[label]) return STYLE_ANALYSIS_PROMPTS_DEFAULT[label];
-
-  // 3) global override
-  if (kv) {
-    const p = await kv.get("settings:analysis_prompt");
-    if (p && p.trim()) return p;
-  }
-
-  return DEFAULT_ANALYSIS_PROMPT;
-}
-
-
 
 async function getAnalysisPrompt(env) {
-  const kv = getDB(env);
-  if (!kv) return DEFAULT_ANALYSIS_PROMPT;
-  const p = await kv.get("settings:analysis_prompt");
-  return (p && p.trim()) ? p : DEFAULT_ANALYSIS_PROMPT;
+  const raw = await getSettingText(env, "settings:analysis_prompt", DEFAULT_ANALYSIS_PROMPT);
+  const p = String(raw || "").trim();
+  return p ? p : DEFAULT_ANALYSIS_PROMPT;
+}
+async function setAnalysisPrompt(env, text) {
+  await setSettingText(env, "settings:analysis_prompt", String(text || "").trim());
+}
+
+async function getBotWelcomeText(env) {
+  const raw = await getSettingText(env, "settings:welcome_bot", WELCOME_BOT);
+  const t = String(raw || "").trim();
+  return t ? t : WELCOME_BOT;
+}
+async function setBotWelcomeText(env, text) {
+  await setSettingText(env, "settings:welcome_bot", String(text || "").trim());
+}
+
+async function getMiniappWelcomeText(env) {
+  const raw = await getSettingText(env, "settings:welcome_miniapp", WELCOME_MINIAPP);
+  const t = String(raw || "").trim();
+  return t ? t : WELCOME_MINIAPP;
+}
+async function setMiniappWelcomeText(env, text) {
+  await setSettingText(env, "settings:welcome_miniapp", String(text || "").trim());
+}
+
+
+/* ========================== STYLE PROMPTS (PER-STYLE) ========================== */
+function styleKey(style) {
+  return String(style || "").trim().toLowerCase().replace(/\s+/g, "_");
+}
+async function getStylePrompt(env, style) {
+  if (!env.BOT_KV) return "";
+  const map = await getStylePromptMap(env);
+  const key = normalizeStyleLabel(style);
+  if (key === "ترکیبی") {
+    const parts = [];
+    for (const s of ["پرایس اکشن", "ICT", "ATR"]) {
+      const v = (map?.[styleKey(s)] || "").toString().trim();
+      if (v) parts.push("[" + s + "]\n" + v);
+    }
+    return parts.join("\n\n");
+  }
+  return (map?.[styleKey(key)] || "").toString();
+}
+async function setStylePrompt(env, style, prompt) {
+  if (!env.BOT_KV) return;
+  const map = await getStylePromptMap(env);
+  map[styleKey(style)] = String(prompt || "");
+  await setStylePromptMap(env, map);
+}
+
+async function getStylePromptMap(env) {
+  const parsed = await getSettingJson(env, "settings:style_prompts_json", {});
+  return (parsed && typeof parsed === "object") ? parsed : {};
+}
+
+async function setStylePromptMap(env, map) {
+  const payload = map && typeof map === "object" ? map : {};
+  await setSettingText(env, "settings:style_prompts_json", JSON.stringify(payload));
+}
+
+async function getCustomPrompts(env) {
+  const parsed = await getSettingJson(env, "settings:custom_prompts", []);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+async function setCustomPrompts(env, prompts) {
+  const clean = Array.isArray(prompts) ? prompts : [];
+  await setSettingText(env, "settings:custom_prompts", JSON.stringify(clean));
+}
+
+async function getFreeDailyLimit(env) {
+  const raw = await getSettingText(env, "settings:free_daily_limit", "");
+  return toInt(raw, 3);
+}
+
+async function setFreeDailyLimit(env, limit) {
+  await setSettingText(env, "settings:free_daily_limit", String(limit));
+}
+const ALLOWED_STYLE_LIST = ["پرایس اکشن", "ICT", "ATR", "ترکیبی"];
+const DEFAULT_STYLE_LIST = ALLOWED_STYLE_LIST.slice();
+
+async function getStyleList(env) {
+  const raw = await getSettingText(env, "settings:style_list", "");
+  if (!raw) return DEFAULT_STYLE_LIST.slice();
+  try {
+    const list = JSON.parse(raw);
+    const filtered = Array.isArray(list) ? list.filter((s) => ALLOWED_STYLE_LIST.includes(s)) : [];
+    return filtered.length ? filtered : DEFAULT_STYLE_LIST.slice();
+  } catch {
+    return DEFAULT_STYLE_LIST.slice();
+  }
+}
+
+async function setStyleList(env, styles) {
+  const clean = (Array.isArray(styles) ? styles : [])
+    .map((s) => String(s || "").trim())
+    .filter((s) => ALLOWED_STYLE_LIST.includes(s));
+  await setSettingText(env, "settings:style_list", JSON.stringify(clean));
+}
+
+async function getOfferBanner(env) {
+  const fallback = (env.SPECIAL_OFFER_TEXT || "").toString().trim();
+  const raw = await getSettingText(env, "settings:offer_banner", fallback);
+  return String(raw || fallback).toString().trim();
+}
+
+async function setOfferBanner(env, text) {
+  await setSettingText(env, "settings:offer_banner", String(text || "").trim());
+}
+
+async function getCommissionSettings(env) {
+  const g = await getSettingText(env, "settings:commission:globalPercent", "");
+  const o = await getSettingText(env, "settings:commission:overrides", "");
+  let overrides = {};
+  try { overrides = o ? JSON.parse(o) : {}; } catch { overrides = {}; }
+  return {
+    globalPercent: toInt(g, 10),
+    overrides: overrides && typeof overrides === "object" ? overrides : {},
+  };
+}
+
+async function setCommissionSettings(env, settings) {
+  if (typeof settings?.globalPercent === "number") {
+    await setSettingText(env, "settings:commission:globalPercent", String(settings.globalPercent));
+  }
+  if (settings?.overrides) {
+    await setSettingText(env, "settings:commission:overrides", JSON.stringify(settings.overrides || {}));
+  }
+}
+
+function resolveCommissionPercent(username, settings) {
+  const handle = normHandle(username);
+  if (!handle) return settings.globalPercent || 0;
+  const raw = settings.overrides?.[handle];
+  const override = Number(raw);
+  if (Number.isFinite(override)) return override;
+  return settings.globalPercent || 0;
+}
+
+async function updateUserIndexes(env, st) {
+  if (!env.BOT_KV) return;
+  const id = String(st.userId);
+
+  const raw = await env.BOT_KV.get("users:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  if (!list.includes(id)) list.push(id);
+  await env.BOT_KV.put("users:index", JSON.stringify(list.slice(-2000)));
+
+  const handle = normHandle(st.profile?.username);
+  if (handle) {
+    await env.BOT_KV.put(`users:by_username:${handle}`, id);
+  }
+}
+
+async function getUserIdByUsername(env, username) {
+  if (!env.BOT_KV) return "";
+  const handle = normHandle(username);
+  if (!handle) return "";
+  return (await env.BOT_KV.get(`users:by_username:${handle}`)) || "";
+}
+
+async function listUsers(env, limit = 100) {
+  if (!env.BOT_KV) return [];
+  const raw = await env.BOT_KV.get("users:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) return [];
+  const ids = list.slice(-limit);
+  const users = [];
+  for (const id of ids) {
+    const u = await getUser(id, env);
+    if (u) users.push(u);
+  }
+  return users;
+}
+
+async function storePayment(env, payment) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put(`payment:${payment.id}`, JSON.stringify(payment));
+
+  const raw = await env.BOT_KV.get("payments:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  if (!list.includes(payment.id)) list.push(payment.id);
+  await env.BOT_KV.put("payments:index", JSON.stringify(list.slice(-500)));
+}
+
+
+async function listUserPayments(env, userId, limit = 20) {
+  if (!env.BOT_KV) return [];
+  const raw = await env.BOT_KV.get("payments:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) return [];
+  const ids = list.slice(-200).reverse();
+  const out = [];
+  for (const id of ids) {
+    if (out.length >= limit) break;
+    const rawPay = await env.BOT_KV.get(`payment:${id}`);
+    if (!rawPay) continue;
+    try {
+      const p = JSON.parse(rawPay);
+      if (String(p.userId || "") === String(userId)) out.push(p);
+    } catch {}
+  }
+  return out.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+}
+
+async function listPayments(env, limit = 50) {
+  if (!env.BOT_KV) return [];
+  const raw = await env.BOT_KV.get("payments:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) return [];
+  const ids = list.slice(-limit);
+  const out = [];
+  for (const id of ids) {
+    const rawPay = await env.BOT_KV.get(`payment:${id}`);
+    if (rawPay) {
+      try { out.push(JSON.parse(rawPay)); } catch {}
+    }
+  }
+  return out.sort((a, b) => (b?.createdAt || "").localeCompare(a?.createdAt || ""));
+}
+
+async function storeSupportTicket(env, ticket) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put(`ticket:${ticket.id}`, JSON.stringify(ticket));
+  const raw = await env.BOT_KV.get("tickets:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  if (!list.includes(ticket.id)) list.push(ticket.id);
+  await env.BOT_KV.put("tickets:index", JSON.stringify(list.slice(-1000)));
+}
+
+async function listSupportTickets(env, limit = 100) {
+  if (!env.BOT_KV) return [];
+  const raw = await env.BOT_KV.get("tickets:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) return [];
+
+  const ids = list.slice(-Number(limit));
+  const out = [];
+  for (const id of ids) {
+    const r = await env.BOT_KV.get(`ticket:${id}`);
+    if (!r) continue;
+    try { out.push(JSON.parse(r)); } catch {}
+  }
+
+  return out.sort((a,b)=>(String(b?.createdAt||"")).localeCompare(String(a?.createdAt||"")));
+}
+
+
+async function updateSupportTicket(env, id, patch = {}) {
+  if (!env.BOT_KV) throw new Error("BOT_KV missing");
+  const key = `ticket:${id}`;
+  const raw = await env.BOT_KV.get(key);
+  if (!raw) throw new Error("ticket_not_found");
+  let t = null;
+  try { t = JSON.parse(raw); } catch {}
+  if (!t) throw new Error("ticket_bad_json");
+
+  const next = { ...t };
+  if (typeof patch.status === "string" && patch.status) next.status = patch.status;
+  if (typeof patch.reply === "string") next.reply = patch.reply;
+  if (typeof patch.updatedBy === "string" && patch.updatedBy) next.updatedBy = patch.updatedBy;
+  next.updatedAt = new Date().toISOString();
+
+  await env.BOT_KV.put(key, JSON.stringify(next));
+
+  // ensure index
+  const idxRaw = await env.BOT_KV.get("tickets:index");
+  let list = [];
+  try { list = idxRaw ? JSON.parse(idxRaw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  if (!list.includes(id)) list.push(id);
+  await env.BOT_KV.put("tickets:index", JSON.stringify(list.slice(-1000)));
+
+  return next;
+}
+
+async function listWithdrawals(env, limit = 50) {
+  const lim = Number(limit);
+  if (env.BOT_DB) {
+    try {
+      const rows = await env.BOT_DB.prepare("SELECT id, userId, createdAt, amount, address, status FROM withdrawals ORDER BY createdAt DESC LIMIT ?1").bind(lim).all();
+      return rows?.results || [];
+    } catch (e) {
+      console.error("listWithdrawals db error:", e);
+    }
+  }
+
+  if (!env.BOT_KV || typeof env.BOT_KV.list !== "function") return [];
+  const listed = await env.BOT_KV.list({ prefix: "withdraw:", limit: lim });
+  const out = [];
+  for (const k of listed?.keys || []) {
+    const raw = await env.BOT_KV.get(k.name);
+    if (!raw) continue;
+    try { out.push(JSON.parse(raw)); } catch {}
+  }
+  return out.sort((a,b)=>String(b.createdAt||"").localeCompare(String(a.createdAt||"")));
+}
+
+async function listWithdrawalsByUser(env, userId, limit = 20) {
+  const lim = Number(limit);
+  const uid = String(userId);
+  if (env.BOT_DB) {
+    try {
+      const rows = await env.BOT_DB.prepare(
+        "SELECT id, userId, createdAt, amount, address, status FROM withdrawals WHERE userId=?1 ORDER BY createdAt DESC LIMIT ?2"
+      ).bind(uid, lim).all();
+      return rows?.results || [];
+    } catch (e) {
+      console.error("listWithdrawalsByUser db error:", e);
+    }
+  }
+
+  if (!env.BOT_KV || typeof env.BOT_KV.list !== "function") return [];
+  const listed = await env.BOT_KV.list({ prefix: "withdraw:", limit: 1000 });
+  const out = [];
+  for (const k of listed?.keys || []) {
+    const raw = await env.BOT_KV.get(k.name);
+    if (!raw) continue;
+    try {
+      const w = JSON.parse(raw);
+      if (String(w.userId || "") === uid) out.push(w);
+    } catch {}
+  }
+  return out.sort((a,b)=>String(b.createdAt||"").localeCompare(String(a.createdAt||""))).slice(0, lim);
+}
+
+
+async function reviewWithdrawal(env, id, decision, txHash, reviewer) {
+  const reviewedAt = new Date().toISOString();
+
+  let prev = {};
+  try { prev = env.BOT_KV ? JSON.parse((await env.BOT_KV.get(`withdraw:${id}`)) || "{}") : {}; } catch { prev = {}; }
+
+  if (env.BOT_DB) {
+    await env.BOT_DB.prepare("UPDATE withdrawals SET status=?1 WHERE id=?2").bind(decision, id).run();
+    const row = await env.BOT_DB.prepare("SELECT id, userId, createdAt, amount, address, status FROM withdrawals WHERE id=?1").bind(id).first();
+    const data = { ...prev, ...(row || {}), txHash, reviewedAt, reviewedBy: normHandle(reviewer?.username) };
+
+    if (decision === "rejected" && data.debitedFromCommission && data.userId) {
+      const u = await ensureUser(String(data.userId), env);
+      const a = Number(data.amount || 0);
+      if (Number.isFinite(a) && a > 0) {
+        u.referral.commissionBalance = Math.round(((Number(u.referral?.commissionBalance || 0)) + a) * 100) / 100;
+        await saveUser(u.userId, u, env);
+        data.refundedAt = new Date().toISOString();
+        data.refundAmount = a;
+      }
+    }
+
+    if (env.BOT_KV) await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(data));
+    return data;
+  }
+
+  const data = { ...prev, id, status: prev.status || "pending" };
+  data.status = decision;
+  data.txHash = txHash;
+  data.reviewedAt = reviewedAt;
+  data.reviewedBy = normHandle(reviewer?.username);
+
+  if (decision === "rejected" && data.debitedFromCommission && data.userId) {
+    const u = await ensureUser(String(data.userId), env);
+    const a = Number(data.amount || 0);
+    if (Number.isFinite(a) && a > 0) {
+      u.referral.commissionBalance = Math.round(((Number(u.referral?.commissionBalance || 0)) + a) * 100) / 100;
+      await saveUser(u.userId, u, env);
+      data.refundedAt = new Date().toISOString();
+      data.refundAmount = a;
+    }
+  }
+
+  if (env.BOT_KV) await env.BOT_KV.put(`withdraw:${id}`, JSON.stringify(data));
+  return data;
+}
+
+async function storeCustomPromptRequest(env, req) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put(`custom_prompt_req:${req.id}`, JSON.stringify(req));
+  const raw = await env.BOT_KV.get("custom_prompt_req:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  if (!list.includes(req.id)) list.push(req.id);
+  await env.BOT_KV.put("custom_prompt_req:index", JSON.stringify(list.slice(-1000)));
+}
+
+async function listCustomPromptRequests(env, limit = 200) {
+  if (!env.BOT_KV) return [];
+  const raw = await env.BOT_KV.get("custom_prompt_req:index");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  if (!Array.isArray(list)) return [];
+
+  const ids = list.slice(-Number(limit));
+  const out = [];
+  for (const id of ids) {
+    const r = await env.BOT_KV.get(`custom_prompt_req:${id}`);
+    if (!r) continue;
+    try { out.push(JSON.parse(r)); } catch {}
+  }
+
+  return out.sort((a,b)=>(String(b?.createdAt||"")).localeCompare(String(a?.createdAt||"")));
+}
+
+async function getAdminFlags(env) {
+  const raw = await getSettingText(env, "settings:admin_flags", "");
+  try {
+    const j = raw ? JSON.parse(raw) : {};
+    return {
+      capitalModeEnabled: typeof j.capitalModeEnabled === "boolean" ? j.capitalModeEnabled : true,
+      profileTipsEnabled: typeof j.profileTipsEnabled === "boolean" ? j.profileTipsEnabled : true,
+    };
+  } catch {
+    return { capitalModeEnabled: true, profileTipsEnabled: true };
+  }
+}
+
+async function setAdminFlags(env, flags) {
+  await setSettingText(env, "settings:admin_flags", JSON.stringify({
+    capitalModeEnabled: !!flags.capitalModeEnabled,
+    profileTipsEnabled: !!flags.profileTipsEnabled,
+  }));
+}
+
+async function runDailyProfileNotifications(env) {
+  const flags = await getAdminFlags(env);
+  if (!flags.profileTipsEnabled) return;
+  const users = await listUsers(env, 500);
+  const hr = new Date().getUTCHours();
+  if (!(hr === 8 || hr === 20)) return;
+  for (const u of users) {
+    const uid = Number(u?.userId || 0);
+    if (!uid) continue;
+
+    const cap = Number(u?.profile?.capital || u?.capital?.amount || 0);
+    const risk = u?.risk || "متوسط";
+    const msg = `🔔 پیشنهاد روزانه تحلیل
+سرمایه ثبت‌شده: ${cap || "-"} ${u?.profile?.capitalCurrency || "USDT"}
+ریسک: ${risk}
+پیشنهاد: امروز با مدیریت سرمایه محافظه‌کارانه و تایید چند-سبکی وارد شو.`;
+    try { await tgSendMessage(env, uid, msg, mainMenuKeyboard(env)); } catch {}
+  }
+}
+
+
+async function verifyBlockchainPayment(payload, env) {
+  const endpoint = (env.BLOCKCHAIN_CHECK_URL || "").toString().trim();
+  if (!endpoint) return { ok: false, reason: "check_url_missing" };
+  const r = await fetchWithTimeout(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }, Number(env.BLOCKCHAIN_CHECK_TIMEOUT_MS || 8000));
+  const j = await r.json().catch(() => null);
+  return j || { ok: false, reason: "bad_response" };
 }
 
 /* ========================== KEYBOARDS ========================== */
@@ -1545,15 +1648,11 @@ function kb(rows) {
 }
 
 function mainMenuKeyboard(env) {
-  const url = getMiniappUrl(env);
-  const miniRow = url ? [{ text: BTN.MINIAPP, web_app: { url } }] : [BTN.MINIAPP];
   return kb([
     [BTN.SIGNAL, BTN.SETTINGS],
-    [BTN.PROFILE, BTN.WALLET],
-    [BTN.SUBSCRIPTION],
-    [BTN.SUPPORT, BTN.EDUCATION],
-    [BTN.LEVELING],
-    miniRow,
+    [BTN.WALLET, BTN.PROFILE],
+    [BTN.INVITE, BTN.SUPPORT],
+    [BTN.EDUCATION, BTN.LEVELING],
     [BTN.HOME],
   ]);
 }
@@ -1563,27 +1662,17 @@ function signalMenuKeyboard() {
 }
 
 function settingsMenuKeyboard() {
-  return kb([[BTN.SET_TF, BTN.SET_STYLE], [BTN.SET_RISK, BTN.SET_NEWS], [BTN.BACK, BTN.HOME]]);
+
+  return kb([[BTN.SET_TF, BTN.SET_STYLE], [BTN.SET_RISK, BTN.SET_NEWS], [BTN.SET_CAPITAL, BTN.REQUEST_CUSTOM_PROMPT], [BTN.BACK, BTN.HOME]]);
 }
 
 function walletMenuKeyboard() {
-  return kb([[BTN.WALLET_DEPOSIT, BTN.WALLET_WITHDRAW], [BTN.WALLET_BALANCE], [BTN.BACK, BTN.HOME]]);
-}
-
-function subscriptionMenuKeyboard() {
-  return kb([[BTN.SUB_BUY], [BTN.SUB_STATUS], [BTN.BACK, BTN.HOME]]);
-}
-
-function subscriptionPlanKeyboard() {
-  return optionsKeyboard(["⭐ ماهانه", "🔥 سه‌ماهه", "👑 سالانه"]);
-}
-
-function subscriptionPayKeyboard(canPayFromBalance) {
-  const rows = [];
-  if (canPayFromBalance) rows.push(["💳 پرداخت از موجودی"]);
-  rows.push(["💸 واریز (TxID)"]);
-  rows.push([BTN.BACK, BTN.HOME]);
-  return kb(rows);
+  return kb([
+    [BTN.WALLET_BALANCE],
+    [BTN.WALLET_DEPOSIT, BTN.WALLET_WITHDRAW],
+    [BTN.WALLET_HISTORY],
+    [BTN.HOME],
+  ]);
 }
 
 
@@ -1619,143 +1708,139 @@ function miniappInlineKeyboard(env) {
   return { inline_keyboard: [[{ text: BTN.MINIAPP, web_app: { url } }]] };
 }
 
-/* ========================== KV STATE (bot_db) ========================== */
+
+
+/* ========================== BOT_DB (D1) STATE ========================== */
+/*
+DDL (Cloudflare D1):
+CREATE TABLE IF NOT EXISTS users (
+  userId TEXT PRIMARY KEY,
+  json TEXT NOT NULL,
+  updatedAt TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS withdrawals (
+  id TEXT PRIMARY KEY,
+  userId TEXT NOT NULL,
+  createdAt TEXT NOT NULL,
+  amount REAL NOT NULL,
+  address TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+*/
+async function dbGetUser(userId, env) {
+  if (!env.BOT_DB) return null;
+  try {
+    const row = await env.BOT_DB.prepare("SELECT json FROM users WHERE userId=?1").bind(String(userId)).first();
+    if (!row || !row.json) return null;
+    return JSON.parse(row.json);
+  } catch (e) {
+    console.error("dbGetUser error:", e);
+    return null;
+  }
+}
+
+async function dbSaveUser(userId, st, env) {
+  if (!env.BOT_DB) return;
+  try {
+    const now = new Date().toISOString();
+    await env.BOT_DB.prepare(
+      "INSERT INTO users (userId, json, updatedAt) VALUES (?1, ?2, ?3) " +
+      "ON CONFLICT(userId) DO UPDATE SET json=excluded.json, updatedAt=excluded.updatedAt"
+    ).bind(String(userId), JSON.stringify(st), now).run();
+  } catch (e) {
+    console.error("dbSaveUser error:", e);
+  }
+}
+
+/*
+DDL additions (Cloudflare D1):
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updatedAt TEXT NOT NULL
+);
+*/
+async function dbGetSetting(env, key) {
+  if (!env.BOT_DB) return null;
+  try {
+    const row = await env.BOT_DB.prepare("SELECT value FROM settings WHERE key=?1").bind(String(key)).first();
+    return row && typeof row.value === "string" ? row.value : null;
+  } catch (e) {
+    // If the table isn't created yet, safely fallback to KV.
+    console.error("dbGetSetting error:", e);
+    return null;
+  }
+}
+
+async function dbSetSetting(env, key, value) {
+  if (!env.BOT_DB) return;
+  try {
+    const now = new Date().toISOString();
+    await env.BOT_DB.prepare(
+      "INSERT INTO settings (key, value, updatedAt) VALUES (?1, ?2, ?3) " +
+      "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updatedAt=excluded.updatedAt"
+    ).bind(String(key), String(value ?? ""), now).run();
+  } catch (e) {
+    console.error("dbSetSetting error:", e);
+  }
+}
+
+// D1-first, KV-fallback + lazy migration (KV -> D1 when D1 is empty).
+async function getSettingText(env, key, fallback = "") {
+  const fromDb = await dbGetSetting(env, key);
+  if (fromDb != null) return fromDb;
+
+  if (env.BOT_KV) {
+    const v = await env.BOT_KV.get(String(key));
+    if (v != null) {
+      // Lazy migrate to D1 for frequently read keys.
+      await dbSetSetting(env, key, v);
+      return v;
+    }
+  }
+  return fallback;
+}
+
+async function setSettingText(env, key, value) {
+  const v = String(value ?? "");
+  await dbSetSetting(env, key, v);
+  if (env.BOT_KV) await env.BOT_KV.put(String(key), v);
+}
+
+async function getSettingJson(env, key, fallback) {
+  const raw = await getSettingText(env, key, "");
+  if (!raw) return fallback;
+  try {
+    const j = JSON.parse(raw);
+    return j == null ? fallback : j;
+  } catch {
+    return fallback;
+  }
+}
+
+async function setSettingJson(env, key, obj) {
+  await setSettingText(env, key, JSON.stringify(obj ?? {}));
+}
+
+/* ========================== KV STATE ========================== */
 async function getUser(userId, env) {
-  const db = getDB(env);
-  if (!db) return null;
-  const raw = await db.get(`u:${userId}`);
+  // Prefer BOT_DB (D1). Fallback to KV.
+  const db = await dbGetUser(userId, env);
+  if (db) return db;
+
+  if (!env.BOT_KV) return null;
+  const raw = await env.BOT_KV.get(`u:${userId}`);
   if (!raw) return null;
   try { return JSON.parse(raw); } catch { return null; }
 }
 async function saveUser(userId, st, env) {
-  const db = getDB(env);
-  if (!db) return;
-  await db.put(`u:${userId}`, JSON.stringify(st));
+  // Write-through to BOT_DB (D1) if available. Also keep KV for compatibility.
+  await dbSaveUser(userId, st, env);
+
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put(`u:${userId}`, JSON.stringify(st));
+  await updateUserIndexes(env, st);
 }
-
-function getCommissionPct(env, username) {
-  const cfg = cfgOf(env);
-  const per = cfg?.commissions?.perUser || {};
-  const k = normHandle(username);
-  const raw = (k && Object.prototype.hasOwnProperty.call(per, k)) ? Number(per[k]) : Number(cfg?.commissions?.globalPct || 0);
-  const pct = Number.isFinite(raw) ? raw : 0;
-  return Math.max(0, pct);
-}
-
-async function createWithdrawTicket(env, payload) {
-  const ticket = `WD-${randomCode(10).toUpperCase()}`;
-  const db = getDB(env);
-  if (db) {
-    const amount = Number(payload?.amount || 0);
-    const pct = getCommissionPct(env, payload?.username || payload?.fromUsername || payload?.from?.username);
-    const fee = Math.max(0, amount * (pct / 100));
-    const net = Math.max(0, amount - fee);
-
-    const data = {
-      ...payload,
-      ticket,
-      status: "pending",
-      commissionPct: pct,
-      commissionFee: Number(fee.toFixed(6)),
-      netAmount: Number(net.toFixed(6)),
-      createdAt: new Date().toISOString(),
-    };
-    // keep for 90 days
-    await db.put(`wd:${ticket}`, JSON.stringify(data), { expirationTtl: 60 * 60 * 24 * 90 });
-  }
-  return ticket;
-}
-
-async function getSubRequest(env, ticket) {
-  const db = getDB(env);
-  if (!db) return null;
-  const raw = await db.get(`subreq:${ticket}`);
-  if (!raw) return null;
-  try { return JSON.parse(raw); } catch { return null; }
-}
-async function putSubRequest(env, ticket, data) {
-  const db = getDB(env);
-  if (!db) return;
-  await db.put(`subreq:${ticket}`, JSON.stringify(data), { expirationTtl: 60 * 60 * 24 * 180 });
-}
-
-async function createSubTicket(env, payload) {
-  const ticket = `SUB-${randomCode(10).toUpperCase()}`;
-  const db = getDB(env);
-  if (db) {
-    const data = {
-      ...payload,
-      ticket,
-      status: "pending",
-      createdAt: new Date().toISOString(),
-    };
-    await putSubRequest(env, ticket, data);
-  }
-  return ticket;
-}
-
-
-function getSubPlans(env) {
-  const cfg = cfgOf(env);
-  if (cfg && Array.isArray(cfg.subPlans) && cfg.subPlans.length) return cfg.subPlans;
-
-  const currency = (env.SUB_CURRENCY || "USDT").toString().trim() || "USDT";
-  const premiumLimit = toInt(env.PREMIUM_DAILY_LIMIT, 200);
-
-  const p1 = Number(env.SUB_PRICE_M1 ?? env.SUB_PRICE_1M ?? 10);
-  const p3 = Number(env.SUB_PRICE_M3 ?? env.SUB_PRICE_3M ?? 25);
-  const p12 = Number(env.SUB_PRICE_Y1 ?? env.SUB_PRICE_12M ?? 80);
-
-  return [
-    { id: "m1", title: "⭐ ماهانه", days: 30, price: Number.isFinite(p1) ? p1 : 10, currency, dailyLimit: premiumLimit },
-    { id: "m3", title: "🔥 سه‌ماهه", days: 90, price: Number.isFinite(p3) ? p3 : 25, currency, dailyLimit: premiumLimit },
-    { id: "y1", title: "👑 سالانه", days: 365, price: Number.isFinite(p12) ? p12 : 80, currency, dailyLimit: premiumLimit },
-  ];
-}
-
-function planFromLabel(env, label) {
-  const s = String(label || "").trim();
-  const plans = getSubPlans(env);
-  if (s.includes("ماه")) return plans.find(p => p.id === "m1");
-  if (s.includes("سه")) return plans.find(p => p.id === "m3");
-  if (s.includes("سال")) return plans.find(p => p.id === "y1");
-  return plans.find(p => p.id === s) || null;
-}
-
-async function notifyAdminsSubRequest(env, data) {
-  const chatId = (env.ADMIN_NOTIFY_CHAT_ID || "").toString().trim();
-  if (!chatId) return;
-
-  const txt =
-    `🧾 درخواست خرید اشتراک
-
-` +
-    `Ticket: ${data.ticket}
-` +
-    `UserId: ${data.userId}
-` +
-    `User: ${data.username ? "@" + data.username : "-"}
-` +
-    `Plan: ${data.planTitle} (${data.planId})
-` +
-    `Price: ${data.amount} ${data.currency}
-` +
-    `Pay: ${data.payMethod}${data.txid ? `
-TxID: ${data.txid}` : ""}
-` +
-    `At: ${data.createdAt}
-`;
-
-  const kbInline = {
-    inline_keyboard: [[
-      { text: "✅ تایید", callback_data: `sub:approve:${data.ticket}` },
-      { text: "❌ رد", callback_data: `sub:reject:${data.ticket}` },
-    ]]
-  };
-
-  await tgSendMessage(env, chatId, txt, kbInline);
-}
-
 
 function defaultUser(userId) {
   return {
@@ -1768,13 +1853,15 @@ function defaultUser(userId) {
 
     // preferences
     timeframe: "H4",
-    style: "اسمارت‌مانی",
+    style: "پرایس اکشن",
     risk: "متوسط",
     newsEnabled: true,
+    promptMode: "style_plus_custom",
 
     // usage quota
     dailyDate: kyivDateString(),
     dailyUsed: 0,
+    freeDailyLimit: 3,
 
     // onboarding/profile
     profile: {
@@ -1788,38 +1875,53 @@ function defaultUser(userId) {
       level: "", // beginner/intermediate/pro
       levelNotes: "",
       onboardingDone: false,
+      capital: 0,
+      capitalCurrency: "USDT",
+
+    },
+
+    capital: {
+      amount: 0,
+      enabled: true,
     },
 
     // referral / points / subscription
     referral: {
-      codes: [],            // 5 codes
+      codes: [],            // 1 code
       referredBy: "",       // inviter userId
       referredByCode: "",   // which code
       successfulInvites: 0,
       points: 0,
+      commissionTotal: 0,
+      commissionBalance: 0,
     },
     subscription: {
       active: false,
       type: "free", // free/premium/gift
       expiresAt: "",
-      dailyLimit: 50, // base
-      planId: "free",
-      pendingTicket: "",
-      pendingPlanId: "",
-      pendingPayMethod: "",
-      pendingAmount: 0,
+      dailyLimit: 3,
     },
 
-    // wallet (اعتبار داخلی - مدیریت دستی/ادمین)
+    // wallet (local balance placeholder)
     wallet: {
       balance: 0,
-      currency: "USDT",
+      transactions: [],
     },
 
     // provider overrides
     textOrder: "",
     visionOrder: "",
     polishOrder: "",
+
+    stats: {
+      totalAnalyses: 0,
+      successfulAnalyses: 0,
+      lastAnalysisAt: "",
+      totalPayments: 0,
+      totalPaymentAmount: 0,
+    },
+    customPromptId: "",
+    pendingCustomPromptRequestId: "",
   };
 }
 
@@ -1830,6 +1932,12 @@ function patchUser(st, userId) {
   merged.referral = { ...d.referral, ...(st?.referral || {}) };
   merged.subscription = { ...d.subscription, ...(st?.subscription || {}) };
   merged.wallet = { ...d.wallet, ...(st?.wallet || {}) };
+  merged.capital = { ...d.capital, ...(st?.capital || {}) };
+  merged.stats = { ...d.stats, ...(st?.stats || {}) };
+  merged.customPromptId = typeof merged.customPromptId === "string" ? merged.customPromptId : "";
+  merged.pendingCustomPromptRequestId = typeof merged.pendingCustomPromptRequestId === "string" ? merged.pendingCustomPromptRequestId : "";
+  merged.profile.capital = Number.isFinite(Number(merged.profile?.capital)) ? Number(merged.profile.capital) : 0;
+  merged.profile.capitalCurrency = typeof merged.profile?.capitalCurrency === "string" ? merged.profile.capitalCurrency : "USDT";
 
   merged.timeframe = merged.timeframe || d.timeframe;
   merged.style = merged.style || d.style;
@@ -1838,9 +1946,7 @@ function patchUser(st, userId) {
 
   merged.dailyDate = merged.dailyDate || d.dailyDate;
   merged.dailyUsed = Number.isFinite(Number(merged.dailyUsed)) ? Number(merged.dailyUsed) : d.dailyUsed;
-
-  merged.wallet.balance = Number.isFinite(Number(merged.wallet?.balance)) ? Number(merged.wallet.balance) : d.wallet.balance;
-  merged.wallet.currency = merged.wallet?.currency || d.wallet.currency;
+  merged.freeDailyLimit = Number.isFinite(Number(merged.freeDailyLimit)) ? Number(merged.freeDailyLimit) : d.freeDailyLimit;
 
   merged.state = merged.state || "idle";
   merged.selectedSymbol = merged.selectedSymbol || "";
@@ -1853,8 +1959,15 @@ function patchUser(st, userId) {
 }
 
 async function ensureUser(userId, env, from) {
-  const existing = await getUser(userId, env);
+  const dbExisting = await dbGetUser(userId, env);
+  const kvExisting = dbExisting ? null : await getUser(userId, env);
+  const existing = dbExisting || kvExisting;
   let st = patchUser(existing || {}, userId);
+
+  // one-way migrate KV -> D1 when BOT_DB is enabled
+  if (env.BOT_DB && !dbExisting && kvExisting) {
+    await dbSaveUser(userId, st, env);
+  }
 
   if (from?.username) st.profile.username = String(from.username);
   if (from?.first_name) st.profile.firstName = String(from.first_name);
@@ -1866,27 +1979,23 @@ async function ensureUser(userId, env, from) {
     st.dailyUsed = 0;
   }
 
-  if (!Array.isArray(st.referral.codes) || st.referral.codes.length < 5) {
+  if (!Array.isArray(st.referral.codes) || st.referral.codes.length < 1) {
     st.referral.codes = (st.referral.codes || []).filter(Boolean);
-    while (st.referral.codes.length < 5) st.referral.codes.push(randomCode(10));
+    while (st.referral.codes.length < 1) st.referral.codes.push(randomCode(10));
   }
 
-  refreshSubscription(st, env);
+  const freeLimit = await getFreeDailyLimit(env);
+  st.freeDailyLimit = freeLimit;
 
-  if (getDB(env)) await saveUser(userId, st, env);
+  if (env.BOT_KV) await saveUser(userId, st, env);
   return st;
 }
 
 function dailyLimit(env, st) {
-  const cfg = cfgOf(env);
-  const freeBase = toInt(cfg?.limits?.freeDailyLimit ?? env?.FREE_DAILY_LIMIT, 50);
-  const premiumBase = toInt(cfg?.limits?.premiumDailyLimit ?? env?.PREMIUM_DAILY_LIMIT, 200);
-
   if (st?.subscription?.active) {
-    const v = toInt(st?.subscription?.dailyLimit, premiumBase);
-    return v || premiumBase;
+    return toInt(st?.subscription?.dailyLimit, 3) || 3;
   }
-  return freeBase;
+  return toInt(st?.freeDailyLimit || st?.subscription?.dailyLimit || 0, 0) || 3;
 }
 
 function canAnalyzeToday(st, from, env) {
@@ -1904,6 +2013,13 @@ function consumeDaily(st, from, env) {
     st.dailyUsed = 0;
   }
   st.dailyUsed = (st.dailyUsed || 0) + 1;
+}
+
+function recordAnalysisSuccess(st) {
+  st.stats = st.stats || {};
+  st.stats.totalAnalyses = (st.stats.totalAnalyses || 0) + 1;
+  st.stats.successfulAnalyses = (st.stats.successfulAnalyses || 0) + 1;
+  st.stats.lastAnalysisAt = new Date().toISOString();
 }
 
 /* ========================== TELEGRAM API ========================== */
@@ -1926,34 +2042,91 @@ async function tgSendMessage(env, chatId, text, replyMarkup) {
     disable_web_page_preview: true,
   });
 }
+
+async function tgSendMessageHtml(env, chatId, html, replyMarkup) {
+  return tgApi(env, "sendMessage", {
+    chat_id: chatId,
+    text: String(html).slice(0, 3900),
+    parse_mode: "HTML",
+    reply_markup: replyMarkup,
+    disable_web_page_preview: false,
+  });
+}
+
 async function tgSendPhoto(env, chatId, photoUrl, caption, replyMarkup) {
-  // Telegram accepts an HTTPS URL as photo
-  const payload = {
+  return tgApi(env, "sendPhoto", {
     chat_id: chatId,
     photo: photoUrl,
+    caption: caption ? String(caption).slice(0, 900) : undefined,
     reply_markup: replyMarkup,
-  };
-  if (caption) payload.caption = String(caption).slice(0, 1000);
-  return tgApi(env, "sendPhoto", payload);
-}
-
-
-async function tgAnswerCallbackQuery(env, callbackQueryId, text = "", showAlert = false) {
-  return tgApi(env, "answerCallbackQuery", {
-    callback_query_id: callbackQueryId,
-    text: text ? String(text).slice(0, 200) : undefined,
-    show_alert: !!showAlert,
   });
 }
 
-async function tgEditMessageText(env, chatId, messageId, text, replyMarkup) {
-  return tgApi(env, "editMessageText", {
-    chat_id: chatId,
-    message_id: messageId,
-    text: String(text).slice(0, 3900),
-    reply_markup: replyMarkup,
-    disable_web_page_preview: true,
+async function tgSendPhotoUpload(env, chatId, photoBytes, filename = "chart.png", caption, replyMarkup) {
+  const boundary = "----tgform" + Math.random().toString(16).slice(2);
+  const CRLF = "\r\n";
+
+  const parts = [];
+  const push = (s) => parts.push(typeof s === "string" ? new TextEncoder().encode(s) : s);
+
+  push(`--${boundary}${CRLF}`);
+  push(`Content-Disposition: form-data; name="chat_id"${CRLF}${CRLF}`);
+  push(String(chatId) + CRLF);
+
+  if (caption) {
+    push(`--${boundary}${CRLF}`);
+    push(`Content-Disposition: form-data; name="caption"${CRLF}${CRLF}`);
+    push(String(caption).slice(0, 900) + CRLF);
+  }
+
+  if (replyMarkup) {
+    push(`--${boundary}${CRLF}`);
+    push(`Content-Disposition: form-data; name="reply_markup"${CRLF}${CRLF}`);
+    push(JSON.stringify(replyMarkup) + CRLF);
+  }
+
+  push(`--${boundary}${CRLF}`);
+  push(`Content-Disposition: form-data; name="photo"; filename="${filename}"${CRLF}`);
+  push(`Content-Type: image/png${CRLF}${CRLF}`);
+  push(new Uint8Array(photoBytes));
+  push(CRLF);
+
+  push(`--${boundary}--${CRLF}`);
+
+  const body = concatU8(parts);
+  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+    body,
   });
+  const j = await r.json().catch(() => null);
+  if (!j || !j.ok) console.error("Telegram sendPhoto(upload) error:", j);
+  return j;
+}
+
+async function tgSendPhotoSmart(env, chatId, photoUrl, caption, replyMarkup) {
+  let j = null;
+  try {
+    const preferUpload = String(env.TG_PHOTO_UPLOAD_FIRST || "") === "1" || String(photoUrl || "").includes("quickchart.io/chart");
+    if (preferUpload) {
+      const r = await fetch(photoUrl);
+      if (!r.ok) return await tgSendPhoto(env, chatId, photoUrl, caption, replyMarkup);
+      const buf = await r.arrayBuffer();
+      const uploadRes = await tgSendPhotoUpload(env, chatId, buf, "chart.png", caption, replyMarkup);
+      if (uploadRes?.ok) return uploadRes;
+    }
+    j = await tgSendPhoto(env, chatId, photoUrl, caption, replyMarkup);
+    if (j?.ok) return j;
+
+    const r = await fetch(photoUrl);
+    if (!r.ok) return j;
+    const buf = await r.arrayBuffer();
+    return await tgSendPhotoUpload(env, chatId, buf, "chart.png", caption, replyMarkup);
+  } catch (e) {
+    console.error("tgSendPhotoSmart fallback failed:", e?.message || e);
+    return j;
+  }
 }
 
 async function tgSendChatAction(env, chatId, action) {
@@ -2037,7 +2210,7 @@ function extractImageFileId(msg, env) {
 
 /* ========================== PROVIDER CHAINS ========================== */
 async function runTextProviders(prompt, env, orderOverride) {
-  const chain = parseOrder(orderOverride || env.TEXT_PROVIDER_ORDER, ["cf","openai","gemini"]);
+  const chain = [...new Set(parseOrder(orderOverride || env.TEXT_PROVIDER_ORDER, ["cf","openai","openrouter","deepseek","gemini"]))];
   let lastErr = null;
   for (const p of chain) {
     try {
@@ -2084,7 +2257,7 @@ async function runVisionProviders(imageUrl, visionPrompt, env, orderOverride) {
   const deadline = Date.now() + totalBudget;
 
   let lastErr = null;
-  let cached = /** @type {{tooLarge?: boolean}|null} */ (null);
+  let cached = /** @type {any} */ (null);
 
   for (const p of chain) {
     const remaining = deadline - Date.now();
@@ -2130,6 +2303,42 @@ async function textProvider(name, prompt, env) {
       },
       body: JSON.stringify({
         model: env.OPENAI_MODEL || "gpt-4o-mini",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.25,
+      }),
+    }, TIMEOUT_TEXT_MS);
+    const j = await r.json().catch(() => null);
+    return j?.choices?.[0]?.message?.content || "";
+  }
+
+  if (name === "openrouter") {
+    if (!env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY_missing");
+    const r = await fetchWithTimeout("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: env.OPENROUTER_MODEL || "openai/gpt-4o-mini",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.25,
+      }),
+    }, TIMEOUT_TEXT_MS);
+    const j = await r.json().catch(() => null);
+    return j?.choices?.[0]?.message?.content || "";
+  }
+
+  if (name === "deepseek") {
+    if (!env.DEEPSEEK_API_KEY) throw new Error("DEEPSEEK_API_KEY_missing");
+    const r = await fetchWithTimeout("https://api.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.DEEPSEEK_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: env.DEEPSEEK_MODEL || "deepseek-chat",
         messages: [{ role: "user", content: prompt }],
         temperature: 0.25,
       }),
@@ -2287,6 +2496,23 @@ function assetKind(symbol) {
   return "unknown";
 }
 
+function providerSupportsSymbol(provider, symbol, env) {
+  const kind = assetKind(symbol);
+  if (provider === "binance") return kind === "crypto";
+  if (provider === "twelvedata") return !!env.TWELVEDATA_API_KEY && ["crypto", "forex", "metal"].includes(kind);
+  if (provider === "alphavantage") return !!env.ALPHAVANTAGE_API_KEY && ["forex", "metal"].includes(kind);
+  if (provider === "finnhub") return !!env.FINNHUB_API_KEY && kind === "forex";
+  if (provider === "yahoo") return true;
+  return true;
+}
+
+function resolveMarketProviderChain(env, symbol) {
+  const desired = parseOrder(env.MARKET_DATA_PROVIDER_ORDER, ["binance","twelvedata","alphavantage","finnhub","yahoo"]);
+  const filtered = desired.filter((p) => providerSupportsSymbol(p, symbol, env));
+  if (filtered.length) return filtered;
+  return ["yahoo"];
+}
+
 function mapTimeframeToBinance(tf) {
   const m = { M15: "15m", H1: "1h", H4: "4h", D1: "1d" };
   return m[tf] || "4h";
@@ -2304,47 +2530,71 @@ function mapForexSymbolForTwelve(symbol) {
 
 function mapTimeframeToAlphaVantage(tf) {
   const m = { M15:"15min", H1:"60min" };
-  if (!m[tf]) throw new Error("alphavantage_tf_not_supported");
-  return m[tf];
+  return m[tf] || "60min";
 }
 
 function toYahooSymbol(symbol) {
-  // Forex
   if (/^[A-Z]{6}$/.test(symbol)) return `${symbol}=X`;
-
-  // Metals (Yahoo FX tickers)
+  if (symbol.endsWith("USDT")) return `${symbol.replace("USDT","-USD")}`;
   if (symbol === "XAUUSD") return "XAUUSD=X";
   if (symbol === "XAGUSD") return "XAGUSD=X";
-
-  // Indices
-  const idxMap = { DJI: "^DJI", NDX: "^NDX", SPX: "^GSPC" };
-  if (idxMap[symbol]) return idxMap[symbol];
-
-  // Crypto
-  if (symbol.endsWith("USDT")) return `${symbol.replace("USDT","-USD")}`;
-
   return symbol;
 }
 function yahooInterval(tf) {
-  const m = { M15:"15m", H1:"60m", H4:"240m", D1:"1d" };
-  return m[tf] || "240m";
+  // Yahoo supports 15m/30m/60m/1d reliably. 240m is often unsupported -> no data.
+  // We fetch 60m for H4 and downsample to 4H candles.
+  const m = { M15:"15m", H1:"60m", H4:"60m", D1:"1d" };
+  return m[tf] || "60m";
+}
+
+function downsampleCandles(candles, groupSize) {
+  if (!Array.isArray(candles) || candles.length === 0) return [];
+  const out = [];
+  for (let i = 0; i < candles.length; i += groupSize) {
+    const g = candles.slice(i, i + groupSize);
+    if (!g.length) continue;
+    const o = g[0].o;
+    const c = g[g.length - 1].c;
+    let h = -Infinity, l = Infinity, v = 0;
+    for (const x of g) {
+      if (Number.isFinite(x.h)) h = Math.max(h, x.h);
+      if (Number.isFinite(x.l)) l = Math.min(l, x.l);
+      if (Number.isFinite(x.v)) v += x.v;
+    }
+    out.push({ t: g[g.length - 1].t, o, h, l, c, v });
+  }
+  return out;
 }
 
 async function fetchBinanceCandles(symbol, timeframe, limit, timeoutMs) {
   if (!symbol.endsWith("USDT")) throw new Error("binance_not_crypto");
   const interval = mapTimeframeToBinance(timeframe);
-  const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
-  const r = await fetchWithTimeout(url, {}, timeoutMs);
-  if (!r.ok) throw new Error(`binance_http_${r.status}`);
-  const data = await r.json();
-  return data.map(k => ({
-    t: k[0],
-    o: Number(k[1]),
-    h: Number(k[2]),
-    l: Number(k[3]),
-    c: Number(k[4]),
-    v: Number(k[5]),
-  }));
+  const urls = [
+    `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`,
+    `https://data-api.binance.vision/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`,
+    `https://api.binance.us/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`,
+  ];
+  let lastErr = null;
+  for (const url of urls) {
+    try {
+      const r = await fetchWithTimeout(url, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+      }, timeoutMs);
+      if (!r.ok) throw new Error(`binance_http_${r.status}`);
+      const data = await r.json();
+      return data.map(k => ({
+        t: k[0],
+        o: Number(k[1]),
+        h: Number(k[2]),
+        l: Number(k[3]),
+        c: Number(k[4]),
+        v: Number(k[5]),
+      }));
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("binance_http_failed");
 }
 
 async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) {
@@ -2352,19 +2602,32 @@ async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) 
   const kind = assetKind(symbol);
   if (kind === "unknown") throw new Error("twelvedata_unknown_symbol");
 
-  const isH4 = String(timeframe || "").toUpperCase() === "H4";
-  const interval = isH4 ? "1h" : mapTimeframeToTwelve(timeframe);
-  const outputsize = isH4 ? Math.min(limit * 4, 5000) : limit;
+  const interval = mapTimeframeToTwelve(timeframe);
   const sym = mapForexSymbolForTwelve(symbol);
-  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&outputsize=${outputsize}&apikey=${encodeURIComponent(env.TWELVEDATA_API_KEY)}`;
+  const base = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${encodeURIComponent(env.TWELVEDATA_API_KEY)}`;
+  const sources = [];
+  if (kind === "crypto") sources.push("binance");
+  if (kind === "forex" || kind === "metal") sources.push("fx");
+  const urls = [base, ...sources.map((s) => `${base}&source=${encodeURIComponent(s)}`)];
 
-  const r = await fetchWithTimeout(url, {}, timeoutMs);
-  if (!r.ok) throw new Error(`twelvedata_http_${r.status}`);
-  const j = await r.json();
-  if (j.status === "error") throw new Error(`twelvedata_err_${j.code || ""}`);
+  let lastErr = null;
+  let j = null;
+  for (const url of urls) {
+    try {
+      const r = await fetchWithTimeout(url, {}, timeoutMs);
+      if (!r.ok) throw new Error(`twelvedata_http_${r.status}`);
+      j = await r.json();
+      if (j.status === "error") throw new Error(`twelvedata_err_${j.code || ""}`);
+      break;
+    } catch (e) {
+      lastErr = e;
+      j = null;
+    }
+  }
+  if (!j) throw lastErr || new Error("twelvedata_http_failed");
 
   const values = Array.isArray(j.values) ? j.values : [];
-  const candles = values.reverse().map(v => ({
+  return values.reverse().map(v => ({
     t: Date.parse(v.datetime + "Z") || Date.now(),
     o: Number(v.open),
     h: Number(v.high),
@@ -2372,7 +2635,6 @@ async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) 
     c: Number(v.close),
     v: v.volume ? Number(v.volume) : null,
   }));
-  return isH4 ? resampleCandles(candles, 4 * 60 * 60 * 1000).slice(-limit) : candles;
 }
 
 async function fetchAlphaVantageFxIntraday(symbol, timeframe, limit, timeoutMs, env) {
@@ -2448,106 +2710,330 @@ async function fetchFinnhubForexCandles(symbol, timeframe, limit, timeoutMs, env
 }
 
 async function fetchYahooChartCandles(symbol, timeframe, limit, timeoutMs) {
+  // Yahoo can intermittently return 404 from some edges / for some symbols.
+  // We try multiple hosts + richer headers, and we keep H4 as 60m + downsample.
+  const interval = yahooInterval(timeframe);
   const ysym = toYahooSymbol(symbol);
-  const isH4 = String(timeframe || "").toUpperCase() === "H4";
 
-  // Yahoo often rejects 240m; fetch 60m and resample to 4H
-  const interval = isH4 ? "60m" : yahooInterval(timeframe);
-  const range = isH4 ? "30d" : "10d";
+  // Pick a range that gives enough bars for downsampling + analysis.
+  const baseRange = (timeframe === "D1") ? "6mo" : (timeframe === "H4" ? "30d" : "10d");
 
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ysym)}?interval=${interval}&range=${range}&includePrePost=false`;
-  const res = await fetchWithTimeout(url, {}, timeoutMs);
-  if (!res.ok) throw new Error("yahoo_http_" + res.status);
-  const j = await res.json();
+  const tryIntervals = [];
+  if (interval) tryIntervals.push(interval);
+  if (interval !== "60m") tryIntervals.push("60m");
 
-  const r = j?.chart?.result?.[0];
-  const ts = r?.timestamp;
-  const quote = r?.indicators?.quote?.[0];
-  if (!ts || !quote) throw new Error("yahoo_no_data");
+  const hosts = [
+    "https://query1.finance.yahoo.com",
+    "https://query2.finance.yahoo.com"
+  ];
 
-  const out = [];
-  for (let i = 0; i < ts.length; i++) {
-    const o = quote.open?.[i];
-    const h = quote.high?.[i];
-    const l = quote.low?.[i];
-    const c = quote.close?.[i];
-    const v = quote.volume?.[i] ?? 0;
-    if ([o, h, l, c].some(x => x == null)) continue;
-    out.push({ t: ts[i] * 1000, o, h, l, c, v });
+  const qs = `?interval={IV}&range=${encodeURIComponent(baseRange)}&includePrePost=false&events=div%7Csplit%7Cearn&lang=en-US&region=US`;
+
+  const headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://finance.yahoo.com/",
+    "Origin": "https://finance.yahoo.com"
+  };
+
+  let lastErr = null;
+
+  for (const iv of tryIntervals) {
+    for (const host of hosts) {
+      try {
+        const url = `${host}/v8/finance/chart/${encodeURIComponent(ysym)}` + qs.replace("{IV}", encodeURIComponent(iv));
+        const r = await fetchWithTimeout(url, { headers }, timeoutMs);
+        if (!r.ok) throw new Error(`yahoo_http_${r.status}`);
+        const j = await r.json();
+
+        const result = j?.chart?.result?.[0];
+        const ts = result?.timestamp || [];
+        const q = result?.indicators?.quote?.[0];
+        if (!ts.length || !q) throw new Error("yahoo_no_data");
+
+        let candles = ts.map((t, i) => ({
+          t: t * 1000,
+          o: Number(q.open?.[i]),
+          h: Number(q.high?.[i]),
+          l: Number(q.low?.[i]),
+          c: Number(q.close?.[i]),
+          v: q.volume?.[i] != null ? Number(q.volume[i]) : null
+        })).filter(x => Number.isFinite(x.c));
+
+        if (timeframe === "H4" && iv === "60m") {
+          candles = downsampleCandles(candles, 4);
+        }
+
+        return candles.slice(-limit);
+      } catch (e) {
+        lastErr = e;
+      }
+    }
   }
-
-  const candles = isH4 ? resampleCandles(out, 4 * 60 * 60 * 1000) : out;
-  return candles.slice(-limit);
+  throw lastErr || new Error("yahoo_no_data");
 }
 
-function resampleCandles(candles, bucketMs) {
-  const out = [];
-  if (!Array.isArray(candles) || !candles.length) return out;
+function marketCacheKey(symbol, timeframe) {
+  return `market:${String(symbol).toUpperCase()}:${String(timeframe).toUpperCase()}`;
+}
 
-  let cur = null;
-  for (const x of candles) {
-    const b = Math.floor(Number(x.t) / bucketMs) * bucketMs;
-    if (!cur || cur.t !== b) {
-      if (cur) out.push(cur);
-      cur = { t: b, o: x.o, h: x.h, l: x.l, c: x.c, v: Number(x.v || 0) };
-      continue;
-    }
-    cur.h = Math.max(cur.h, x.h);
-    cur.l = Math.min(cur.l, x.l);
-    cur.c = x.c;
-    cur.v = Number(cur.v || 0) + Number(x.v || 0);
-  }
-  if (cur) out.push(cur);
-  return out;
+async function getMarketCache(env, key) {
+  const mem = cacheGet(MARKET_CACHE, key);
+  if (mem) return mem;
+  const r2 = await getCachedR2Value(env.MARKET_R2, key);
+  if (r2) cacheSet(MARKET_CACHE, key, r2, Number(env.MARKET_CACHE_TTL_MS || 120000));
+  return r2;
+}
+
+async function getMarketCacheStale(env, key) {
+  const mem = cacheGet(MARKET_CACHE, key);
+  if (mem) return mem;
+  const r2 = await getCachedR2ValueAllowStale(env.MARKET_R2, key);
+  if (r2) cacheSet(MARKET_CACHE, key, r2, Number(env.MARKET_CACHE_TTL_MS || 120000));
+  return r2;
+}
+
+async function setMarketCache(env, key, value) {
+  const ttlMs = Number(env.MARKET_CACHE_TTL_MS || 120000);
+  cacheSet(MARKET_CACHE, key, value, ttlMs);
+  await r2PutJson(env.MARKET_R2, key, value, ttlMs);
 }
 
 async function getMarketCandlesWithFallback(env, symbol, timeframe) {
-  const timeoutMs = Number(env.MARKET_DATA_TIMEOUT_MS || 7000);
+  const timeoutMs = Number(env.MARKET_DATA_TIMEOUT_MS || 12000);
   const limit = Number(env.MARKET_DATA_CANDLES_LIMIT || 120);
+  const tf = String(timeframe || "H4").toUpperCase();
+  const cacheKey = marketCacheKey(symbol, tf);
+  const minNeed = minCandlesForTimeframe(tf);
+  const cached = await getMarketCache(env, cacheKey);
+  if (Array.isArray(cached) && cached.length >= Math.min(6, minNeed)) return cached;
 
-  const kind = assetKind(symbol);
-
-  // Default provider order is chosen by asset kind to avoid noisy/pointless fallbacks.
-  const defaultByKind =
-    kind === "crypto" ? ["binance", "yahoo", "twelvedata"] :
-    kind === "index" ? ["yahoo", "twelvedata"] :
-    /* forex/metals/unknown */ ["twelvedata", "alphavantage", "finnhub", "yahoo"];
-
-  // Allow override via env.MARKET_DATA_PROVIDER_ORDER, but still filter by compatibility.
-  const chainRaw = parseOrder(env.MARKET_DATA_PROVIDER_ORDER, defaultByKind);
-
-  const isCompat = (p) => {
-    if (p === "binance") return kind === "crypto";
-    if (p === "alphavantage") return kind === "forex" || kind === "metal";
-    if (p === "finnhub") return kind === "forex";
-    if (p === "twelvedata") return kind === "forex" || kind === "metal" || kind === "index";
-    if (p === "yahoo") return true;
-    return false;
-  };
-
-  // Ensure yahoo is always available as last resort
-  const chain = [...chainRaw.filter(isCompat), "yahoo"].filter((v, i, a) => a.indexOf(v) === i);
-
+  const chain = resolveMarketProviderChain(env, symbol);
   let lastErr = null;
 
   for (const p of chain) {
     try {
-      if (p === "binance") return await fetchBinanceCandles(symbol, timeframe, limit, timeoutMs);
-      if (p === "twelvedata") return await fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env);
-      if (p === "alphavantage") return await fetchAlphaVantageFxIntraday(symbol, timeframe, limit, timeoutMs, env);
-      if (p === "finnhub") return await fetchFinnhubForexCandles(symbol, timeframe, limit, timeoutMs, env);
-      if (p === "yahoo") return await fetchYahooChartCandles(symbol, timeframe, limit, timeoutMs);
+      let candles = null;
+      if (p === "binance") candles = await fetchBinanceCandles(symbol, tf, limit, timeoutMs);
+      if (p === "twelvedata") candles = await fetchTwelveDataCandles(symbol, tf, limit, timeoutMs, env);
+      if (p === "alphavantage") candles = await fetchAlphaVantageFxIntraday(symbol, tf, limit, timeoutMs, env);
+      if (p === "finnhub") candles = await fetchFinnhubForexCandles(symbol, tf, limit, timeoutMs, env);
+      if (p === "yahoo") candles = await fetchYahooChartCandles(symbol, tf, limit, timeoutMs);
+      if (Array.isArray(candles) && candles.length) {
+        await setMarketCache(env, cacheKey, candles);
+        if (candles.length >= minNeed) return candles;
+      }
     } catch (e) {
       lastErr = e;
-
-      // By default keep logs clean; enable with DEBUG_MARKET_DATA=1
-      if (String(env.DEBUG_MARKET_DATA || "") === "1") {
-        console.warn("market provider failed:", p, e?.message || e);
-      }
+      console.error("market provider failed:", p, e?.message || e);
     }
   }
 
+  const stale = await getMarketCacheStale(env, cacheKey);
+  if (Array.isArray(stale) && stale.length) return stale;
+
+  // fallback: use near timeframe source and aggregate to requested tf
+  const altTimeframes = {
+    M15: ["M5", "M1"],
+    H1: ["M15", "M5"],
+    H4: ["H1", "M15"],
+    D1: ["H4", "H1"],
+  };
+  const candidates = altTimeframes[tf] || [];
+  for (const altTf of candidates) {
+    try {
+      const altCandles = await getMarketCandlesWithFallbackRaw(env, symbol, altTf, timeoutMs, limit * 8);
+      const mapped = aggregateCandlesToTimeframe(altCandles, altTf, tf).slice(-limit);
+      if (Array.isArray(mapped) && mapped.length) {
+        await setMarketCache(env, cacheKey, mapped);
+        if (mapped.length >= Math.min(8, minNeed)) return mapped;
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+
+  // final fallback: try stale cache from any timeframe and remap
+  const remapped = await getAnyTimeframeMarketCache(env, symbol, tf, limit);
+  if (Array.isArray(remapped) && remapped.length) {
+    await setMarketCache(env, cacheKey, remapped.slice(-limit));
+    return remapped.slice(-limit);
+  }
+
   throw lastErr || new Error("market_data_all_failed");
+}
+
+async function getAnyTimeframeMarketCache(env, symbol, targetTf, limit) {
+  const tfs = ["M15", "H1", "H4", "D1"];
+  for (const sourceTf of tfs) {
+    const cacheKey = marketCacheKey(symbol, sourceTf);
+    const cached = await getMarketCacheStale(env, cacheKey);
+    if (!Array.isArray(cached) || !cached.length) continue;
+    const mapped = aggregateCandlesToTimeframe(cached, sourceTf, targetTf);
+    if (Array.isArray(mapped) && mapped.length) return mapped.slice(-limit);
+    if (String(sourceTf) === String(targetTf)) return cached.slice(-limit);
+  }
+  return [];
+}
+
+async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs, limit) {
+  const cacheKey = marketCacheKey(symbol, timeframe);
+  const cached = await getMarketCache(env, cacheKey);
+  if (Array.isArray(cached) && cached.length) return cached;
+  const chain = resolveMarketProviderChain(env, symbol);
+  let lastErr = null;
+  for (const p of chain) {
+    try {
+      let candles = null;
+      if (p === "binance") candles = await fetchBinanceCandles(symbol, timeframe, limit, timeoutMs);
+      if (p === "twelvedata") candles = await fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env);
+      if (p === "alphavantage") candles = await fetchAlphaVantageFxIntraday(symbol, timeframe, limit, timeoutMs, env);
+      if (p === "finnhub") candles = await fetchFinnhubForexCandles(symbol, timeframe, limit, timeoutMs, env);
+      if (p === "yahoo") candles = await fetchYahooChartCandles(symbol, timeframe, limit, timeoutMs);
+      if (Array.isArray(candles) && candles.length) {
+        await setMarketCache(env, cacheKey, candles);
+        return candles;
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("market_data_alt_failed");
+}
+
+async function fetchSymbolNewsFa(symbol, env) {
+  const query = symbolNewsQueryFa(symbol);
+  const timeoutMs = Number(env.NEWS_TIMEOUT_MS || 9000);
+  const limit = Math.min(8, Math.max(3, Number(env.NEWS_ITEMS_LIMIT || 6)));
+
+  const urls = [
+    "https://news.google.com/rss/search?q=" + encodeURIComponent(query) + "&hl=fa&gl=IR&ceid=IR:fa",
+    "https://news.google.com/rss/search?q=" + encodeURIComponent(symbol + " market") + "&hl=fa&gl=IR&ceid=IR:fa",
+  ];
+
+  let lastErr = null;
+  for (const u of urls) {
+    try {
+      const r = await fetchWithTimeout(u, { headers: { "User-Agent": "Mozilla/5.0" } }, timeoutMs);
+      if (!r.ok) throw new Error("news_http_" + r.status);
+      const xml = await r.text();
+      const items = parseRssItems(xml, limit);
+      if (items.length) return items;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("news_failed");
+}
+
+function symbolNewsQueryFa(symbol) {
+  const map = {
+    BTCUSDT: "بیت کوین", ETHUSDT: "اتریوم", BNBUSDT: "بایننس کوین", SOLUSDT: "سولانا",
+    XRPUSDT: "ریپل", ADAUSDT: "کاردانو", DOGEUSDT: "دوج کوین", AVAXUSDT: "آوالانچ",
+    EURUSD: "یورو دلار", GBPUSD: "پوند دلار", USDJPY: "دلار ین", AUDUSD: "دلار استرالیا",
+    XAUUSD: "طلا", XAGUSD: "نقره", DJI: "داوجونز", NDX: "نزدک", SPX: "اس اند پی 500"
+  };
+  return (map[symbol] || symbol) + " بازار مالی";
+}
+
+function stripTags(s) {
+  return String(s || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function decodeXmlEntities(s) {
+  return String(s || "")
+    .split("&amp;").join("&")
+    .split("&lt;").join("<")
+    .split("&gt;").join(">")
+    .split("&quot;").join('"')
+    .split("&#39;").join("'");
+}
+
+function parseRssItems(xml, limit) {
+  const raw = String(xml || "");
+  const blocks = raw.match(/<item>[\s\S]*?<\/item>/g) || [];
+  const out = [];
+  for (const b of blocks.slice(0, limit * 2)) {
+    const title = decodeXmlEntities(stripTags((b.match(/<title>([\s\S]*?)<\/title>/i) || [])[1] || "")).trim();
+    const link = decodeXmlEntities(((b.match(/<link>([\s\S]*?)<\/link>/i) || [])[1] || "").trim());
+    const source = decodeXmlEntities(stripTags((b.match(/<source[^>]*>([\s\S]*?)<\/source>/i) || [])[1] || "")).trim();
+    const pubDate = decodeXmlEntities(stripTags((b.match(/<pubDate>([\s\S]*?)<\/pubDate>/i) || [])[1] || "")).trim();
+    if (!title || !link) continue;
+    out.push({ title: title.slice(0, 180), url: link, source: source || "Google News", publishedAt: pubDate || "" });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+async function buildNewsBlockForSymbol(symbol, env, maxItems = 4) {
+  try {
+    const rows = await fetchSymbolNewsFa(symbol, env);
+    if (!Array.isArray(rows) || !rows.length) return "";
+    return rows.slice(0, maxItems).map((x, i) => {
+      const src = x?.source ? (" | " + x.source) : "";
+      const dt = x?.publishedAt ? (" | " + x.publishedAt) : "";
+      return (i + 1) + ") " + String(x?.title || "") + src + dt;
+    }).join("\n");
+  } catch {
+    return "";
+  }
+}
+
+
+
+function parseNewsBlockRows(newsBlock) {
+  return String(newsBlock || "").split("\n").map((x) => ({ title: String(x || "").replace(/^\d+\)\s*/, "").trim() })).filter((x) => x.title);
+}
+
+async function buildNewsAnalysisSummary(symbol, articles, env) {
+  const rows = Array.isArray(articles) ? articles.slice(0, 5) : [];
+  if (!rows.length) return "برای این نماد خبر کافی جهت جمع‌بندی خبری در دسترس نیست.";
+  const top = rows.map((a, i) => `${i + 1}) ${String(a?.title || "")}`).join("\n");
+  const prompt = [
+    "تحلیل‌گر خبر بازار مالی هستی.",
+    `نماد: ${symbol}`,
+    "از تیترهای زیر، یک جمع‌بندی کوتاه فارسی در ۳ بخش بساز:",
+    "۱) احساس غالب بازار (صعودی/نزولی/خنثی)",
+    "۲) ریسک خبری کوتاه‌مدت",
+    "۳) اثر احتمالی روی سناریوی معاملاتی",
+    "خیال‌بافی نکن و فقط بر اساس تیترها بنویس.",
+    "TIERS:",
+    top,
+  ].join("\n");
+  try {
+    const out = await runTextProviders(prompt, env, env.TEXT_PROVIDER_ORDER);
+    return String(out || "").trim() || "جمع‌بندی خبری تولید نشد.";
+  } catch {
+    return "جمع‌بندی خبری موقت: تیترها نشان‌دهنده نوسان کوتاه‌مدت هستند؛ ورود فقط با تایید تکنیکال انجام شود.";
+  }
+}
+
+function timeframeMinutes(tf) {
+  const map = { M1: 1, M5: 5, M15: 15, M30: 30, H1: 60, H4: 240, D1: 1440, W1: 10080 };
+  return map[String(tf || "").toUpperCase()] || 0;
+}
+
+function aggregateCandlesToTimeframe(candles, fromTf, toTf) {
+  if (!Array.isArray(candles) || candles.length < 2) return candles || [];
+  const fromMin = timeframeMinutes(fromTf);
+  const toMin = timeframeMinutes(toTf);
+  if (!fromMin || !toMin || toMin <= fromMin || toMin % fromMin !== 0) return candles;
+  const step = Math.max(1, Math.round(toMin / fromMin));
+  const out = [];
+  for (let i = 0; i < candles.length; i += step) {
+    const chunk = candles.slice(i, i + step).filter((x) => Number.isFinite(x?.o) && Number.isFinite(x?.h) && Number.isFinite(x?.l) && Number.isFinite(x?.c));
+    if (!chunk.length) continue;
+    out.push({
+      t: chunk[0].t,
+      o: chunk[0].o,
+      h: Math.max(...chunk.map((x) => x.h)),
+      l: Math.min(...chunk.map((x) => x.l)),
+      c: chunk[chunk.length - 1].c,
+      v: chunk.reduce((s, x) => s + (Number(x.v) || 0), 0),
+    });
+  }
+  return out;
 }
 
 function computeSnapshot(candles) {
@@ -2589,193 +3075,170 @@ function candlesToCompactCSV(candles, maxRows = 80) {
   const tail = candles.slice(-maxRows);
   return tail.map(x => `${x.t},${x.o},${x.h},${x.l},${x.c}`).join("\n");
 }
-function buildQuickChartUrl(candles, symbol, timeframe, analysisText) {
-  try {
-    const tail = (candles || []).slice(-70);
-    if (!tail.length) return "";
 
-    const labels = tail.map(c => {
-      const d = new Date(c.t);
-      return (timeframe === "D1")
-        ? d.toISOString().slice(5, 10)   // MM-DD
-        : d.toISOString().slice(11, 16); // HH:MM
-    });
-
-    const closes = tail.map(c => Number(c.c)).filter(n => Number.isFinite(n));
-    if (!closes.length) return "";
-
-    const hi = Math.max(...closes);
-    const lo = Math.min(...closes);
-    const range = (hi - lo) || (Math.abs(hi) || 1);
-
-    // ---- Extract likely price levels from analysis text (and keep only a few) ----
-    const levels = (() => {
-      if (!analysisText) return [];
-      const raw = (toLatinDigits(analysisText).match(/\b\d{1,10}(?:\.\d{1,10})?\b/g) || []);
-      const nums = raw.map(Number).filter(n => Number.isFinite(n));
-      const minOk = lo - range * 0.25;
-      const maxOk = hi + range * 0.25;
-
-      // remove list numbers (1..20) that often appear in sections
-      const filtered = nums.filter(n => {
-        if (Number.isInteger(n) && n >= 1 && n <= 20) return false;
-        return n >= minOk && n <= maxOk;
-      }).sort((a, b) => a - b);
-
-      // de-duplicate with tolerance
-      const uniq = [];
-      const eps = Math.max(range * 0.006, (Math.abs(hi) || 1) * 0.001);
-      for (const n of filtered) {
-        if (!uniq.length || Math.abs(uniq[uniq.length - 1] - n) > eps) uniq.push(n);
-      }
-
-      if (uniq.length <= 3) return uniq;
-      // pick support / mid / resistance
-      return [uniq[0], uniq[Math.floor(uniq.length / 2)], uniq[uniq.length - 1]];
-    })();
-
-    const constArr = (v) => labels.map(() => Number(v));
-    const zoneDatasets = [];
-
-    // band width: ~1.2% of recent range (with a floor based on price)
-    for (let i = 0; i < levels.length; i++) {
-      const L = levels[i];
-      const band = Math.max(range * 0.012, Math.abs(L) * 0.0015);
-
-      // upper (invisible)
-      zoneDatasets.push({
-        label: "zone_u_" + i,
-        data: constArr(L + band),
-        borderWidth: 0,
-        pointRadius: 0,
-        borderColor: "rgba(0,0,0,0)",
-        backgroundColor: "rgba(0,0,0,0)",
-        fill: false,
-        order: 0
-      });
-
-      // lower (fills to previous -> shaded band)
-      zoneDatasets.push({
-        label: "zone_" + i,
-        data: constArr(L - band),
-        borderWidth: 0,
-        pointRadius: 0,
-        borderColor: "rgba(0,0,0,0)",
-        backgroundColor: (i % 2 === 0) ? "rgba(109,94,246,0.14)" : "rgba(0,209,255,0.12)",
-        fill: "-1",
-        order: 0
-      });
-
-      // center dashed line
-      zoneDatasets.push({
-        label: "level_" + i,
-        data: constArr(L),
-        borderWidth: 1,
-        pointRadius: 0,
-        borderDash: [6, 5],
-        fill: false,
-        order: 1
-      });
-    }
-
-    const cfg = {
-      type: "line",
-      data: {
-        labels,
-        datasets: [
-          ...zoneDatasets,
-          {
-            label: symbol + " " + timeframe,
-            data: closes,
-            fill: false,
-            borderWidth: 2,
-            pointRadius: 0,
-            tension: 0.25,
-            order: 99
-          }
-        ]
-      },
-      options: {
-        responsive: true,
-        plugins: {
-          legend: { display: false },
-          title: { display: true, text: symbol + " • " + timeframe + " • Close + Zones" }
-        },
-        scales: {
-          x: { ticks: { maxTicksLimit: 8 } },
-          y: { ticks: { maxTicksLimit: 6 } }
-        }
-      }
-    };
-
-    return "https://quickchart.io/chart?format=png&width=900&height=450&devicePixelRatio=2&c=" +
-      encodeURIComponent(JSON.stringify(cfg));
-  } catch {
-    return "";
-  }
+function minCandlesForTimeframe(tf) {
+  const m = { M15: 48, H1: 36, H4: 30, D1: 20 };
+  return m[String(tf || "").toUpperCase()] || 24;
 }
 
+function buildLocalFallbackAnalysis(symbol, st, candles, reason = "") {
+  const tf = st?.timeframe || "H4";
+  const snap = computeSnapshot(Array.isArray(candles) ? candles : []);
+  const levels = extractLevelsFromCandles(Array.isArray(candles) ? candles : []);
+  const levelTxt = levels.length ? levels.join(" | ") : "داده کافی نیست";
+  const bias = snap?.trend || "نامشخص";
+  const risk =
+    String(st?.risk || "").trim() ||
+    (snap ? (Math.abs(Number(snap.changePct || 0)) > 2 ? "بالا" : "متوسط") : "نامشخص");
+
+  return [
+    "۱) وضعیت کلی",
+    `نماد ${symbol} در تایم‌فریم ${tf} با بایاس ${bias} ارزیابی شد.`,
+    snap ? `قیمت آخر: ${snap.lastPrice} | تغییر: ${snap.changePct}%` : "قیمت لحظه‌ای معتبر در دسترس نیست.",
+    "",
+    "۲) زون‌ها و سطوح",
+    `سطوح پیشنهادی (auto): ${levelTxt}`,
+    "",
+    "۳) سناریوها",
+    `سناریوی اصلی: ادامه ${bias === "صعودی" ? "حرکت رو به بالا" : (bias === "نزولی" ? "فشار فروش" : "نوسانی")}.`,
+    "سناریوی جایگزین: شکست ساختار خلاف جهت و بازگشت به محدوده‌های میانی.",
+    "",
+    "۴) مدیریت ریسک",
+    `ریسک پیشنهادی: ${risk}. ورود پله‌ای، حدضرر اجباری و کاهش اهرم توصیه می‌شود.`,
+    "",
+    "۵) وضعیت سرویس",
+    `تحلیل با فالبک داخلی تولید شد (${reason || "text_provider_unavailable"}).`,
+  ].join("\n");
+}
 
 /* ========================== TEXT BUILDERS ========================== */
-async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env) {
+async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env, newsBlock = "") {
   const tf = st.timeframe || "H4";
-  const baseRaw = await getAnalysisPromptForStyle(env, st.style);
-  const base = baseRaw.replaceAll("{TIMEFRAME}", tf);
+  const baseRaw = await getAnalysisPrompt(env);
+  const sp = await getStylePrompt(env, st.style);
+  const customPrompts = await getCustomPrompts(env);
+  const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
+  const promptMode = String(st.promptMode || "style_plus_custom").trim();
+  const includeStylePrompt = promptMode !== "custom_only";
+  const includeStyleGuide = promptMode === "combined_all" || promptMode === "style_only" || promptMode === "style_plus_custom";
+  const includeCustomPrompt = !!customPrompt?.text && (promptMode === "custom_only" || promptMode === "style_plus_custom" || promptMode === "combined_all");
+  const newsAnalysisBlock = newsBlock ? await buildNewsAnalysisSummary(symbol, parseNewsBlockRows(newsBlock), env) : "";
+  const base = baseRaw
+     .split("{TIMEFRAME}").join(tf)
+     .split("{STYLE}").join(st.style || "")
+     .split("{RISK}").join(st.risk || "")
+     .split("{NEWS}").join(st.newsEnabled ? "on" : "off");
 
   const userExtra = (isStaff({ username: st.profile?.username }, env) && userPrompt?.trim())
     ? userPrompt.trim()
     : "تحلیل با حالت نهادی";
 
   return (
-    `${base}\n\n` +
-    (getStyleGuide(st.style) ? `STYLE_GUIDE:\n${getStyleGuide(st.style)}\n\n` : ``) +
-    `ASSET: ${symbol}\n` +
-    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}\n\n` +
-    `MARKET_DATA:\n${marketBlock}\n\n` +
-    `RULES:\n` +
-    `- خروجی فقط فارسی و دقیقاً بخش‌های ۱ تا ۵\n` +
-    `- سطح‌های قیمتی را مشخص کن (X/Y/Z)\n` +
-    `- شرط کندلی را واضح بگو (close/wick)\n` +
-    `- از داده OHLC استفاده کن، خیال‌بافی نکن\n\n` +
-    `EXTRA:\n${userExtra}`
+    `${base}
+
+` +
+    (includeStylePrompt && sp ? `STYLE_PROMPT:
+${sp}
+
+` : ``) +
+    (includeStyleGuide && getStyleGuide(st.style) ? `STYLE_GUIDE:
+${getStyleGuide(st.style)}
+
+` : ``) +
+    (includeCustomPrompt ? `CUSTOM_PROMPT:
+${customPrompt.text}
+
+` : ``) +
+    `ASSET: ${symbol}
+` +
+
+    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}, Capital=${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}
+
+` +
+    `MARKET_DATA:
+${marketBlock}
+
+` +
+    (newsBlock ? `NEWS_HEADLINES_FA:
+${newsBlock}
+
+` : ``) +
+    (newsAnalysisBlock ? `NEWS_ANALYSIS_FA:
+${newsAnalysisBlock}
+
+` : ``) +
+    `RULES:
+` +
+    `- خروجی فقط فارسی باشد
+` +
+    `- فقط از سبک انتخاب‌شده (STYLE_MODE) استفاده کن و ساختار خروجی را مطابق STYLE_PROMPT رعایت کن
+` +
+    `- مدیریت سرمایه متناسب با Capital را لحاظ کن و سایز پوزیشن پیشنهادی بده
+` +
+    `- quickchart_config را به شکل JSON داخلی بساز اما به کاربر نمایش نده
+` +
+    `- سطح‌های قیمتی را مشخص کن (X/Y/Z)
+` +
+    `- شرط کندلی را واضح بگو (close/wick)
+` +
+    `- از داده OHLC استفاده کن، خیال‌بافی نکن
+` +
+    `- اگر NEWS_HEADLINES_FA موجود بود، تحلیل خبری کوتاه و اثر خبر روی سناریوها را اضافه کن
+
+` +
+    `EXTRA:
+${userExtra}`
   );
 }
 
 async function buildVisionPrompt(st, env) {
   const tf = st.timeframe || "H4";
-  const baseRaw = await getAnalysisPromptForStyle(env, st.style);
-  const base = baseRaw.replaceAll("{TIMEFRAME}", tf);
+  const baseRaw = await getAnalysisPrompt(env);
+  const sp = await getStylePrompt(env, st.style);
+  const customPrompts = await getCustomPrompts(env);
+  const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
+  const promptMode = String(st.promptMode || "style_plus_custom").trim();
+  const includeStylePrompt = promptMode !== "custom_only";
+  const includeStyleGuide = promptMode === "combined_all" || promptMode === "style_only" || promptMode === "style_plus_custom";
+  const includeCustomPrompt = !!customPrompt?.text && (promptMode === "custom_only" || promptMode === "style_plus_custom" || promptMode === "combined_all");
+  const base = baseRaw
+     .split("{TIMEFRAME}").join(tf)
+     .split("{STYLE}").join(st.style || "")
+     .split("{RISK}").join(st.risk || "")
+     .split("{NEWS}").join(st.newsEnabled ? "on" : "off");
   return (
-    `${base}\n\n` +
-    `TASK: این تصویر چارت را تحلیل کن. دقیقاً خروجی ۱ تا ۵ بده و سطح‌ها را مشخص کن.\n` +
-    `RULES: فقط فارسی، لحن افشاگر، خیال‌بافی نکن.\n`
+    `${base}
+
+` +
+    (includeStylePrompt && sp ? `STYLE_PROMPT:
+${sp}
+
+` : ``) +
+    (includeStyleGuide && getStyleGuide(st.style) ? `STYLE_GUIDE:
+${getStyleGuide(st.style)}
+
+` : ``) +
+    (includeCustomPrompt ? `CUSTOM_PROMPT:
+${customPrompt.text}
+
+` : ``) +
+    `TASK: این تصویر چارت را تحلیل کن. دقیقاً خروجی ۱ تا ۵ بده و سطح‌ها را مشخص کن.
+` +
+    `RULES: فقط فارسی، لحن افشاگر، خیال‌بافی نکن.
+`
   );
 }
 
 /* ========================== WALLET (ADMIN ONLY) ========================== */
 async function getWallet(env) {
-  const cfg = cfgOf(env);
-  if (cfg?.walletAddress) return String(cfg.walletAddress).trim();
-
-  const db = getDB(env);
-  if (db) {
-    const v = await db.get("settings:wallet");
-    if (v && String(v).trim()) return String(v).trim();
-  }
-
-  return (env.WALLET_ADDRESS || "").toString().trim();
+  const fallback = (env.WALLET_ADDRESS || "").toString().trim();
+  const v = await getSettingText(env, "settings:wallet", fallback);
+  return (v || fallback).toString().trim();
 }
 async function setWallet(env, wallet) {
-  const db = getDB(env);
-  if (!db) throw new Error("bot_db_missing");
-
   const w = String(wallet || "").trim();
-  const cfg = cfgOf(env) || defaultMainConfig(env);
-  cfg.walletAddress = w;
-
-  await saveMainConfig(env, cfg);
-  // backward compat key
-  await db.put("settings:wallet", w);
+  if (!w) throw new Error("wallet_empty");
+  await setSettingText(env, "settings:wallet", w);
 }
 
 /* ========================== LEVELING (AI) ========================== */
@@ -2837,14 +3300,12 @@ function mapPreferredMarket(s) {
 
 /* ========================== REFERRAL / POINTS ========================== */
 async function storeReferralCodeOwner(env, code, ownerUserId) {
-  const db = getDB(env);
-  if (!db) return;
-  await db.put(`ref:${code}`, String(ownerUserId));
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put(`ref:${code}`, String(ownerUserId));
 }
 async function resolveReferralOwner(env, code) {
-  const db = getDB(env);
-  if (!db) return "";
-  const v = await db.get(`ref:${code}`);
+  if (!env.BOT_KV) return "";
+  const v = await env.BOT_KV.get(`ref:${code}`);
   return (v || "").toString().trim();
 }
 
@@ -2858,22 +3319,21 @@ async function hashPhone(phone) {
 }
 
 async function isPhoneNew(env, phone) {
-  if (!getDB(env)) return true;
+  if (!env.BOT_KV) return true;
   const h = await hashPhone(phone);
   const key = `phone:${h}`;
-  const exists = await getDB(env).get(key);
+  const exists = await env.BOT_KV.get(key);
   return !exists;
 }
 
 async function markPhoneSeen(env, phone, userId) {
-  const db = getDB(env);
-  if (!db) return;
+  if (!env.BOT_KV) return;
   const h = await hashPhone(phone);
-  await db.put(`phone:${h}`, String(userId));
+  await env.BOT_KV.put(`phone:${h}`, String(userId));
 }
 
 async function awardReferralIfEligible(env, newUserSt) {
-  if (!getDB(env)) return;
+  if (!env.BOT_KV) return;
   const phone = newUserSt.profile?.phone || "";
   if (!phone) return;
 
@@ -2886,7 +3346,7 @@ async function awardReferralIfEligible(env, newUserSt) {
   const inviterId = String(newUserSt.referral.referredBy);
   const inviter = await ensureUser(inviterId, env);
   inviter.referral.successfulInvites = (inviter.referral.successfulInvites || 0) + 1;
-  inviter.referral.points = (inviter.referral.points || 0) + 3;
+  inviter.referral.points = (inviter.referral.points || 0) + 6;
 
   if (inviter.referral.points >= 500) {
     inviter.referral.points -= 500;
@@ -2904,40 +3364,9 @@ function futureISO(days) {
   return d.toISOString();
 }
 
-function addDaysISO(baseIso, days) {
-  const base = baseIso ? Date.parse(baseIso) : NaN;
-  const t0 = Number.isFinite(base) ? base : Date.now();
-  const d = new Date(t0 + Number(days || 0) * 24 * 3600 * 1000);
-  return d.toISOString();
-}
-
-function refreshSubscription(st, env) {
-  st.subscription = st.subscription || {};
-  const exp = st.subscription.expiresAt;
-  if (st.subscription.active && exp) {
-    const t = Date.parse(exp);
-    if (Number.isFinite(t) && t <= Date.now()) {
-      st.subscription.active = false;
-      st.subscription.type = "free";
-      st.subscription.planId = "free";
-      st.subscription.expiresAt = "";
-      st.subscription.dailyLimit = toInt(env?.FREE_DAILY_LIMIT, 50);
-    }
-  }
-  if (!st.subscription.dailyLimit) st.subscription.dailyLimit = toInt(env?.FREE_DAILY_LIMIT, 50);
-}
-
 /* ========================== UPDATE HANDLER ========================== */
 async function handleUpdate(update, env) {
   try {
-    env.__cfg = await loadMainConfig(env);
-
-    const cq = update.callback_query;
-    if (cq) {
-      await handleCallbackQuery(env, cq);
-      return;
-    }
-
     const msg = update.message;
     if (!msg) return;
 
@@ -2984,112 +3413,32 @@ async function handleUpdate(update, env) {
       if (!isStaff(from, env)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین/اونر می‌تواند پرامپت تحلیل را تعیین کند.", mainMenuKeyboard(env));
       const p = text.split(" ").slice(1).join(" ").trim();
       if (!p) return tgSendMessage(env, chatId, "فرمت: /setprompt <prompt_text>", mainMenuKeyboard(env));
-      if (!getDB(env)) return tgSendMessage(env, chatId, "⛔️ BOT_KV فعال نیست.", mainMenuKeyboard(env));
-      await getDB(env).put("settings:analysis_prompt", p);
+      if (!env.BOT_DB && !env.BOT_KV) return tgSendMessage(env, chatId, "⛔️ Storage فعال نیست (BOT_DB/BOT_KV).", mainMenuKeyboard(env));
+      await setAnalysisPrompt(env, p);
       return tgSendMessage(env, chatId, "✅ پرامپت تحلیل ذخیره شد.", mainMenuKeyboard(env));
     }
 
-    if (text.startsWith("/setpromptstyle")) {
+
+    if (text.startsWith("/setstyleprompt")) {
       if (!isStaff(from, env)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین/اونر می‌تواند پرامپت هر سبک را تعیین کند.", mainMenuKeyboard(env));
-      if (!getDB(env)) return tgSendMessage(env, chatId, "⛔️ BOT_KV فعال نیست.", mainMenuKeyboard(env));
-
-      const parts = text.split(" ");
-      const styleArg = parts[1] || "";
-      const p = parts.slice(2).join(" ").trim();
-      if (!styleArg || !p) {
-        return tgSendMessage(
-          env,
-          chatId,
-          "فرمت: /setpromptstyle <style> <prompt_text>\n\nstyle های معتبر: اسکالپ | سوئینگ | اسمارت‌مانی | پرایس اکشن | ICT | ATR",
-          mainMenuKeyboard(env)
-        );
+      const rest = text.replace("/setstyleprompt", "").trim();
+      const sp = rest.split(" ");
+      const style = (sp.shift() || "").trim();
+      const prompt = sp.join(" ").trim();
+      if (!style || !prompt) {
+        return tgSendMessage(env, chatId, "فرمت: /setstyleprompt <style> <prompt_text>", mainMenuKeyboard(env));
       }
-
-      const label = normalizeStyleLabel(styleArg);
-      const key = stylePromptKey(label);
-      if (!key) {
-        return tgSendMessage(env, chatId, "❌ سبک نامعتبر است. یکی از این‌ها را وارد کن: اسکالپ | سوئینگ | اسمارت‌مانی | پرایس اکشن | ICT | ATR", mainMenuKeyboard(env));
-      }
-
-      await getDB(env).put(`settings:analysis_prompt:${key}`, p);
-      return tgSendMessage(env, chatId, `✅ پرامپت سبک «${label}» ذخیره شد.`, mainMenuKeyboard(env));
+      if (!env.BOT_DB && !env.BOT_KV) return tgSendMessage(env, chatId, "⛔️ Storage فعال نیست (BOT_DB/BOT_KV).", mainMenuKeyboard(env));
+      await setStylePrompt(env, style, prompt);
+      return tgSendMessage(env, chatId, `✅ پرامپت سبک «${style}» ذخیره شد.`, mainMenuKeyboard(env));
     }
 
-    if (text.startsWith("/getpromptstyle")) {
-      if (!isStaff(from, env)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین/اونر می‌تواند پرامپت‌ها را ببیند.", mainMenuKeyboard(env));
-      const styleArg = text.split(" ").slice(1).join(" ").trim();
-      if (!styleArg) return tgSendMessage(env, chatId, "فرمت: /getpromptstyle <style>", mainMenuKeyboard(env));
-      const label = normalizeStyleLabel(styleArg);
-      const p = await getAnalysisPromptForStyle(env, label);
-      return tgSendMessage(env, chatId, `🧩 پرامپت سبک «${label}»:\n\n${p}`, mainMenuKeyboard(env));
-    }
-
-    if (text.startsWith("/setbalance")) {
-      if (!isAdmin(from, env)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین می‌تواند موجودی را تغییر دهد.", mainMenuKeyboard(env));
-      const parts = text.split(" ");
-      const uid = parts[1];
-      const amount = Number(toAsciiDigits(parts[2] || ""));
-      if (!uid || !Number.isFinite(amount)) return tgSendMessage(env, chatId, "فرمت: /setbalance <userId> <amount>", mainMenuKeyboard(env));
-      const u = await ensureUser(uid, env);
-      u.wallet = u.wallet || { balance: 0, currency: "USDT" };
-      u.wallet.balance = amount;
-      await saveUser(uid, u, env);
-      return tgSendMessage(env, chatId, `✅ موجودی کاربر ${uid} شد: ${amount} ${u.wallet.currency || "USDT"}`, mainMenuKeyboard(env));
-    }
-
-    if (text.startsWith("/addbalance")) {
-      if (!isAdmin(from, env)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین می‌تواند موجودی را تغییر دهد.", mainMenuKeyboard(env));
-      const parts = text.split(" ");
-      const uid = parts[1];
-      const delta = Number(toAsciiDigits(parts[2] || ""));
-      if (!uid || !Number.isFinite(delta)) return tgSendMessage(env, chatId, "فرمت: /addbalance <userId> <delta>", mainMenuKeyboard(env));
-      const u = await ensureUser(uid, env);
-      u.wallet = u.wallet || { balance: 0, currency: "USDT" };
-      u.wallet.balance = Number(u.wallet.balance || 0) + delta;
-      await saveUser(uid, u, env);
-      return tgSendMessage(env, chatId, `✅ موجودی کاربر ${uid} تغییر کرد: ${u.wallet.balance} ${u.wallet.currency || "USDT"}`, mainMenuKeyboard(env));
-    }
-
-    // ===== Subscription admin commands =====
-    if (text === "/sublist") {
-      if (!isAdmin(from, env)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین.", mainMenuKeyboard(env));
-      if (!getDB(env) || !getDB(env).list) return tgSendMessage(env, chatId, "⛔️ KV list در دسترس نیست.", mainMenuKeyboard(env));
-
-      const res = await getDB(env).list({ prefix: "subreq:", limit: 30 });
-      const keys = res?.keys || [];
-      if (!keys.length) return tgSendMessage(env, chatId, "درخواستی پیدا نشد.", mainMenuKeyboard(env));
-
-      const pending = [];
-      for (const k of keys) {
-        const ticket = String(k.name || "").replace("subreq:", "");
-        const req = await getSubRequest(env, ticket);
-        if (req && req.status === "pending") {
-          pending.push(`• ${ticket} | ${req.planTitle || req.planId} | ${req.amount} ${req.currency} | ${req.userId}`);
-        }
-      }
-      if (!pending.length) return tgSendMessage(env, chatId, "درخواست در انتظار نداریم ✅", mainMenuKeyboard(env));
-      return tgSendMessage(env, chatId, "🕓 Pending:\n" + pending.join("\n"), mainMenuKeyboard(env));
-    }
-
-    if (text.startsWith("/subapprove")) {
-      if (!isAdmin(from, env)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین.", mainMenuKeyboard(env));
-      const parts = text.split(" ");
-      const ticket = (parts[1] || "").trim();
-      if (!ticket) return tgSendMessage(env, chatId, "فرمت: /subapprove <ticket>", mainMenuKeyboard(env));
-      const r = await adminApproveSub(env, ticket, from);
-      if (!r.ok) return tgSendMessage(env, chatId, "⚠️ خطا: " + (r.error || "نامشخص"), mainMenuKeyboard(env));
-      return tgSendMessage(env, chatId, `✅ تایید شد. اعتبار تا: ${r.expiresAt}`, mainMenuKeyboard(env));
-    }
-
-    if (text.startsWith("/subreject")) {
-      if (!isAdmin(from, env)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین.", mainMenuKeyboard(env));
-      const parts = text.split(" ");
-      const ticket = (parts[1] || "").trim();
-      const reason = parts.slice(2).join(" ").trim();
-      if (!ticket) return tgSendMessage(env, chatId, "فرمت: /subreject <ticket> <reason?>", mainMenuKeyboard(env));
-      const r = await adminRejectSub(env, ticket, from, reason || "رد شد");
-      if (!r.ok) return tgSendMessage(env, chatId, "⚠️ خطا: " + (r.error || "نامشخص"), mainMenuKeyboard(env));
-      return tgSendMessage(env, chatId, "❌ رد شد.", mainMenuKeyboard(env));
+    if (text.startsWith("/getstyleprompt")) {
+      if (!isStaff(from, env)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین/اونر.", mainMenuKeyboard(env));
+      const style = text.replace("/getstyleprompt", "").trim();
+      if (!style) return tgSendMessage(env, chatId, "فرمت: /getstyleprompt <style>", mainMenuKeyboard(env));
+      const p = await getStylePrompt(env, style);
+      return tgSendMessage(env, chatId, p ? `🎯 ${style}\n\n${p}` : "برای این سبک چیزی ثبت نشده.", mainMenuKeyboard(env));
     }
 
 
@@ -3099,11 +3448,10 @@ async function handleUpdate(update, env) {
         await startOnboarding(env, chatId, from, st);
         return;
       }
-      st.state = "wiz_market";
+      st.state = "choose_symbol";
       st.selectedSymbol = "";
-      st.wizard = { market: "", symbol: "", style: "", timeframe: "" };
       await saveUser(userId, st, env);
-      return tgSendMessage(env, chatId, "🧭 مرحله ۱/۴: بازار را انتخاب کن:", signalMenuKeyboard());
+      return tgSendMessage(env, chatId, "📈 دسته‌بندی سیگنال‌ها:", signalMenuKeyboard());
     }
 
     if (text === "/settings" || text === BTN.SETTINGS) {
@@ -3115,221 +3463,141 @@ async function handleUpdate(update, env) {
       return sendSettingsSummary(env, chatId, st, from);
     }
 
+
+    if (text === "/wallet" || text === BTN.WALLET) {
+      const wallet = await getWallet(env);
+      const txt =
+        `💳 ولت و پرداخت\n\n` +
+        (wallet ? `آدرس ولت:\n${wallet}\n\n` : "") +
+        `برای مشاهده موجودی، واریز یا برداشت از دکمه‌ها استفاده کن.`;
+      return tgSendMessage(env, chatId, txt, walletMenuKeyboard());
+    }
+
+    if (text === BTN.WALLET_BALANCE) {
+      const bal = Number(st.referral?.commissionBalance || 0);
+      return tgSendMessage(env, chatId, `💰 موجودی قابل برداشت (کمیسیون): ${bal} USDT`, walletMenuKeyboard());
+    }
+
+    if (text === BTN.WALLET_HISTORY) {
+      const tx = Array.isArray(st.wallet?.transactions) ? st.wallet.transactions.slice(-10).reverse() : [];
+      const wd = await listWithdrawalsByUser(env, String(st.userId), 10);
+
+      const lines = [];
+      if (tx.length) {
+        lines.push("➕ واریزهای اخیر:");
+        for (const t of tx) {
+          lines.push(`• ${t.amount || 0} | ${t.txHash ? String(t.txHash).slice(0,10)+"…" : "-"} | ${t.createdAt || "-"}`);
+        }
+        lines.push("");
+      }
+      if (wd.length) {
+        lines.push("➖ برداشت‌های اخیر:");
+        for (const w of wd) {
+          lines.push(`• ${w.amount || 0} | ${String(w.status || "pending")} | ${w.address ? String(w.address).slice(0,10)+"…" : "-"} | ${w.createdAt || "-"}`);
+        }
+      }
+
+      const msg = lines.length ? lines.join("\n") : "تراکنشی ثبت نشده.";
+      return tgSendMessage(env, chatId, msg, walletMenuKeyboard());
+    }
+
+    if (text === BTN.WALLET_DEPOSIT) {
+      const wallet = await getWallet(env);
+      const memo = `U${st.userId}`;
+      st.state = "wallet_deposit_txid";
+      await saveUser(userId, st, env);
+      const txt =
+        `➕ واریز (BEP20)
+
+` +
+        `پلن: marketi1 PRO | با ارزش: ۲۵ USDT
+
+` +
+        (wallet ? `آدرس ولت:
+${wallet}
+` : "") +
+        `
+Memo/Tag: ${memo}
+
+` +
+        `TxID پرداخت رو همینجا بفرست (اختیاری: <txid> <amount>). اگر مبلغ رو نفرستی، 25 در نظر می‌گیریم.
+
+واریزی فقط به آدرس ولت درگاه ممکن است
+در لیست زیر باید از واریز هش واریزی را ارسال کنید.`;
+      return tgSendMessage(env, chatId, txt, kb([[BTN.BACK, BTN.HOME]]));
+    }
+
+    if (text === BTN.WALLET_WITHDRAW) {
+      st.state = "wallet_withdraw";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "➖ برداشت\n\nفرمت را بفرست:\n<amount> <address>", kb([[BTN.HOME]]));
+    }
+
+
     if (text === "/profile" || text === BTN.PROFILE) {
       return tgSendMessage(env, chatId, profileText(st, from, env), mainMenuKeyboard(env));
     }
 
+    if (text === "/invite" || text === BTN.INVITE) {
+      const { link, share } = inviteShareText(st, env);
+      const pts = Number(st.referral?.points || 0);
+      const inv = Number(st.referral?.successfulInvites || 0);
+      const com = Number(st.referral?.commissionBalance || 0);
+      if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
+      const txt =
+        `🤝 دعوت دوستان
 
-    if (text === "/wallet" || text === BTN.WALLET) {
-      const walletAddr = await getWallet(env);
-      const addrLine = walletAddr ? `\n\nآدرس واریز:\n${walletAddr}` : "";
-      const bal = Number(st.wallet?.balance || 0);
-      const cur = st.wallet?.currency || "USDT";
-      return tgSendMessage(
-        env,
-        chatId,
-        `💳 کیف پول\n\nموجودی: ${bal} ${cur}\nامتیاز شما: ${Number(st.referral?.points || 0)}${addrLine}\n\nیکی از گزینه‌ها را انتخاب کن:`,
-        walletMenuKeyboard()
-      );
-    }
+` +
+        `امتیاز شما: ${pts} | دعوت موفق: ${inv} | کمیسیون قابل برداشت: ${com} USDT
 
-    if (text === BTN.WALLET_DEPOSIT) {
-      const walletAddr = await getWallet(env);
-      const addrLine = walletAddr ? `${walletAddr}` : "فعلاً آدرس ولت تنظیم نشده.";
-      return tgSendMessage(
-        env,
-        chatId,
-        `➕ واریز\n\nآدرس واریز:\n${addrLine}\n\nبعد از واریز، رسید/TxId را برای پشتیبانی ارسال کن تا موجودی‌ات شارژ شود.`,
-        walletMenuKeyboard()
-      );
-    }
+` +
+        `🔗 لینک رفرال اختصاصی: <a href="${escapeHtml(link)}">باز کردن لینک دعوت</a>
 
-    if (text === BTN.WALLET_BALANCE) {
-      const bal = Number(st.wallet?.balance || 0);
-      const cur = st.wallet?.currency || "USDT";
-      return tgSendMessage(
-        env,
-        chatId,
-        `📊 موجودی\n\nموجودی: ${bal} ${cur}\nامتیاز: ${Number(st.referral?.points || 0)}\nاشتراک: ${st.subscription?.active ? "فعال ✅" : "غیرفعال ❌"}${st.subscription?.expiresAt ? `\nانقضا: ${st.subscription.expiresAt}` : ""}`,
-        walletMenuKeyboard()
-      );
-    }
+` +
+        (share ? `برای اشتراک‌گذاری سریع: <a href="${escapeHtml(share)}">ارسال لینک</a>
 
-    if (text === BTN.WALLET_WITHDRAW) {
-      st.state = "wallet_withdraw_amount";
-      await saveUser(userId, st, env);
-      return tgSendMessage(env, chatId, "➖ برداشت\n\nمبلغ برداشت را وارد کن (عدد).", kb([[BTN.BACK, BTN.HOME]]));
+` : "") +
+        `قانون‌ها:
+با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتباز بدست می اورید در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید`;
+      return tgSendMessageHtml(env, chatId, txt, mainMenuKeyboard(env));
     }
 
 
-    
-    // ===== Subscription (purchase -> admin approve -> activate) =====
-    if (text === "/sub" || text === "/subscription" || text === BTN.SUBSCRIPTION) {
-      if (!st.profile?.name || !st.profile?.phone) {
-        await tgSendMessage(env, chatId, "برای خرید اشتراک، اول نام و شماره را ثبت کن ✅", mainMenuKeyboard(env));
-        await startOnboarding(env, chatId, from, st);
-        return;
-      }
-      st.state = "sub_menu";
-      await saveUser(userId, st, env);
-      return tgSendMessage(env, chatId, subscriptionStatusText(st, env), subscriptionMenuKeyboard());
-    }
-
-    if (text === BTN.SUB_STATUS) {
-      st.state = "sub_menu";
-      await saveUser(userId, st, env);
-      return tgSendMessage(env, chatId, subscriptionStatusText(st, env), subscriptionMenuKeyboard());
-    }
-
-    if (text === BTN.SUB_BUY) {
-      if (!getDB(env)) return tgSendMessage(env, chatId, "⚠️ سیستم اشتراک نیاز به BOT_KV دارد.", mainMenuKeyboard(env));
-      if (st.subscription?.pendingTicket) {
-        st.state = "sub_menu";
-        await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, `🕓 یک درخواست در انتظار داری:\nTicket: ${st.subscription.pendingTicket}\n\nبعد از تأیید مدیریت فعال می‌شود.`, subscriptionMenuKeyboard());
-      }
-      st.state = "sub_choose_plan";
-      await saveUser(userId, st, env);
-      return tgSendMessage(env, chatId, "🛒 پلن را انتخاب کن:", subscriptionPlanKeyboard());
-    }
-
-    if (st.state === "sub_choose_plan") {
-      const plan = planFromLabel(env, text);
-      if (!plan) {
-        return tgSendMessage(env, chatId, "پلن نامعتبره. یکی از گزینه‌ها را انتخاب کن:", subscriptionPlanKeyboard());
-      }
-
-      st.subscription.pendingPlanId = plan.id;
-      st.subscription.pendingAmount = plan.price;
-      st.subscription.pendingPayMethod = "";
-      st.state = "sub_choose_pay";
-      await saveUser(userId, st, env);
-
-      const bal = Number(st.wallet?.balance || 0);
-      const canPay = bal >= plan.price;
-
-      const walletAddr = await getWallet(env);
-      const msg =
-        `🧾 فاکتور اشتراک\n\n` +
-        `پلن: ${plan.title}\n` +
-        `مبلغ: ${plan.price} ${plan.currency}\n\n` +
-        (canPay ? `گزینه «پرداخت از موجودی» فعال است ✅\n` : `موجودی کافی نیست (موجودی: ${bal}).\n`) +
-        (walletAddr ? `آدرس واریز: ${walletAddr}\n` : ``) +
-        `\nروش پرداخت را انتخاب کن:`;
-
-      return tgSendMessage(env, chatId, msg, subscriptionPayKeyboard(canPay));
-    }
-
-    if (st.state === "sub_choose_pay") {
-      const plan = planFromLabel(env, st.subscription?.pendingPlanId);
-      if (!plan) {
-        st.state = "sub_choose_plan";
-        await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, "پلن از دست رفت. دوباره انتخاب کن:", subscriptionPlanKeyboard());
-      }
-
-      if (text.includes("پرداخت از موجودی")) {
-        const bal = Number(st.wallet?.balance || 0);
-        if (bal < plan.price) return tgSendMessage(env, chatId, "⛔️ موجودی کافی نیست.", subscriptionPayKeyboard(false));
-
-        st.wallet.balance = bal - plan.price;
-
-        const payload = {
-          userId: String(userId),
-          username: st.profile?.username || from?.username || "",
-          planId: plan.id,
-          planTitle: plan.title,
-          planDays: plan.days,
-          dailyLimit: plan.dailyLimit,
-          amount: plan.price,
-          currency: plan.currency,
-          payMethod: "balance",
-          txid: "",
-          paidFromBalance: true,
-        };
-
-        const ticket = await createSubTicket(env, payload);
-
-        st.subscription.pendingTicket = ticket;
-        st.subscription.pendingPayMethod = "balance";
-        st.state = "sub_menu";
-        await saveUser(userId, st, env);
-
-        await notifyAdminsSubRequest(env, { ...payload, ticket });
-
-        return tgSendMessage(env, chatId, `✅ درخواست ثبت شد.\nTicket: ${ticket}\n\n🕓 بعد از تأیید مدیریت اشتراک فعال می‌شود.`, subscriptionMenuKeyboard());
-      }
-
-      if (text.includes("واریز")) {
-        st.subscription.pendingPayMethod = "txid";
-        st.state = "sub_enter_txid";
-        await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, "TxID / رسید واریز را ارسال کن (یک متن کوتاه کافیست).", kb([[BTN.BACK, BTN.HOME]]));
-      }
-
-      return tgSendMessage(env, chatId, "یک روش پرداخت انتخاب کن:", subscriptionPayKeyboard(true));
-    }
-
-    if (st.state === "sub_enter_txid") {
-      const plan = planFromLabel(env, st.subscription?.pendingPlanId);
-      if (!plan) {
-        st.state = "sub_choose_plan";
-        await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, "پلن از دست رفت. دوباره انتخاب کن:", subscriptionPlanKeyboard());
-      }
-
-      const txid = String(text || "").trim();
-      if (txid.length < 4) return tgSendMessage(env, chatId, "TxID/رسید نامعتبره. دوباره ارسال کن.", kb([[BTN.BACK, BTN.HOME]]));
-
-      const payload = {
-        userId: String(userId),
-        username: st.profile?.username || from?.username || "",
-        planId: plan.id,
-        planTitle: plan.title,
-        planDays: plan.days,
-        dailyLimit: plan.dailyLimit,
-        amount: plan.price,
-        currency: plan.currency,
-        payMethod: "txid",
-        txid,
-        paidFromBalance: false,
-      };
-
-      const ticket = await createSubTicket(env, payload);
-
-      st.subscription.pendingTicket = ticket;
-      st.state = "sub_menu";
-      await saveUser(userId, st, env);
-
-      await notifyAdminsSubRequest(env, { ...payload, ticket });
-
-      return tgSendMessage(env, chatId, `✅ رسید ثبت شد.\nTicket: ${ticket}\n\n🕓 بعد از تأیید مدیریت اشتراک فعال می‌شود.`, subscriptionMenuKeyboard());
-    }
-
-
-if (text === "/education" || text === BTN.EDUCATION) {
-      return tgSendMessage(env, chatId, "📚 آموزش و مفاهیم بازار\n\nبه‌زودی محتوای آموزشی اضافه می‌شود.\nفعلاً برای تعیین سطح روی «🧪 تعیین سطح» بزن.", mainMenuKeyboard(env));
+    if (text === "/education" || text === BTN.EDUCATION) {
+      return tgSendMessage(env, chatId, "📚 آموزش و مفاهیم بازار\n\nبه‌زودی محتوای آموزشی اضافه می‌شود.", mainMenuKeyboard(env));
     }
 
     if (text === "/support" || text === BTN.SUPPORT) {
       const handle = env.SUPPORT_HANDLE || "@support";
       const wallet = await getWallet(env);
       const walletLine = wallet ? `\n\n💳 آدرس ولت جهت پرداخت:\n${wallet}` : "";
-      return tgSendMessage(env, chatId, `🆘 پشتیبانی\n\nپیام بده به: ${handle}${walletLine}`, mainMenuKeyboard(env));
+      return tgSendMessage(
+        env,
+        chatId,
+        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.
+
+با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.\n\nپیام مستقیم: ${handle}${walletLine}`,
+        kb([[BTN.SUPPORT_FAQ, BTN.SUPPORT_TICKET], [BTN.SUPPORT_CUSTOM_PROMPT], [BTN.HOME]])
+      );
     }
 
     if (text === "/miniapp" || text === BTN.MINIAPP) {
       const url = getMiniappUrl(env);
       if (!url) {
-        return tgSendMessage(env, chatId, "⚠️ لینک مینی‌اپ تنظیم نشده.\n\nدر Wrangler / داشبورد یک متغیر ENV به نام MINIAPP_URL یا PUBLIC_BASE_URL بگذار (مثلاً https://<your-worker-domain>/ ) و دوباره Deploy کن.", mainMenuKeyboard(env));
+        return tgSendMessage(env, chatId, `⚠️ لینک مینی‌اپ تنظیم نشده.
+
+در Wrangler / داشبورد یک متغیر ENV به نام MINIAPP_URL یا PUBLIC_BASE_URL بگذار (مثلاً https://<your-worker-domain>/ ) و دوباره Deploy کن.`, mainMenuKeyboard(env));
       }
-      return tgSendMessage(env, chatId, "🧩 برای باز کردن مینی‌اپ روی دکمه زیر بزن:", miniappInlineKeyboard(env) || mainMenuKeyboard(env));
+      return tgSendMessage(env, chatId, `🧩 لینک مینی‌اپ:
+${url}`, mainMenuKeyboard(env));
     }
+
 
     if (text === "/users") {
       if (!isStaff(from, env)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین/اونر می‌تواند لیست کاربران را ببیند.", mainMenuKeyboard(env));
       return sendUsersList(env, chatId);
     }
+
 
     if (text === BTN.LEVELING || text === "/level") {
       if (!st.profile?.name || !st.profile?.phone) {
@@ -3339,6 +3607,25 @@ if (text === "/education" || text === BTN.EDUCATION) {
       }
       await startLeveling(env, chatId, from, st);
       return;
+    }
+    if (text === BTN.SET_CAPITAL) {
+      st.state = "set_capital";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "💼 لطفاً سرمایه قابل معامله‌ات را به عدد وارد کن (مثال: 1000)", kb([[BTN.BACK, BTN.HOME]]));
+    }
+
+    if (text === BTN.REQUEST_CUSTOM_PROMPT) {
+      st.state = "request_custom_prompt";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "🧠 درخواستت برای پرامپت اختصاصی را بنویس (سبک، بازار، هدف).", kb([[BTN.BACK, BTN.HOME]]));
+    }
+
+    if (text === BTN.SUPPORT_FAQ || text === "/faq") {
+      st.state = "support_faq";
+      await saveUser(userId, st, env);
+      const faq = getSupportFaq();
+      const list = faq.map((f, i) => `${i + 1}) ${f.q}`).join("\n");
+      return tgSendMessage(env, chatId, `❓ سوالات آماده\n\n${list}\n\nعدد سوال را ارسال کن تا پاسخ را ببینی.`, kb([[BTN.BACK, BTN.HOME]]));
     }
 
     if (text === BTN.HOME) {
@@ -3354,44 +3641,16 @@ if (text === "/education" || text === BTN.EDUCATION) {
         await saveUser(userId, st, env);
         return tgSendMessage(env, chatId, "🏠 برگشتی به منوی اصلی.", mainMenuKeyboard(env));
       }
-      if (st.state === "wiz_tf") {
-        st.state = "wiz_style";
-        await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, "🧭 مرحله ۳/۴: سبک را انتخاب کن:", optionsKeyboard(["اسکالپ","سوئینگ","اسمارت‌مانی","پرایس اکشن","ICT","ATR"]));
-      }
-      if (st.state === "wiz_style") {
-        st.state = "wiz_symbol";
-        const mkt = st.wizard?.market || "";
-        const list = (mkt === "forex") ? MAJORS : (mkt === "metals") ? METALS : (mkt === "indices") ? INDICES : CRYPTOS;
-        await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, "🧭 مرحله ۲/۴: نماد را انتخاب کن:", listKeyboard(list));
-      }
-      if (st.state === "wiz_symbol") {
-        st.state = "wiz_market";
-        await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, "🧭 مرحله ۱/۴: بازار را انتخاب کن:", signalMenuKeyboard());
-      }
-      if (st.state === "wiz_market") {
-        st.state = "idle";
-        await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, "🏠 منوی اصلی:", mainMenuKeyboard(env));
-      }
       if (st.state === "await_prompt") {
-        st.state = "wiz_market";
+        st.state = "choose_symbol";
         st.selectedSymbol = "";
-        st.wizard = { market: "", symbol: "", style: "", timeframe: "" };
         await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, "🧭 مرحله ۱/۴: بازار را انتخاب کن:", signalMenuKeyboard());
+        return tgSendMessage(env, chatId, "📈 دسته‌بندی سیگنال‌ها:", signalMenuKeyboard());
       }
       if (st.state.startsWith("set_")) {
         st.state = "idle";
         await saveUser(userId, st, env);
         return sendSettingsSummary(env, chatId, st, from);
-      }
-      if (st.state.startsWith("sub_")) {
-        st.state = "sub_menu";
-        await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, subscriptionStatusText(st, env), subscriptionMenuKeyboard());
       }
       return tgSendMessage(env, chatId, "🏠 منوی اصلی:", mainMenuKeyboard(env));
     }
@@ -3445,44 +3704,39 @@ if (text === "/education" || text === BTN.EDUCATION) {
       st.profile.level = result.level || "";
       st.profile.levelNotes = result.notes || "";
       st.timeframe = result.settings?.timeframe || st.timeframe;
-      st.style = normalizeStyleLabel(result.settings?.style || st.style);
+      st.style = result.settings?.style || st.style;
       st.risk = result.settings?.risk || st.risk;
       st.profile.onboardingDone = true;
 
       await saveUser(userId, st, env);
 
       const marketFa = ({crypto:"کریپتو", forex:"فارکس", metals:"فلزات", stocks:"سهام"})[result.recommendedMarket] || "کریپتو";
-      return tgSendMessage(
+      await tgSendMessage(
         env,
         chatId,
-        `✅ تعیین سطح انجام شد.\n\nسطح: ${st.profile.level}\nپیشنهاد بازار: ${marketFa}\n\nتنظیمات پیشنهادی:\n⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}\n\nیادداشت:\n${st.profile.levelNotes || "—"}\n\nاگر می‌خوای دوباره تعیین‌سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
+        `✅ تعیین سطح انجام شد.
+
+سطح: ${st.profile.level}
+پیشنهاد بازار: ${marketFa}
+
+تنظیمات پیشنهادی:
+⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}
+
+یادداشت:
+${st.profile.levelNotes || "—"}
+
+اگر می‌خوای دوباره تعیین سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
         mainMenuKeyboard(env)
       );
+
+      await sendPostOnboardingNudge(env, chatId, st);
+      return;
     }
-    if (text === BTN.CAT_MAJORS || text === BTN.CAT_METALS || text === BTN.CAT_INDICES || text === BTN.CAT_CRYPTO) {
-      const market = (text === BTN.CAT_MAJORS) ? "forex" :
-        (text === BTN.CAT_METALS) ? "metals" :
-        (text === BTN.CAT_INDICES) ? "indices" : "crypto";
 
-      const title = (text === BTN.CAT_MAJORS) ? "💱 ماجورها:" :
-        (text === BTN.CAT_METALS) ? "🪙 فلزات:" :
-        (text === BTN.CAT_INDICES) ? "📊 شاخص‌ها:" : "₿ کریپتو:";
-
-      const list = (market === "forex") ? MAJORS :
-        (market === "metals") ? METALS :
-        (market === "indices") ? INDICES : CRYPTOS;
-
-      // Wizard flow: Market -> Symbol -> Style -> Timeframe -> Analyze
-      if (st.state === "wiz_market") {
-        st.wizard = st.wizard || { market: "", symbol: "", style: "", timeframe: "" };
-        st.wizard.market = market;
-        st.state = "wiz_symbol";
-        await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, "🧭 مرحله ۲/۴: نماد را انتخاب کن:", listKeyboard(list));
-      }
-
-      return tgSendMessage(env, chatId, title, listKeyboard(list));
-    }
+    if (text === BTN.CAT_MAJORS) return tgSendMessage(env, chatId, "💱 ماجورها:", listKeyboard(MAJORS));
+    if (text === BTN.CAT_METALS) return tgSendMessage(env, chatId, "🪙 فلزات:", listKeyboard(METALS));
+    if (text === BTN.CAT_INDICES) return tgSendMessage(env, chatId, "📊 شاخص‌ها:", listKeyboard(INDICES));
+    if (text === BTN.CAT_CRYPTO) return tgSendMessage(env, chatId, "₿ کریپتو:", listKeyboard(CRYPTOS));
 
     if (text === BTN.SET_TF) {
       st.state = "set_tf";
@@ -3492,7 +3746,7 @@ if (text === "/education" || text === BTN.EDUCATION) {
     if (text === BTN.SET_STYLE) {
       st.state = "set_style";
       await saveUser(userId, st, env);
-      return tgSendMessage(env, chatId, "🎯 سبک:", optionsKeyboard(["اسکالپ","سوئینگ","اسمارت‌مانی","پرایس اکشن","ICT","ATR"]));
+      return tgSendMessage(env, chatId, "🎯 سبک:", optionsKeyboard(ALLOWED_STYLE_LIST));
     }
     if (text === BTN.SET_RISK) {
       st.state = "set_risk";
@@ -3504,65 +3758,141 @@ if (text === "/education" || text === BTN.EDUCATION) {
       await saveUser(userId, st, env);
       return tgSendMessage(env, chatId, "📰 خبر:", optionsKeyboard(["روشن ✅","خاموش ❌"]));
     }
-
-    if (st.state === "set_tf") { st.timeframe = text; st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ تایم‌فریم: ${st.timeframe}`, mainMenuKeyboard(env)); }
-    if (st.state === "set_style") { st.style = normalizeStyleLabel(text); st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ سبک: ${st.style}`, mainMenuKeyboard(env)); }
-
-    if (st.state === "wallet_withdraw_amount") {
-      const cleaned = toAsciiDigits(text).replace(/[^0-9.]/g, "");
-      const amount = Number(cleaned);
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return tgSendMessage(env, chatId, "❌ مبلغ نامعتبر است. لطفاً فقط عدد وارد کن.", kb([[BTN.BACK, BTN.HOME]]));
-      }
-      const bal = Number(st.wallet?.balance || 0);
-      if (bal < amount) {
-        st.state = "idle";
-        await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, `❌ موجودی کافی نیست.
-موجودی فعلی: ${bal} ${st.wallet?.currency || "USDT"}`, walletMenuKeyboard());
-      }
-      st.wallet._pendingWithdrawAmount = amount;
-      st.state = "wallet_withdraw_address";
+    if (text === BTN.SET_CAPITAL) {
+      const flags = await getAdminFlags(env);
+      if (!flags.capitalModeEnabled) return tgSendMessage(env, chatId, "⚠️ مدیریت سرمایه توسط ادمین غیرفعال است.", settingsMenuKeyboard());
+      st.state = "set_capital";
       await saveUser(userId, st, env);
-      return tgSendMessage(env, chatId, "✅ مبلغ ثبت شد.\n\nحالا آدرس مقصد (TRC20/ERC20/… بسته به نوع پرداخت) را بفرست.", kb([[BTN.BACK, BTN.HOME]]));
-}
-
-    if (st.state === "wallet_withdraw_address") {
-      const address = String(text || "").trim();
-      const amount = Number(st.wallet?._pendingWithdrawAmount || 0);
-      if (!address) return tgSendMessage(env, chatId, "❌ آدرس نامعتبر است. دوباره بفرست.", kb([[BTN.BACK, BTN.HOME]]));
-
-      const bal = Number(st.wallet?.balance || 0);
-      if (bal < amount || amount <= 0) {
-        st.state = "idle";
-        delete st.wallet._pendingWithdrawAmount;
-        await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, "❌ درخواست نامعتبر شد (موجودی/مبلغ). دوباره تلاش کن.", walletMenuKeyboard());
-      }
-
-      st.wallet.balance = bal - amount;
-      delete st.wallet._pendingWithdrawAmount;
-
-      const ticket = await createWithdrawTicket(env, { userId, amount, address, from });
-      st.state = "idle";
-      await saveUser(userId, st, env);
-
-      return tgSendMessage(
-        env,
-        chatId,
-        `✅ درخواست برداشت ثبت شد.
-
-کد پیگیری: ${ticket}
-مبلغ: ${amount} ${st.wallet?.currency || "USDT"}
-آدرس: ${address}
-
-برای انجام برداشت، در صورت نیاز پشتیبانی با شما تماس می‌گیرد.`,
-        walletMenuKeyboard()
-      );
+      return tgSendMessage(env, chatId, "💼 سرمایه را وارد کن (عدد).", kb([[BTN.BACK, BTN.HOME]]));
     }
 
+    if (text === BTN.SUPPORT_FAQ) {
+      st.state = "support_faq";
+      await saveUser(userId, st, env);
+      const faq = getSupportFaq();
+      const list = faq.map((f, i) => `${i + 1}) ${f.q}`).join("\n");
+      return tgSendMessage(env, chatId, `❓ سوالات آماده\n\n${list}\n\nعدد سوال را ارسال کن تا پاسخ را ببینی.`, kb([[BTN.BACK, BTN.HOME]]));
+    }
+
+    if (text === BTN.SUPPORT_TICKET) {
+      st.state = "support_ticket";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "✉️ متن تیکت را بنویس (حداکثر ۳۰۰ کاراکتر):", kb([[BTN.BACK, BTN.HOME]]));
+    }
+
+    if (text === BTN.SUPPORT_CUSTOM_PROMPT) {
+      st.state = "support_custom_prompt";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "🧠 نیازت را برای پرامپت اختصاصی بنویس (حداکثر ۴۰۰ کاراکتر).", kb([[BTN.BACK, BTN.HOME]]));
+    }
+
+    if (st.state === "set_tf") { st.timeframe = text; st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ تایم‌فریم: ${st.timeframe}`, mainMenuKeyboard(env)); }
+    if (st.state === "set_style") {
+      st.style = ALLOWED_STYLE_LIST.includes(text) ? text : st.style;
+      st.state = "idle";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, `✅ سبک: ${st.style}`, mainMenuKeyboard(env));
+    }
     if (st.state === "set_risk") { st.risk = text; st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ ریسک: ${st.risk}`, mainMenuKeyboard(env)); }
     if (st.state === "set_news") { st.newsEnabled = text.includes("روشن"); st.state = "idle"; await saveUser(userId, st, env); return tgSendMessage(env, chatId, `✅ خبر: ${st.newsEnabled ? "روشن ✅" : "خاموش ❌"}`, mainMenuKeyboard(env)); }
+    if (st.state === "set_capital" || st.state === "onb_capital") {
+
+      const cap = Number(String(text || "").replace(/[, ]+/g, "").trim());
+      if (!Number.isFinite(cap) || cap <= 0) return tgSendMessage(env, chatId, "عدد سرمایه معتبر نیست. مثال: 1500", kb([[BTN.BACK, BTN.HOME]]));
+      st.profile = st.profile || {};
+      st.profile.capital = cap;
+      st.profile.capitalCurrency = st.profile.capitalCurrency || "USDT";
+      st.capital = st.capital || { amount: 0, enabled: true };
+      st.capital.amount = cap;
+      st.capital.enabled = true;
+      const wasOnb = st.state === "onb_capital";
+      st.state = "idle";
+      await saveUser(userId, st, env);
+      if (wasOnb) return startLeveling(env, chatId, from, st);
+
+      return tgSendMessage(env, chatId, `✅ سرمایه ثبت شد: ${cap} ${st.profile.capitalCurrency || "USDT"}`, settingsMenuKeyboard());
+    }
+
+    if (st.state === "request_custom_prompt") {
+      const req = String(text || "").trim();
+      if (req.length < 8) {
+        return tgSendMessage(env, chatId, "متن درخواست خیلی کوتاه است.", kb([[BTN.BACK, BTN.HOME]]));
+      }
+      const reqId = `cpr_${Date.now()}_${st.userId}`;
+      const item = { id: reqId, userId: String(st.userId), username: st.profile?.username || "", text: req, status: "pending", createdAt: new Date().toISOString() };
+      await storeCustomPromptRequest(env, item);
+      const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+      if (supportChatId) {
+        await tgSendMessage(env, supportChatId, `🧠 درخواست پرامپت اختصاصی جدید #${reqId}
+کاربر: ${item.username ? '@'+item.username : item.userId}
+متن:
+${req}`);
+      }
+      st.state = "idle";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "✅ درخواست ثبت شد. بعد از تایید ادمین فعال می‌شود.", settingsMenuKeyboard());
+    }
+
+    if (st.state === "support_faq") {
+      const idx = Number(text.trim());
+      const faq = getSupportFaq();
+      const item = Number.isFinite(idx) ? faq[idx - 1] : null;
+      st.state = "idle";
+      await saveUser(userId, st, env);
+      if (!item) return tgSendMessage(env, chatId, "عدد معتبر نیست. دوباره تلاش کن.", kb([[BTN.SUPPORT_FAQ, BTN.HOME]]));
+      return tgSendMessage(env, chatId, `✅ پاسخ:\n${item.a}`, kb([[BTN.SUPPORT_FAQ, BTN.HOME]]));
+    }
+    if (st.state === "support_ticket") {
+      const textClean = String(text || "").trim();
+      if (!textClean || textClean.length < 4) {
+        return tgSendMessage(env, chatId, "متن تیکت کوتاه است. لطفاً توضیح بیشتری بده.", kb([[BTN.BACK, BTN.HOME]]));
+      }
+      st.state = "idle";
+      await saveUser(userId, st, env);
+      const ticket = { id: `t_${Date.now()}_${st.userId}`, userId: String(st.userId), username: st.profile?.username || "", phone: st.profile?.phone || "", text: textClean, kind: "general", status: "pending", createdAt: new Date().toISOString() };
+      await storeSupportTicket(env, ticket);
+
+      const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+      if (supportChatId) {
+        await tgSendMessage(env, supportChatId, `📩 تیکت جدید
+شناسه: ${ticket.id}
+کاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}
+شماره: ${st.profile?.phone || "-"}
+متن:
+${textClean}`);
+      }
+      return tgSendMessage(env, chatId, "✅ تیکت شما ثبت شد و در صف بررسی ادمین است.", mainMenuKeyboard(env));
+    }
+
+    if (st.state === "support_custom_prompt") {
+      const textClean = String(text || "").trim();
+      if (!textClean || textClean.length < 8) {
+        return tgSendMessage(env, chatId, "برای درخواست پرامپت اختصاصی، توضیح کامل‌تری ارسال کن.", kb([[BTN.BACK, BTN.HOME]]));
+      }
+      st.state = "idle";
+      const req = {
+        id: `cpr_${Date.now()}_${st.userId}`,
+        userId: String(st.userId),
+        username: st.profile?.username || "",
+        text: textClean,
+        status: "pending",
+        promptId: "",
+        createdAt: new Date().toISOString(),
+      };
+      st.pendingCustomPromptRequestId = req.id;
+      await saveUser(userId, st, env);
+      await storeCustomPromptRequest(env, req);
+      const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+      if (supportChatId) {
+        await tgSendMessage(env, supportChatId, `🧠 درخواست پرامپت اختصاصی
+شناسه: ${req.id}
+کاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}
+متن:
+${textClean}`);
+      }
+      return tgSendMessage(env, chatId, "✅ درخواست شما ثبت شد. بعد از تایید ادمین، پرامپت اختصاصی فعال می‌شود.", mainMenuKeyboard(env));
+    }
+
 
     if (isSymbol(text)) {
       if (!st.profile?.name || !st.profile?.phone) {
@@ -3571,25 +3901,6 @@ if (text === "/education" || text === BTN.EDUCATION) {
         return;
       }
 
-      // Wizard step 2 -> 3
-      if (st.state === "wiz_symbol" || st.state === "choose_symbol") {
-        st.wizard = st.wizard || { market: "", symbol: "", style: "", timeframe: "" };
-        st.wizard.symbol = text;
-
-        // If user picked symbol without market step, infer it
-        if (!st.wizard.market) {
-          st.wizard.market =
-            MAJORS.includes(text) ? "forex" :
-            METALS.includes(text) ? "metals" :
-            INDICES.includes(text) ? "indices" : "crypto";
-        }
-
-        st.state = "wiz_style";
-        await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, "🧭 مرحله ۳/۴: سبک را انتخاب کن:", optionsKeyboard(["اسکالپ","سوئینگ","اسمارت‌مانی","پرایس اکشن","ICT","ATR"]));
-      }
-
-      // Legacy: quick pick symbol -> ask to press analyze
       st.selectedSymbol = text;
       st.state = "await_prompt";
       await saveUser(userId, st, env);
@@ -3598,63 +3909,8 @@ if (text === "/education" || text === BTN.EDUCATION) {
       return tgSendMessage(env, chatId, `✅ نماد: ${st.selectedSymbol}\n\nبرای شروع تحلیل روی «${BTN.ANALYZE}» بزن.\n\nسهمیه امروز: ${quota}`, kb([[BTN.ANALYZE], [BTN.BACK, BTN.HOME]]));
     }
 
-    
-    if (st.state === "wiz_style") {
-      const style = normalizeStyleLabel(text);
-      const allowed = ["اسکالپ","سوئینگ","اسمارت‌مانی","پرایس اکشن","ICT","ATR"];
-      if (!allowed.includes(style)) {
-        return tgSendMessage(env, chatId, "یکی از گزینه‌های سبک را انتخاب کن:", optionsKeyboard(allowed));
-      }
-      st.wizard = st.wizard || { market: "", symbol: "", style: "", timeframe: "" };
-      st.wizard.style = style;
-      st.state = "wiz_tf";
-      await saveUser(userId, st, env);
-      return tgSendMessage(env, chatId, "🧭 مرحله ۴/۴: تایم‌فریم را انتخاب کن:", optionsKeyboard(["M15","H1","H4","D1"]));
-    }
-
-    if (st.state === "wiz_tf") {
-      const tf = String(text || "").trim().toUpperCase();
-      if (!["M15","H1","H4","D1"].includes(tf)) {
-        return tgSendMessage(env, chatId, "یکی از تایم‌فریم‌ها را انتخاب کن:", optionsKeyboard(["M15","H1","H4","D1"]));
-      }
-
-      st.wizard = st.wizard || { market: "", symbol: "", style: "", timeframe: "" };
-      st.wizard.timeframe = tf;
-
-      const symbol = st.wizard.symbol;
-      const style = st.wizard.style;
-
-      if (!symbol || !style) {
-        st.state = "wiz_market";
-        await saveUser(userId, st, env);
-        return tgSendMessage(env, chatId, "⚠️ انتخاب‌ها کامل نیست. از اول شروع کنیم: بازار را انتخاب کن.", signalMenuKeyboard());
-      }
-
-      if (getDB(env) && !canAnalyzeToday(st, from, env)) {
-        return tgSendMessage(env, chatId, `⛔️ سهمیه امروزت تموم شده (${dailyLimit(env, st)} تحلیل در روز).`, mainMenuKeyboard(env));
-      }
-
-      // Persist selected style/timeframe as user's current prefs
-      st.style = style;
-      st.timeframe = tf;
-
-      st.state = "idle";
-      st.selectedSymbol = "";
-      st.wizard = { market: "", symbol: "", style: "", timeframe: "" };
-
-      if (getDB(env)) {
-        consumeDaily(st, from, env);
-        await saveUser(userId, st, env);
-      } else {
-        await saveUser(userId, st, env);
-      }
-
-      await runSignalTextFlow(env, chatId, from, st, symbol, "", { timeframe: tf, style });
-      return;
-    }
-
-if (st.state === "await_prompt" && st.selectedSymbol) {
-      if (getDB(env) && !canAnalyzeToday(st, from, env)) {
+    if (st.state === "await_prompt" && st.selectedSymbol) {
+      if (env.BOT_KV && !canAnalyzeToday(st, from, env)) {
         return tgSendMessage(env, chatId, `⛔️ سهمیه امروزت تموم شده (${dailyLimit(env, st)} تحلیل در روز).`, mainMenuKeyboard(env));
       }
 
@@ -3665,13 +3921,73 @@ if (st.state === "await_prompt" && st.selectedSymbol) {
       st.state = "idle";
       st.selectedSymbol = "";
 
-      if (getDB(env)) {
+      const ok = await runSignalTextFlow(env, chatId, from, st, symbol, "");
+      if (ok && env.BOT_KV) {
         consumeDaily(st, from, env);
+        recordAnalysisSuccess(st);
         await saveUser(userId, st, env);
       }
-
-      await runSignalTextFlow(env, chatId, from, st, symbol, "");
       return;
+    }
+
+
+    if (st.state === "wallet_deposit_txid") {
+      const parts = String(text || "").trim().split(/\s+/).filter(Boolean);
+      const txid = String(parts[0] || "").trim();
+      const amount = Number(parts[1] || 0);
+      if (!txid || txid.length < 8) {
+        return tgSendMessage(env, chatId, "TxID نامعتبر است. دوباره ارسال کن.", kb([[BTN.BACK, BTN.HOME]]));
+      }
+      const payment = { id: `dep_${Date.now()}_${st.userId}`, userId: String(st.userId), username: st.profile?.username || "", amount: Number.isFinite(amount) ? amount : 0, txHash: txid, status: "pending", createdAt: new Date().toISOString(), source: "bot_txid" };
+      await storePayment(env, payment);
+      const supportChatId = env.SUPPORT_CHAT_ID ? Number(env.SUPPORT_CHAT_ID) : 0;
+      if (supportChatId) {
+        await tgSendMessage(env, supportChatId, `💳 درخواست واریز جدید
+کاربر: ${st.profile?.username ? "@"+st.profile.username : st.userId}
+TxID: ${txid}
+
+${Number.isFinite(payment.amount) && payment.amount > 0 ? `مبلغ: ${payment.amount}` : ""}`);
+      }
+      st.state = "idle";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "✅ درخواست واریز ثبت شد و پس از بررسی تایید می‌شود.", walletMenuKeyboard());
+    }
+
+    if (st.state === "wallet_withdraw") {
+      const parts = text.split(/\s+/).filter(Boolean);
+      if (parts.length < 2) {
+        return tgSendMessage(env, chatId, "فرمت درست نیست. مثال: 10 0x1234abcd...", kb([[BTN.HOME]]));
+      }
+      const amount = Number(parts[0]);
+      const address = parts.slice(1).join(" ").trim();
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return tgSendMessage(env, chatId, "مقدار نامعتبر است.", kb([[BTN.HOME]]));
+      }
+      if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+        return tgSendMessage(env, chatId, "آدرس نامعتبر است. آدرس BEP20 باید با 0x شروع شود.", kb([[BTN.HOME]]));
+      }
+
+      const bal = Number(st.referral?.commissionBalance || 0);
+      if (bal < amount) {
+        return tgSendMessage(env, chatId, `موجودی کافی نیست. موجودی قابل برداشت: ${bal} USDT`, walletMenuKeyboard());
+      }
+      st.referral.commissionBalance = Math.round((bal - amount) * 100) / 100;
+
+      const wid = `w_${Date.now()}_${st.userId}`;
+      const createdAt = new Date().toISOString();
+
+      if (env.BOT_DB) {
+        await env.BOT_DB.prepare(
+          "INSERT INTO withdrawals (id, userId, createdAt, amount, address, status) VALUES (?1, ?2, ?3, ?4, ?5, 'pending')"
+        ).bind(wid, String(st.userId), createdAt, amount, address).run();
+      }
+      if (env.BOT_KV) {
+        await env.BOT_KV.put(`withdraw:${wid}`, JSON.stringify({ id: wid, userId: st.userId, createdAt, amount, address, status: "pending", debitedFromCommission: true, network: "BEP20" }));
+      }
+
+      st.state = "idle";
+      await saveUser(userId, st, env);
+      return tgSendMessage(env, chatId, "✅ درخواست برداشت ثبت شد و در انتظار بررسی است.", walletMenuKeyboard());
     }
 
     return tgSendMessage(env, chatId, "از منوی پایین استفاده کن ✅", mainMenuKeyboard(env));
@@ -3686,7 +4002,7 @@ async function onStart(env, chatId, from, st, refArg) {
   st.selectedSymbol = "";
   st.profile.username = from?.username ? String(from.username) : st.profile.username;
 
-  if (getDB(env)) {
+  if (env.BOT_KV) {
     for (const c of st.referral.codes || []) {
       await storeReferralCodeOwner(env, c, st.userId);
     }
@@ -3703,7 +4019,7 @@ async function onStart(env, chatId, from, st, refArg) {
 
   await saveUser(st.userId, st, env);
 
-  await tgSendMessage(env, chatId, WELCOME_BOT, mainMenuKeyboard(env));
+  await tgSendMessage(env, chatId, await getBotWelcomeText(env), mainMenuKeyboard(env));
 
   if (!st.profile?.name || !st.profile?.phone) {
     await startOnboarding(env, chatId, from, st);
@@ -3730,6 +4046,12 @@ async function startOnboarding(env, chatId, from, st) {
     st.state = "onb_market";
     await saveUser(st.userId, st, env);
     return tgSendMessage(env, chatId, "بازار مورد علاقه‌ات کدام است؟", optionsKeyboard(["کریپتو", "فارکس", "فلزات", "سهام"]));
+  }
+  const flags = await getAdminFlags(env);
+  if (flags.capitalModeEnabled && !Number(st.profile?.capital || 0)) {
+    st.state = "onb_capital";
+    await saveUser(st.userId, st, env);
+    return tgSendMessage(env, chatId, "💼 سرمایه تقریبی‌ات را وارد کن (عدد). مثال: 1000", kb([[BTN.BACK, BTN.HOME]]));
   }
   await startLeveling(env, chatId, from, st);
 }
@@ -3759,19 +4081,95 @@ async function startLeveling(env, chatId, from, st) {
   return tgSendMessage(env, chatId, QUIZ[0].text, optionsKeyboard(QUIZ[0].options));
 }
 
+function pickPostOnboardingSymbol(st) {
+  const m = String(st.profile?.preferredMarket || "").toLowerCase();
+  if (m.includes("کریپتو") || m.includes("crypto")) return "BTCUSDT";
+  if (m.includes("فارکس") || m.includes("forex")) return "EURUSD";
+  if (m.includes("فلز") || m.includes("metal")) return "XAUUSD";
+  if (m.includes("سهام") || m.includes("stock")) return "AAPL";
+  // fallback based on style
+  const s = String(st.style || "").toLowerCase();
+  if (s.includes("ict") || s.includes("اسمارت")) return "EURUSD";
+  return "BTCUSDT";
+}
+
+function fmtPrice(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return "نامشخص";
+  const abs = Math.abs(x);
+  const dp = abs >= 1000 ? 0 : (abs >= 100 ? 2 : (abs >= 1 ? 4 : 6));
+  return x.toFixed(dp);
+}
+
+async function sendPostOnboardingNudge(env, chatId, st) {
+  try {
+    const symbol = pickPostOnboardingSymbol(st);
+    const tf = String(st.timeframe || "H4").toUpperCase();
+    let candles = [];
+    try {
+      candles = await getMarketCandlesWithFallback(env, symbol, tf);
+    } catch (e) {
+      candles = [];
+    }
+
+    let teaser = "";
+    if (Array.isArray(candles) && candles.length >= 40) {
+      const tail = candles.slice(-40);
+      const highs = tail.map((c) => Number(c.high)).filter(Number.isFinite);
+      const lows = tail.map((c) => Number(c.low)).filter(Number.isFinite);
+      const closes = tail.map((c) => Number(c.close)).filter(Number.isFinite);
+      const lastClose = closes.length ? closes[closes.length - 1] : NaN;
+      const hi = highs.length ? Math.max(...highs) : NaN;
+      const lo = lows.length ? Math.min(...lows) : NaN;
+      const mid = (Number.isFinite(hi) && Number.isFinite(lo)) ? (hi + lo) / 2 : NaN;
+      const bias = (Number.isFinite(lastClose) && Number.isFinite(mid))
+        ? (lastClose >= mid ? "تمایل صعودی" : "تمایل نزولی")
+        : "نامشخص";
+
+      teaser =
+        `• محدوده مهم: حمایت ~ ${fmtPrice(lo)} | مقاومت ~ ${fmtPrice(hi)}
+` +
+        `• بایاس: ${bias}
+` +
+        `• سناریو: اگر قیمت بالای مقاومت تثبیت شد → ادامه حرکت محتمل‌تر؛ اگر زیر حمایت شکست و پولبک زد → سناریوی مخالف فعال می‌شود.`;
+    } else {
+      teaser =
+        "الان دیتای کافی برای نمونه‌ی عددی ندارم، ولی خروجی ربات دقیقاً با همین ساختار سناریو/سطوح/تریگر کندلی میاد.";
+    }
+
+    const msg =
+      `🚀 آماده‌ای شروع کنیم؟
+
+` +
+      `🎁 یه نمونه تحلیل خیلی کوتاه (برای اینکه ببینی خروجی چه شکلیه):
+` +
+      `نماد: ${symbol} | تایم‌فریم: ${tf} | سبک: ${st.style || "—"}
+` +
+      `${teaser}
+
+` +
+      `حالا از منوی «📈 تحلیل» نماد دلخواهت رو انتخاب کن، یا یه عکس چارت بفرست تا تحلیل کامل بگیر ✅`;
+
+    await tgSendMessage(env, chatId, msg, mainMenuKeyboard(env));
+  } catch (e) {
+    // silent
+  }
+}
+
+
 /* ========================== ADMIN: USERS LIST ========================== */
 async function sendUsersList(env, chatId) {
-  if (!getDB(env) || typeof getDB(env).list !== "function") {
+  if (!env.BOT_KV || typeof env.BOT_KV.list !== "function") {
     return tgSendMessage(env, chatId, "⛔️ KV list در دسترس نیست. (BOT_KV را درست بایند کن)", mainMenuKeyboard(env));
   }
 
-  const res = await getDB(env).list({ prefix: "u:", limit: 20 });
+  const res = await env.BOT_KV.list({ prefix: "u:", limit: 20 });
   const keys = res?.keys || [];
   if (!keys.length) return tgSendMessage(env, chatId, "هیچ کاربری ثبت نشده.", mainMenuKeyboard(env));
 
   const users = [];
   for (const k of keys) {
-    const raw = await getDB(env).get(k.name);
+    const raw = await env.BOT_KV.get(k.name);
     if (!raw) continue;
     try {
       const u = JSON.parse(raw);
@@ -3804,6 +4202,15 @@ function isSymbol(t) {
 }
 
 /* ========================== TEXTS ========================== */
+function getSupportFaq() {
+  return [
+    { q: "چطور سهمیه روزانه شارژ می‌شود؟", a: "سهمیه هر روز (Tehran) صفر می‌شود و مجدداً قابل استفاده است." },
+    { q: "چرا تحلیل ناموفق شد؟", a: "اتصال دیتا یا مدل ممکن است موقتاً قطع باشد. چند دقیقه بعد دوباره تلاش کن." },
+    { q: "چطور اشتراک فعال کنم؟", a: "پرداخت را انجام بده و هش تراکنش را برای ادمین ارسال کن تا تأیید و فعال شود." },
+    { q: "چطور رفرال کار می‌کند؟", a: "هر دعوت موفق با شماره جدید ۶ امتیاز (معادل ۳ تحلیل) دارد. هر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه." },
+  ];
+}
+
 async function sendSettingsSummary(env, chatId, st, from) {
   const quota = isStaff(from, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
   const wallet = await getWallet(env);
@@ -3811,6 +4218,7 @@ async function sendSettingsSummary(env, chatId, st, from) {
     `⚙️ تنظیمات:\n\n` +
     `⏱ تایم‌فریم: ${st.timeframe}\n` +
     `🎯 سبک: ${st.style}\n` +
+    `🧩 پرامپت اختصاصی: ${st.customPromptId || "پیش‌فرض"}\n` +
     `⚠️ ریسک: ${st.risk}\n` +
     `📰 خبر: ${st.newsEnabled ? "روشن ✅" : "خاموش ❌"}\n\n` +
     `سهمیه امروز: ${quota}\n` +
@@ -3827,47 +4235,235 @@ function profileText(st, from, env) {
   const inv = st.referral?.successfulInvites || 0;
 
   const botUser = env.BOT_USERNAME ? String(env.BOT_USERNAME).replace(/^@/, "") : "";
-  const links = (st.referral?.codes || []).slice(0, 5).map((c, i) => {
-    const deep = botUser ? `https://t.me/${botUser}?start=ref_${c}` : `ref_${c}`;
-    return `${i+1}) ${deep}`;
-  }).join("\n");
+  const code = (st.referral?.codes || [])[0] || "";
+  const deep = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "-";
 
-  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Kyiv): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک‌های رفرال (۵ عدد):\n${links}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
+  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Tehran): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۶ امتیاز (معادل ۳ تحلیل).\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
+}
+
+function inviteShareText(st, env) {
+  const botUser = env.BOT_USERNAME ? String(env.BOT_USERNAME).replace(/^@/, "") : "";
+  const code = (st.referral?.codes || [])[0] || "";
+  const link = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "";
+  const share = link ? `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent("با لینک من بیا تو MarketiQ ✅")}` : "";
+  return { link, share };
 }
 
 /* ========================== FLOWS ========================== */
-async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt, overrides) {
-  const tfUse = (overrides && overrides.timeframe) ? String(overrides.timeframe) : (st.timeframe || "H4");
-  const styleUse = (overrides && overrides.style) ? normalizeStyleLabel(overrides.style) : st.style;
 
-  await tgSendMessage(
-    env,
-    chatId,
-    `⏳ جمع‌آوری داده و تحلیل ${symbol}...\n⏱ ${tfUse} | 🎯 ${styleUse}`,
-    kb([[BTN.HOME]])
-  );
+/* ========================== QUICKCHART IMAGE (CANDLESTICK) ==========================
+QuickChart renders Chart.js configs as images via https://quickchart.io/chart .
+Financial (candlestick/OHLC) charts are supported via chartjs-chart-financial plugin.
+*/
+function buildQuickChartSpec(candles, symbol, tf, levels = []) {
+  const items = (candles || []).slice(-60).map((c) => ({
+    x: new Date(c.t || c.time || c.ts || c.timestamp || Date.now()).toISOString(),
+    o: Number(c.o),
+    h: Number(c.h),
+    l: Number(c.l),
+    c: Number(c.c),
+  }));
+  const annotations = (levels || []).slice(0, 6).map((lvl, idx) => ({
+    type: "line",
+    scaleID: "y",
+    value: Number(lvl),
+    borderColor: idx === 0 ? "#00d1ff" : idx === 1 ? "#ff6b6b" : "#f7c948",
+    borderWidth: 1.5,
+    borderDash: [6, 4],
+    label: { enabled: true, content: `L${idx + 1}: ${Number(lvl).toFixed(4)}` },
+  }));
+  return {
+    type: "candlestick",
+    data: { datasets: [{ label: `${symbol} ${tf}`, data: items }] },
+    options: {
+      plugins: {
+        legend: { display: false },
+        title: { display: true, text: `${symbol} · ${tf}` },
+        annotation: { annotations },
+      },
+      scales: { x: { ticks: { maxRotation: 0, autoSkip: true } } },
+    },
+  };
+}
+
+function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
+  const items = (candles || []).slice(-80).map((c) => ({
+    x: Number(c.t || c.time || c.ts || c.timestamp || Date.now()),
+    o: Number(c.o),
+    h: Number(c.h),
+    l: Number(c.l),
+    c: Number(c.c),
+  })).filter((x) => Number.isFinite(x.x) && Number.isFinite(x.o) && Number.isFinite(x.h) && Number.isFinite(x.l) && Number.isFinite(x.c));
+
+  const cfg = {
+    type: "candlestick",
+    data: {
+      datasets: [
+        {
+          label: `${symbol} ${tf}`,
+          data: items,
+          color: { up: "#2FE3A5", down: "#FF4D4D", unchanged: "#888" },
+        },
+      ],
+    },
+    options: {
+      parsing: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { maxRotation: 0, autoSkip: true } },
+      },
+    },
+  };
+
+  const encoded = encodeURIComponent(JSON.stringify(cfg));
+  return `https://quickchart.io/chart?version=4&format=png&w=900&h=450&devicePixelRatio=2&plugins=chartjs-chart-financial&c=${encoded}`;
+}
+
+function buildQuickChartLevelsOnlyUrl(symbol, tf, levels = []) {
+  const lv = levels.map(Number).filter(Number.isFinite).slice(0, 12);
+  const labels = lv.map((_, i) => `L${i + 1}`);
+  const cfg = {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{ label: `${symbol} ${tf} levels`, data: lv, borderColor: "#22d3ee", backgroundColor: "rgba(34,211,238,.15)", fill: true, tension: 0.2 }],
+    },
+    options: {
+      plugins: { legend: { display: true }, title: { display: true, text: `${symbol} · ${tf} · levels` } },
+      scales: { y: { grid: { color: "rgba(148,163,184,.25)" } }, x: { grid: { color: "rgba(148,163,184,.15)" } } },
+    },
+  };
+  const encoded = encodeURIComponent(JSON.stringify(cfg));
+  return `https://quickchart.io/chart?version=4&format=png&w=900&h=450&devicePixelRatio=2&c=${encoded}`;
+}
+
+function stripHiddenModelOutput(text) {
+  let out = String(text || "");
+  out = out.replace(/\*\*?\s*quickchart_config\s*\*\*?/gi, "");
+  out = out.replace(/```\s*json[\s\S]*?quickchart[\s\S]*?```/gi, "");
+  out = out.replace(/quickchart_config\s*:\s*\{[\s\S]*?\}/gi, "");
+  return out.trim();
+}
+
+function buildAdminReportLines(env, users, payments, withdrawals, tickets) {
+  const u = Array.isArray(users) ? users : [];
+  const p = Array.isArray(payments) ? payments : [];
+  const w = Array.isArray(withdrawals) ? withdrawals : [];
+  const t = Array.isArray(tickets) ? tickets : [];
+  const head = [
+    `Admin Report | ${new Date().toISOString()}`,
+    `users=${u.length} payments=${p.length} withdrawals=${w.length} tickets=${t.length}`,
+    "------------------------------------------------------------",
+  ];
+  const usersBlock = u.slice(0, 80).map((x) => {
+    const user = x?.profile?.username ? `@${String(x.profile.username).replace(/^@/, "")}` : x?.userId;
+    return `USER ${user || "-"} | analyses=${x?.stats?.successfulAnalyses || 0} | used=${x?.dailyUsed || 0}/${dailyLimit(env || {}, x || {})} | sub=${x?.subscription?.type || "free"}`;
+  });
+  const payBlock = p.slice(0, 60).map((x) => `PAY ${x.username || x.userId || "-"} | amount=${x.amount || 0} | status=${x.status || "-"} | tx=${x.txHash || "-"}`);
+  const wdBlock = w.slice(0, 60).map((x) => `WD ${x.userId || "-"} | amount=${x.amount || 0} | status=${x.status || "pending"} | addr=${x.address || "-"}`);
+  const tkBlock = t.slice(0, 60).map((x) => `TICKET ${x.id || "-"} | ${x.username || x.userId || "-"} | ${x.status || "pending"} | ${String(x.text || "").slice(0, 80)}`);
+  return [
+    ...head,
+    "USERS", ...(usersBlock.length ? usersBlock : ["-"]),
+    "",
+    "PAYMENTS", ...(payBlock.length ? payBlock : ["-"]),
+    "",
+    "WITHDRAWALS", ...(wdBlock.length ? wdBlock : ["-"]),
+    "",
+    "TICKETS", ...(tkBlock.length ? tkBlock : ["-"]),
+  ];
+}
+
+function buildSimplePdfFromText(text) {
+  const content = String(text || "").replace(/\r/g, "");
+  const lines = content.split("\n").slice(0, 500);
+  const escaped = lines.map((l) => String(l || "").replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)").replace(/[^	\x20-\x7E]/g, " "));
+  const streamLines = ["BT", "/F1 10 Tf", "36 800 Td", "12 TL"];
+  for (let i = 0; i < escaped.length; i++) {
+    if (i === 0) streamLines.push(`(${escaped[i]}) Tj`);
+    else streamLines.push(`T* (${escaped[i]}) Tj`);
+  }
+  streamLines.push("ET");
+  const stream = streamLines.join("\n");
+
+  const objects = [];
+  objects.push("1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n");
+  objects.push("2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n");
+  objects.push("3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n");
+  objects.push("4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Courier >> endobj\n");
+  objects.push(`5 0 obj << /Length ${stream.length} >> stream\n${stream}\nendstream endobj\n`);
+
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const obj of objects) {
+    offsets.push(pdf.length);
+    pdf += obj;
+  }
+  const xrefStart = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n`;
+  pdf += "0000000000 65535 f \n";
+  for (let i = 1; i < offsets.length; i++) {
+    pdf += `${String(offsets[i]).padStart(10, "0")} 00000 n \n`;
+  }
+  pdf += `trailer << /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+  return new TextEncoder().encode(pdf);
+}
+
+async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
+  await tgSendMessage(env, chatId, `⏳ جمع‌آوری داده و تحلیل ${symbol}...`, kb([[BTN.HOME]]));
 
   const t = stopToken();
   const typingTask = typingLoop(env, chatId, t);
 
   try {
-    const r = await runSignalTextFlowCompute(env, from, st, symbol, userPrompt, { timeframe: tfUse, style: styleUse });
-    const result = r.text;
+    const flowTimeoutMs = Math.max(15000, Number(env.SIGNAL_FLOW_TIMEOUT_MS || 70000));
+    const result = await Promise.race([
+      runSignalTextFlowReturnText(env, from, st, symbol, userPrompt),
+      timeoutPromise(flowTimeoutMs, "signal_text_flow_timeout"),
+    ]);
 
-    // Quick chart (image) – can be disabled with QUICK_CHART=0
-    if (r.chartUrl) {
-      await tgSendPhoto(
-        env,
-        chatId,
-        r.chartUrl,
-        `📈 چارت + زون‌ها ${symbol} (${r.used?.timeframe || tfUse})`,
-        kb([[BTN.HOME]])
-      );
+    // 📸 QuickChart candlestick image
+    if (String(env.QUICKCHART || "1") !== "0") {
+      try {
+        let candles = [];
+        try {
+          candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4");
+        } catch (e) {
+          console.error("market provider failed (all)", e?.message || e);
+          candles = [];
+        }
+        if (!Array.isArray(candles) || candles.length === 0) {
+          const cacheKey = marketCacheKey(symbol, st.timeframe || "H4");
+          candles = await getMarketCacheStale(env, cacheKey);
+        }
+        if (!Array.isArray(candles) || candles.length === 0) {
+          // اگر دیتا نداریم، عکس ارسال نکن
+          await tgSendMessage(env, chatId, "⚠️ برای این نماد در این تایم‌فریم دیتای کافی پیدا نشد؛ چارت ارسال نشد.", kb([[BTN.HOME]]));
+        } else {
+          const levels = extractLevels(result);
+          const chartUrl = buildQuickChartCandlestickUrl(candles, symbol, st.timeframe || "H4", levels);
+          const caption = candles.length < 5
+            ? `📈 چارت ${symbol} (${st.timeframe || "H4"}) — داده محدود`
+            : `📈 چارت ${symbol} (${st.timeframe || "H4"})`;
+          const pj = await tgSendPhotoSmart(env, chatId, chartUrl, caption, kb([[BTN.HOME]]));
+          if (!pj || !pj.ok) {
+            console.error("chart send failed:", pj);
+            if (String(env.RENDER_ZONES || "") === "1") {
+              const svg = buildZonesSvgFromAnalysis(result, symbol, st.timeframe || "H4");
+              await tgSendSvgDocument(env, chatId, svg, "zones.svg", `🖼️ نقشه زون‌ها: ${symbol} (${st.timeframe || "H4"})`);
+            } else {
+              await tgSendMessage(env, chatId, "⚠️ ارسال چارت ناموفق بود.", kb([[BTN.HOME]]));
+            }
+          }
+}
+      } catch (e) {
+        console.error("quickchart error:", e);
+      }
     }
 
     if (String(env.RENDER_ZONES || "") === "1") {
-      const svg = buildZonesSvgFromAnalysis(result, symbol, r.used?.timeframe || tfUse);
-      await tgSendSvgDocument(env, chatId, svg, "zones.svg", `🖼️ نقشه زون‌ها: ${symbol} (${r.used?.timeframe || tfUse})`);
+      const svg = buildZonesSvgFromAnalysis(result, symbol, st.timeframe || "H4");
+      await tgSendSvgDocument(env, chatId, svg, "zones.svg", `🖼️ نقشه زون‌ها: ${symbol} (${st.timeframe || "H4"})`);
     }
 
     t.stop = true;
@@ -3876,51 +4472,91 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt, over
     for (const part of chunkText(result, 3500)) {
       await tgSendMessage(env, chatId, part, mainMenuKeyboard(env));
     }
+    return true;
   } catch (e) {
-    // Keep a single error log (provider fallbacks are silent unless DEBUG_MARKET_DATA=1)
     console.error("runSignalTextFlow error:", e);
     t.stop = true;
     await tgSendMessage(env, chatId, "⚠️ فعلاً امکان انجام این عملیات نیست. لطفاً بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
+    return false;
   }
 }
 
-async function runSignalTextFlowCompute(env, from, st, symbol, userPrompt, overrides) {
-  const tf = (overrides && overrides.timeframe) ? String(overrides.timeframe) : (st.timeframe || "H4");
-  const style = (overrides && overrides.style) ? normalizeStyleLabel(overrides.style) : st.style;
+function analysisCacheKey(symbol, st) {
+  const tf = st.timeframe || "H4";
+  const style = st.style || "";
+  const risk = st.risk || "";
+  const news = st.newsEnabled ? "1" : "0";
+  return `analysis:${String(symbol).toUpperCase()}:${tf}:${style}:${risk}:${news}`;
+}
 
-  // use an ephemeral view of user settings for this run
-  const stRun = { ...st, timeframe: tf, style };
+async function getAnalysisCache(env, key) {
+  const mem = cacheGet(ANALYSIS_CACHE, key);
+  if (mem) return mem;
+  const r2 = await getCachedR2Value(env.MARKET_R2, key);
+  if (r2) cacheSet(ANALYSIS_CACHE, key, r2, Number(env.ANALYSIS_CACHE_TTL_MS || 120000));
+  return r2;
+}
 
-  const candles = await getMarketCandlesWithFallback(env, symbol, tf);
+async function setAnalysisCache(env, key, value) {
+  const ttlMs = Number(env.ANALYSIS_CACHE_TTL_MS || 120000);
+  cacheSet(ANALYSIS_CACHE, key, value, ttlMs);
+  await r2PutJson(env.MARKET_R2, key, value, ttlMs);
+}
+
+function buildMarketBlock(candles, maxRows) {
   const snap = computeSnapshot(candles);
-  const ohlc = candlesToCompactCSV(candles, 80);
-
-  const marketBlock =
+  const ohlc = candlesToCompactCSV(candles, maxRows);
+  return (
     `lastPrice=${snap?.lastPrice}\n` +
     `changePct=${snap?.changePct}%\n` +
     `trend=${snap?.trend}\n` +
     `range50_hi=${snap?.range50?.hi} range50_lo=${snap?.range50?.lo}\n` +
     `sma20=${snap?.sma20} sma50=${snap?.sma50}\n` +
     `lastTs=${snap?.lastTs}\n\n` +
-    `OHLC_CSV(t,o,h,l,c):\n${ohlc}`;
-
-  const prompt = await buildTextPromptForSymbol(symbol, userPrompt, stRun, marketBlock, env);
-  const draft = await runTextProviders(prompt, env, stRun.textOrder);
-  const polished = await runPolishProviders(draft, env, stRun.polishOrder);
-
-  // Chart uses the final analysis text to infer zones/levels
-  const chartUrl = String(env.QUICK_CHART || "1") === "1" ? buildQuickChartUrl(candles, symbol, tf, polished) : "";
-  return { text: polished, chartUrl, snap, used: { timeframe: tf, style } };
+    `OHLC_CSV(t,o,h,l,c):\n${ohlc}`
+  );
 }
-
 
 async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
-  const r = await runSignalTextFlowCompute(env, from, st, symbol, userPrompt);
-  return r.text;
+  const useCache = !userPrompt && !isStaff(from, env);
+  const cacheKey = useCache ? analysisCacheKey(symbol, st) : "";
+  if (useCache) {
+    const cached = await getAnalysisCache(env, cacheKey);
+    if (cached) return cached;
+  }
+
+  let candles = [];
+  try {
+    candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4");
+  } catch (e) {
+    console.error("market provider failed (all)", e?.message || e);
+    candles = [];
+  }
+  const marketBlock = buildMarketBlock(candles, 80);
+  const newsBlock = st.newsEnabled ? (await buildNewsBlockForSymbol(symbol, env, 5)) : "";
+  const prompt = await buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env, newsBlock);
+  let draft = "";
+  try {
+    draft = await runTextProviders(prompt, env, st.textOrder);
+  } catch (e) {
+    console.error("text providers failed (retry compact):", e?.message || e);
+    try {
+      const compactBlock = buildMarketBlock(candles, 40);
+      const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env, newsBlock);      draft = await runTextProviders(compactPrompt, env, st.textOrder);
+    } catch (e2) {
+      console.error("text providers failed (fallback local):", e2?.message || e2);
+      draft = buildLocalFallbackAnalysis(symbol, st, candles, e2?.message || "text_provider_timeout");
+    }
+  }
+  const polished = await runPolishProviders(draft, env, st.polishOrder);
+  const clean = stripHiddenModelOutput(polished);
+  if (useCache && clean) await setAnalysisCache(env, cacheKey, clean);
+  return clean;
 }
 
+
 async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
-  if (getDB(env) && !canAnalyzeToday(st, from, env)) {
+  if (env.BOT_KV && !canAnalyzeToday(st, from, env)) {
     await tgSendMessage(env, chatId, `⛔️ سهمیه امروزت تموم شده (${dailyLimit(env, st)} تحلیل در روز).`, mainMenuKeyboard(env));
     return;
   }
@@ -3935,17 +4571,12 @@ async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
     if (!filePath) throw new Error("no_file_path");
     const imageUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`;
 
-    if (getDB(env)) {
-      consumeDaily(st, from, env);
-      await saveUser(userId, st, env);
-    }
-
     const vPrompt = await buildVisionPrompt(st, env);
     const visionRaw = await runVisionProviders(imageUrl, vPrompt, env, st.visionOrder);
 
     const tf = st.timeframe || "H4";
-    const baseRaw = await getAnalysisPromptForStyle(env, st.style);
-    const base = baseRaw.replaceAll("{TIMEFRAME}", tf);
+    const baseRaw = await getAnalysisPrompt(env);
+    const base = baseRaw .split("{TIMEFRAME}").join(tf);
 
     const finalPrompt =
       `${base}\n\n` +
@@ -3967,6 +4598,11 @@ async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
     for (const part of chunkText(polished, 3500)) {
       await tgSendMessage(env, chatId, part, mainMenuKeyboard(env));
     }
+    if (env.BOT_KV) {
+      consumeDaily(st, from, env);
+      recordAnalysisSuccess(st);
+      await saveUser(userId, st, env);
+    }
   } catch (e) {
     console.error("handleVisionFlow error:", e);
     t.stop = true;
@@ -3975,23 +4611,61 @@ async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
 }
 
 /* ========================== ZONES RENDER (SVG) ========================== */
-function toLatinDigits(s) {
-  const a = "۰۱۲۳۴۵۶۷۸۹";
-  const b = "٠١٢٣٤٥٦٧٨٩";
-  return String(s || "")
-    .replace(/[۰-۹]/g, d => String(a.indexOf(d)))
-    .replace(/[٠-٩]/g, d => String(b.indexOf(d)));
+
+
+async function renderQuickChartPng(env, candles, symbol, tf, levels = []) {
+  const chartUrl = buildQuickChartCandlestickUrl(candles, symbol, tf, levels);
+  const r = await fetch(chartUrl, { cf: { cacheTtl: 60, cacheEverything: true } });
+  if (!r.ok) throw new Error(`quickchart_fetch_failed_${r.status}`);
+  return await r.arrayBuffer();
+}
+
+function buildLevelsOnlySvg(symbol, timeframe, levels = []) {
+  const clean = (Array.isArray(levels) ? levels : []).filter((x) => Number.isFinite(Number(x))).map(Number).slice(0, 8);
+  const rows = clean.length ? clean : [0, 1, 2];
+  const width = 1200;
+  const height = 700;
+  const pad = 70;
+  const innerH = height - pad * 2;
+  const sorted = [...rows].sort((a, b) => b - a);
+  const max = Math.max(...sorted, 1);
+  const min = Math.min(...sorted, 0);
+  const den = Math.max(1e-9, max - min);
+  const yFor = (p) => pad + ((max - p) / den) * innerH;
+  const lines = sorted.map((p, i) => {
+    const y = yFor(p);
+    const c = i % 2 === 0 ? "#2FE3A5" : "#FFB020";
+    return `<line x1="${pad}" y1="${y}" x2="${width-pad}" y2="${y}" stroke="${c}" stroke-width="2" stroke-dasharray="6 6"/><text x="${width-pad-8}" y="${y-6}" fill="${c}" font-size="22" text-anchor="end">${p}</text>`;
+  }).join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+  <rect width="100%" height="100%" fill="#0B0F17"/>
+  <text x="${pad}" y="42" fill="#E6F0FF" font-size="30" font-family="Arial">${escapeXml(symbol)} - ${escapeXml(timeframe)} (Internal Fallback)</text>
+  <rect x="${pad}" y="${pad}" width="${width-pad*2}" height="${innerH}" rx="14" fill="#101827" stroke="#223047"/>
+  ${lines}
+</svg>`;
 }
 
 function extractLevels(text) {
-  const norm = toLatinDigits(text);
-  const nums = (String(norm || "").match(/\b\d{1,10}(?:\.\d{1,10})?\b/g) || [])
+  const nums = (String(text || "").match(/\b\d{1,6}(?:\.\d{1,6})?\b/g) || [])
     .map(Number)
-    .filter(n => Number.isFinite(n))
-    .filter(n => !(Number.isInteger(n) && n >= 1 && n <= 20)); // ignore section numbering
+    .filter(n => Number.isFinite(n));
+  const uniq = [...new Set(nums)].sort((a,b)=>a-b);
+  return uniq.slice(0, 6);
+}
 
-  const uniq = [...new Set(nums)].sort((a, b) => a - b);
-  return uniq.slice(0, 8);
+function extractLevelsFromCandles(candles) {
+  if (!Array.isArray(candles) || !candles.length) return [];
+  const tail = candles.slice(-60);
+  const highs = tail.map((x) => Number(x?.h)).filter((n) => Number.isFinite(n));
+  const lows = tail.map((x) => Number(x?.l)).filter((n) => Number.isFinite(n));
+  if (!highs.length || !lows.length) return [];
+  const hi = Math.max(...highs);
+  const lo = Math.min(...lows);
+  const mid = (hi + lo) / 2;
+  const q1 = lo + (hi - lo) * 0.25;
+  const q3 = lo + (hi - lo) * 0.75;
+  return [lo, q1, mid, q3, hi].map((n) => Number(n.toFixed(6)));
 }
 
 function buildZonesSvgFromAnalysis(analysisText, symbol, timeframe) {
@@ -4059,11 +4733,18 @@ function buildZonesSvgFromAnalysis(analysisText, symbol, timeframe) {
 
 function escapeXml(s) {
   return String(s || "")
-    .replaceAll("&","&amp;")
-    .replaceAll("<","&lt;")
-    .replaceAll(">","&gt;")
-    .replaceAll('"',"&quot;")
-    .replaceAll("'","&apos;");
+    .split("&").join("&amp;")
+    .split("<").join("&lt;")
+    .split(">").join("&gt;")
+    .split('"').join("&quot;")
+    .split("'").join("&apos;");
+}
+function escapeHtml(s) {
+  return String(s || "")
+    .split("&").join("&amp;")
+    .split("<").join("&lt;")
+    .split(">").join("&gt;")
+    .split('"').join("&quot;");
 }
 
 /* ========================== MINI APP INLINE ASSETS ========================== */
@@ -4078,37 +4759,39 @@ function jsonResponse(obj, status = 200) {
 }
 
 /* ========================== TELEGRAM MINI APP initData verification ========================== */
-async function verifyTelegramInitData(initData, botToken, env) {
-  if (!initData || typeof initData !== "string") {
-    if (env && String(env.MINIAPP_DEV_BYPASS || "").trim() === "1") {
-      return { ok: true, userId: 0, fromLike: { id: 0, username: "dev", first_name: "Dev", last_name: "" }, devBypass: true };
-    }
-    return { ok: false, reason: "initData_missing" };
+async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientRaw) {
+  if (!initData || typeof initData !== "string") return { ok: false, reason: "initData_missing" };
+  const lenient = String(lenientRaw || "").trim() === "1" || String(lenientRaw || "").toLowerCase() === "true";
+  const initRaw = String(initData || "").trim();
+  if (lenient && initRaw.startsWith("dev:")) {
+    const devId = Number(initRaw.split(":")[1] || "0") || 999001;
+    return { ok: true, userId: devId, fromLike: { username: "dev_user" } };
   }
-  if (!botToken) return { ok: false, reason: "bot_token_missing" };
+  if (!botToken && !lenient) return { ok: false, reason: "bot_token_missing" };
 
   const params = new URLSearchParams(initData);
   const hash = params.get("hash");
-  if (!hash) return { ok: false, reason: "hash_missing" };
+  if (!hash && !lenient) return { ok: false, reason: "hash_missing" };
   params.delete("hash");
 
   const authDate = Number(params.get("auth_date") || "0");
-  if (!Number.isFinite(authDate) || authDate <= 0) return { ok: false, reason: "auth_date_invalid" };
+  if ((!Number.isFinite(authDate) || authDate <= 0) && !lenient) return { ok: false, reason: "auth_date_invalid" };
   const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - authDate) > 7 * 24 * 3600) return { ok: false, reason: "initData_expired" };
+  const maxAgeSec = Math.max(60, Number(maxAgeSecRaw || 0) || (lenient ? 7 * 24 * 60 * 60 : 24 * 60 * 60));
+  if (Number.isFinite(authDate) && authDate > 0 && (now - authDate > maxAgeSec) && !lenient) return { ok: false, reason: "initData_expired" };
 
   const pairs = [];
-  for (const [k, v] of params.entries()) pairs.push([k, v]);
+  params.forEach((v, k) => pairs.push([k, v]));
   pairs.sort((a, b) => a[0].localeCompare(b[0]));
   const dataCheckString = pairs.map(([k, v]) => `${k}=${v}`).join("\n");
 
   const secretKey = await hmacSha256Raw(utf8("WebAppData"), utf8(botToken));
   const sigHex = await hmacSha256Hex(secretKey, utf8(dataCheckString));
 
-  if (!timingSafeEqualHex(sigHex, hash)) return { ok: false, reason: "hash_mismatch" };
+  if (hash && !timingSafeEqualHex(sigHex, hash) && !lenient) return { ok: false, reason: "hash_mismatch" };
 
   const user = safeJsonParse(params.get("user") || "") || {};
-  const userId = user?.id;
+  const userId = user?.id || Number(params.get("user_id") || "0");
   if (!userId) return { ok: false, reason: "user_missing" };
 
   const fromLike = { username: user?.username || "" };
@@ -4136,6 +4819,31 @@ function timingSafeEqualHex(a, b) {
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
+}
+
+function b64urlFromBytes(u8){ return btoa(String.fromCharCode(...u8)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
+function b64urlToBytes(s){ const t=String(s||'').replace(/-/g,'+').replace(/_/g,'/'); const pad=t + '==='.slice((t.length+3)%4); return Uint8Array.from(atob(pad),c=>c.charCodeAt(0)); }
+async function makeSessionToken(payload, env){ const part=b64urlFromBytes(utf8(JSON.stringify(payload||{}))); const sig=await hmacSha256Raw(utf8(String(env.SESSION_SECRET||'')), utf8(part)); return `${part}.${b64urlFromBytes(sig)}`; }
+async function verifySessionToken(token, env){
+  const [part,sig]=String(token||'').split('.'); if(!part||!sig) return {ok:false, reason:'bad_token'};
+  const expected = b64urlFromBytes(await hmacSha256Raw(utf8(String(env.SESSION_SECRET||'')), utf8(part)));
+  if (!timingSafeEqualHex(toHex(b64urlToBytes(sig)), toHex(b64urlToBytes(expected)))) return {ok:false, reason:'bad_signature'};
+  const payload = safeJsonParse(new TextDecoder().decode(b64urlToBytes(part))) || {};
+  if (!payload.uid) return {ok:false, reason:'bad_payload'};
+  if (payload.exp && Math.floor(Date.now()/1000) > Number(payload.exp)) return {ok:false, reason:'expired'};
+  return {ok:true, userId:String(payload.uid), fromLike: payload.fromLike || null};
+}
+function readCookie(request, key){ const c=request.headers.get('cookie')||''; for(const p of c.split(';')){ const i=p.indexOf('='); if(i<0) continue; const k=p.slice(0,i).trim(); if(k===key) return p.slice(i+1).trim(); } return ''; }
+function buildSessionCookie(token,maxAge){ return `__Host-mq_session=${token}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=${maxAge}`; }
+function clearSessionCookie(){ return `__Host-mq_session=; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0`; }
+async function authMiniappRequest(request, body, env){
+  const auth = request.headers.get('authorization') || '';
+  if (auth.toLowerCase().startsWith('bearer ')) { const v = await verifySessionToken(auth.slice(7).trim(), env); if (v.ok) return v; }
+  if (body?.token) { const v = await verifySessionToken(body.token, env); if (v.ok) return v; }
+  const c = readCookie(request, '__Host-mq_session');
+  if (c) { const v = await verifySessionToken(c, env); if (v.ok) return v; }
+  if (body?.initData) return verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+  return {ok:false, reason:'unauthorized'};
 }
 
 /* ========================== MINI APP UI (MODERN TRADING) ========================== */
@@ -4321,13 +5029,42 @@ const MINI_APP_HTML = `<!doctype html>
     }
     @keyframes spin{ to { transform: rotate(360deg); } }
     .muted{ color: var(--muted); }
-    .list{max-height:280px;overflow:auto;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:10px;background:rgba(255,255,255,.03)}
-    .list .item{display:flex;gap:10px;align-items:flex-start;justify-content:space-between;border-bottom:1px dashed rgba(255,255,255,.08);padding:8px 0}
-    .list .item:last-child{border-bottom:none}
-    .list .item small{opacity:.8;display:block;line-height:1.5}
-    .list .actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
-    textarea{width:100%}
-
+    .offer{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap: 12px;
+      padding: 16px;
+      border-radius: 20px;
+      background: linear-gradient(135deg, rgba(109,94,246,.24), rgba(0,209,255,.12));
+      border: 1px solid rgba(109,94,246,.35);
+    }
+    .offer h3{ margin:0; font-size: 15px; }
+    .offer p{ margin:6px 0 0; font-size: 12px; color: var(--muted); }
+    .offer .tag{
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      border: 1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.08);
+    }
+    .admin-card{ display:none; }
+    .admin-card.show{ display:block; }
+    .owner-hide.hidden{ display:none; }
+    .admin-grid{ display:grid; gap: 10px; }
+    .admin-row{ display:flex; gap:8px; flex-wrap:wrap; }
+    .admin-row .control{ flex:1; min-width: 140px; }
+    .toggle{ display:flex; align-items:center; gap:8px; padding: 8px 10px; border: 1px solid rgba(255,255,255,.12); border-radius: 12px; }
+    .toggle input{ width:18px; height:18px; }
+    textarea.control{ min-height: 120px; resize: vertical; }
+    .mini-list{ font-size: 12px; color: var(--muted); white-space: pre-wrap; }
+    .quote-grid{ display:grid; grid-template-columns: repeat(auto-fit,minmax(160px,1fr)); gap:10px; }
+    .quote-item{ border:1px solid rgba(255,255,255,.12); border-radius:14px; padding:10px; background:rgba(255,255,255,.04); }
+    .quote-item .k{ font-size:11px; color:var(--muted); }
+    .quote-item .v{ font-size:16px; font-weight:800; margin-top:4px; }
+    .q-up{ color: var(--good); }
+    .q-down{ color: var(--bad); }
+    .q-flat{ color: var(--warn); }
   </style>
 </head>
 <body>
@@ -4345,31 +5082,124 @@ const MINI_APP_HTML = `<!doctype html>
 
     <div class="grid">
       <div class="card">
+        <div class="card-b offer" id="offerCard">
+          <div>
+            <h3>🎁 پیشنهاد ویژه</h3>
+            <p id="offerText">فعال‌سازی اشتراک ویژه با تخفیف محدود.</p>
+          </div>
+          <div class="tag" id="offerTag">Special</div>
+        </div>
+      </div>
+      <div class="card" id="quoteCard">
+        <div class="card-h">
+          <strong>داشبورد قیمت لحظه‌ای</strong>
+          <span id="quoteStamp">—</span>
+        </div>
+        <div class="card-b">
+          <div class="quote-grid">
+            <div class="quote-item"><div class="k">نماد</div><div class="v" id="quoteSymbol">—</div></div>
+            <div class="quote-item"><div class="k">قیمت</div><div class="v" id="quotePrice">—</div></div>
+            <div class="quote-item"><div class="k">تغییر</div><div class="v" id="quoteChange">—</div></div>
+            <div class="quote-item"><div class="k">روند</div><div class="v" id="quoteTrend">—</div></div>
+          </div>
+          <div class="muted" style="font-size:12px; margin-top:8px;" id="quoteMeta">در حال دریافت داده…</div>
+        </div>
+      </div>
+
+      <div class="card" id="newsCard">
+        <div class="card-h">
+          <strong>📰 اخبار فارسی نماد</strong>
+          <button id="refreshNews" class="btn ghost" style="min-width:unset; padding:6px 10px;">بروزرسانی</button>
+        </div>
+        <div class="card-b">
+          <div class="mini-list" id="newsList">در حال دریافت خبر…</div>
+          <div class="muted" style="margin-top:10px; font-size:12px;">تحلیل خبری:</div>
+          <div class="mini-list" id="newsAnalysis">در حال تولید تحلیل خبری…</div>
+        </div>
+      </div>
+      <div class="card" id="userWalletCard">
+        <div class="card-h">
+          <strong>💳 ولت</strong>
+          <button id="refreshWallet" class="btn ghost" style="min-width:unset; padding:6px 10px;">بروزرسانی</button>
+        </div>
+        <div class="card-b">
+          <div class="mini-list">
+            <div>پلن: <b id="planName">marketi1 PRO</b> — با ارزش <b id="planPrice">۲۵</b> USDT (<span id="planNetwork">BEP20</span>)</div>
+            <div>وضعیت اشتراک: <span id="subStatus">—</span></div>
+            <div>انقضا: <span id="subExpiry">—</span></div>
+            <div>موجودی قابل برداشت (کمیسیون): <b id="commissionBalanceTxt">0</b> USDT</div>
+          </div>
+
+          <div class="field" style="margin-top:10px">
+            <div class="label">آدرس ولت درگاه (BEP20)</div>
+            <div class="admin-row">
+              <input id="gatewayWallet" class="control" readonly />
+              <button id="copyGatewayWallet" class="btn ghost">کپی</button>
+              <button id="openBscscanWallet" class="btn ghost">BscScan</button>
+            </div>
+            <div class="muted" style="font-size:12px; line-height:1.7;">
+              واریزی فقط به همین آدرس انجام می‌شه. بعد از واریز، TxID رو ثبت کن.
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">ثبت واریز (TxID)</div>
+            <div class="admin-row">
+              <input id="depositTxId" class="control" placeholder="TxID" />
+              <input id="depositAmount" class="control" placeholder="Amount" inputmode="decimal" />
+              <button id="submitDeposit" class="btn primary">ثبت</button>
+            </div>
+            <div class="muted" style="font-size:12px; line-height:1.8;">واریزی فقط به آدرس ولت درگاه ممکن است<br>در لیست زیر باید از واریز هش واریزی را ارسال کنید.<br>اگر مبلغ رو نزنی، ۲۵ در نظر می‌گیریم.</div>
+          </div>
+
+          <div class="field">
+            <div class="label">برداشت (از کمیسیون)</div>
+            <div class="admin-row">
+              <input id="withdrawAmountUser" class="control" placeholder="مبلغ (USDT)" inputmode="decimal" />
+              <input id="withdrawAddressUser" class="control" placeholder="آدرس BEP20 (0x...)" />
+              <button id="submitWithdraw" class="btn primary">ثبت درخواست</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">تاریخچه تراکنشات</div>
+            <div class="mini-list" id="walletHistoryList">—</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" id="userInviteCard">
+        <div class="card-h">
+          <strong>🤝 دعوت دوستان</strong>
+          <button id="refreshInvite" class="btn ghost" style="min-width:unset; padding:6px 10px;">بروزرسانی</button>
+        </div>
+        <div class="card-b">
+          <div class="mini-list">
+            <div>امتیاز شما: <b id="refPointsTxt">0</b></div>
+            <div>دعوت موفق: <b id="refInvitesTxt">0</b></div>
+            <div>کمیسیون قابل برداشت: <b id="refCommissionTxt">0</b> USDT</div>
+          </div>
+
+          <div class="field" style="margin-top:10px">
+            <div class="label">لینک رفرال قابل کپی و قابل اشتراک سریع</div>
+            <div class="admin-row">
+              <input id="refLinkInput" class="control" readonly />
+              <button id="copyRefLink" class="btn ghost">کپی</button>
+              <button id="shareRefLink" class="btn ghost">ارسال سریع</button>
+            </div>
+            <div class="muted" style="font-size:12px; line-height:1.7;">
+              با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتباز بدست می اورید • در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
         <div class="card-h">
           <strong>تحلیل سریع</strong>
           <span id="meta">—</span>
         </div>
         <div class="card-b">
-          <div class="row">
-            <div class="field" style="flex:1">
-              <div class="label">بازار</div>
-              <div class="chips" id="marketChips">
-                <div class="chip on" data-market="crypto">کریپتو</div>
-                <div class="chip" data-market="forex">فارکس</div>
-                <div class="chip" data-market="metals">فلزات</div>
-                <div class="chip" data-market="indices">شاخص‌ها</div>
-              </div>
-              <select id="market" class="control" style="display:none">
-                <option value="crypto" selected>crypto</option>
-                <option value="forex">forex</option>
-                <option value="metals">metals</option>
-                <option value="indices">indices</option>
-              </select>
-            </div>
-          </div>
-
-          <div style="height:10px"></div>
-
           <div class="row">
             <div class="field" style="flex:1.4">
               <div class="label">جستجوی نماد</div>
@@ -4384,17 +5214,6 @@ const MINI_APP_HTML = `<!doctype html>
           <div style="height:10px"></div>
 
           <div class="row">
-            <div class="field">
-              <div class="label">سبک</div>
-              <select id="style" class="control">
-                <option value="اسکالپ">اسکالپ</option>
-                <option value="سوئینگ">سوئینگ</option>
-                <option value="اسمارت‌مانی" selected>اسمارت‌مانی</option>
-                <option value="پرایس اکشن">پرایس اکشن</option>
-                <option value="ICT">ICT</option>
-                <option value="ATR">ATR</option>
-              </select>
-            </div>
             <div class="field">
               <div class="label">تایم‌فریم</div>
               <div class="chips" id="tfChips">
@@ -4411,6 +5230,14 @@ const MINI_APP_HTML = `<!doctype html>
               </select>
             </div>
             <div class="field">
+              <div class="label">سبک</div>
+              <select id="style" class="control"></select>
+            </div>
+            <div class="field">
+              <div class="label">پرامپت اختصاصی</div>
+              <select id="customPrompt" class="control"></select>
+            </div>
+            <div class="field">
               <div class="label">ریسک</div>
               <select id="risk" class="control">
                 <option value="کم">کم</option>
@@ -4425,6 +5252,15 @@ const MINI_APP_HTML = `<!doctype html>
                 <option value="false">خاموش ❌</option>
               </select>
             </div>
+            <div class="field">
+              <div class="label">حالت پرامپت</div>
+              <select id="promptMode" class="control">
+                <option value="style_plus_custom" selected>سبک + اختصاصی</option>
+                <option value="style_only">فقط سبک</option>
+                <option value="custom_only">فقط اختصاصی</option>
+                <option value="combined_all">ترکیب همه سبک‌ها</option>
+              </select>
+            </div>
           </div>
 
           <div style="height:12px"></div>
@@ -4432,6 +5268,7 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="actions">
             <button id="save" class="btn">💾 ذخیره</button>
             <button id="analyze" class="btn primary">⚡ تحلیل</button>
+            <button id="reconnect" class="btn ghost">🔄 اتصال مجدد</button>
             <button id="close" class="btn ghost">✖ بستن</button>
           </div>
 
@@ -4440,267 +5277,1587 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
 
         <div class="out" id="out">آماده…</div>
-        <div class="chart" id="chartBox" style="display:none; margin-top:10px;">
-          <img id="qChart" alt="Quick Chart" style="width:100%; border-radius:14px; box-shadow: var(--shadow);" />
+
+        <div class="card" id="chartCard" style="display:none; margin-top:12px;">
+          <div class="card-h">
+            <strong>چارت</strong>
+            <span class="muted" id="chartMeta">QuickChart</span>
+          </div>
+          <div class="card-b">
+            <img id="chartImg" alt="chart" style="width:100%; border-radius:16px; display:block;" />
+          </div>
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" id="supportCard">
         <div class="card-h">
-          <strong>💳 کیف پول</strong>
-          <span id="wMeta">—</span>
+          <strong>پشتیبانی</strong>
+          <span>ارسال تیکت</span>
         </div>
         <div class="card-b">
-          <div class="row">
-            <div class="field">
-              <div class="label">موجودی</div>
-              <input id="wBalance" class="control" readonly value="—" />
-            </div>
-            <div class="field">
-              <div class="label">آدرس واریز</div>
-              <input id="wAddress" class="control" readonly value="—" />
-            </div>
+          <div class="field">
+            <div class="label">متن تیکت</div>
+            <div class="muted" style="font-size:12px; line-height:1.7; margin-top:6px;">با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.</div>
+            <textarea id="supportTicketText" class="control" placeholder="مشکل یا درخواست خود را بنویسید..." maxlength="300"></textarea>
           </div>
-
-          <div style="height:12px"></div>
           <div class="actions">
-            <button id="wDeposit" class="btn">➕ واریز</button>
-            <button id="wWithdraw" class="btn">➖ برداشت</button>
-            <button id="wSubBuy" class="btn">👑 اشتراک</button>
-            <button id="wRefresh" class="btn ghost">🔄 موجودی</button>
+            <button id="sendSupportTicket" class="btn">✉️ ارسال تیکت</button>
           </div>
-
-          <div style="height:10px"></div>
-          <div class="muted" style="font-size:12px; line-height:1.6;" id="wNote"></div>
+          <div class="muted" style="font-size:12px; line-height:1.6;">پاسخ از طریق پشتیبانی تلگرام ارسال می‌شود.</div>
         </div>
       </div>
-    </div>
-  </div>
 
+      <div class="card admin-card" id="adminCard">
+        <div class="card-h">
+          <strong id="adminTitle">پنل ادمین</strong>
+          <span>مدیریت پرامپت، سبک‌ها، پرداخت، برداشت و تیکت‌ها</span>
+        </div>
+        <div class="card-b admin-grid">
+          <div class="field">
+            <div class="label">پرامپت اصلی تحلیل</div>
+            <textarea id="adminPrompt" class="control" placeholder="پرامپت اصلی تحلیل..."></textarea>
+            <div class="actions">
+              <button id="savePrompt" class="btn primary">ذخیره پرامپت</button>
+            </div>
+          </div>
 
-  <div class="card" id="adminCard" style="display:none">
-    <h2>🛠 پنل ادمین</h2>
-    <div class="meta">برای اعمال تغییرات، ذخیره را بزن. همه چیز داخل <b>bot_db</b> ذخیره می‌شود.</div>
+          <div class="field">
+            <div class="label">پرامپت سبک‌ها (JSON)</div>
+            <textarea id="stylePromptJson" class="control" placeholder='{"پرایس_اکشن":"...","ict":"...","atr":"..."}'></textarea>
+            <div class="actions">
+              <button id="saveStylePrompts" class="btn">ذخیره JSON سبک‌ها</button>
+            </div>
+          </div>
 
-    <div class="row">
-      <div>
-        <label>آدرس ولت (واریز)</label>
-        <input id="adm_wallet" placeholder="Wallet Address..." />
+          <div class="field">
+            <div class="label">مدیریت سبک‌ها</div>
+            <div class="admin-row">
+              <input id="newStyle" class="control" placeholder="سبک جدید" />
+              <button id="addStyle" class="btn">افزودن سبک</button>
+            </div>
+            <div class="admin-row">
+              <input id="removeStyleName" class="control" placeholder="نام سبک برای حذف" />
+              <button id="removeStyle" class="btn ghost">حذف سبک</button>
+            </div>
+            <div class="mini-list" id="styleList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">کمیسیون دعوت</div>
+            <div class="admin-row">
+              <input id="globalCommission" class="control" placeholder="درصد کمیسیون کلی (مثلاً 5)" />
+              <button id="saveGlobalCommission" class="btn">ذخیره کلی</button>
+            </div>
+            <div class="admin-row">
+              <input id="commissionUser" class="control" placeholder="یوزرنیم خاص (@user)" />
+              <input id="commissionPercent" class="control" placeholder="درصد برای کاربر خاص" />
+              <button id="saveUserCommission" class="btn">ذخیره کاربر</button>
+            </div>
+            <div class="mini-list" id="commissionList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">سهمیه رایگان روزانه</div>
+            <div class="admin-row">
+              <input id="freeDailyLimit" class="control" placeholder="مثلاً 3" />
+              <button id="saveFreeLimit" class="btn">ذخیره سهمیه</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">پرامپت‌های اختصاصی (JSON)</div>
+            <textarea id="customPromptsJson" class="control" placeholder='[{"id":"p1","title":"VIP","text":"..."}]'></textarea>
+            <div class="actions">
+              <button id="saveCustomPrompts" class="btn">ذخیره پرامپت‌های اختصاصی</button>
+            </div>
+            <div class="admin-row">
+              <input id="customPromptUser" class="control" placeholder="یوزرنیم کاربر" />
+              <input id="customPromptId" class="control" placeholder="شناسه پرامپت" />
+              <button id="sendCustomPrompt" class="btn ghost">ارسال به کاربر</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">تأیید پرداخت و فعال‌سازی اشتراک</div>
+            <div class="admin-row">
+              <input id="payUsername" class="control" placeholder="یوزرنیم خریدار" />
+              <input id="payAmount" class="control" placeholder="مبلغ" />
+              <input id="payDays" class="control" placeholder="روزهای اشتراک" />
+              <input id="payDailyLimit" class="control" placeholder="سهمیه روزانه اشتراک" />
+            </div>
+            <div class="admin-row">
+              <input id="payTx" class="control" placeholder="هش تراکنش" />
+              <button id="approvePayment" class="btn primary">تأیید و فعال‌سازی</button>
+              <button id="checkPayment" class="btn ghost">چک بلاک‌چین</button>
+              <button id="activateSubscription" class="btn">فعال‌سازی دستی</button>
+            </div>
+            <div class="muted" style="font-size:12px; line-height:1.8;">برای استفاده ساده: فقط یوزرنیم + مبلغ + یکی از پلن‌ها را انتخاب کنید. TxHash اختیاری است.</div>
+            <div class="chips" id="paymentPresets">
+              <button type="button" class="chip" data-days="7" data-amount="9">پلن شروع ۷ روزه</button>
+              <button type="button" class="chip" data-days="30" data-amount="19">پلن ماهانه</button>
+              <button type="button" class="chip" data-days="90" data-amount="49">پلن حرفه‌ای ۹۰ روزه</button>
+            </div>
+            <div class="mini-list" id="paymentList">—</div>
+          </div>
+
+          
+          <div class="field">
+            <div class="label">بنر پیشنهاد (نمایش داخل مینی‌اپ)</div>
+            <textarea id="offerBannerInput" class="control" placeholder="متن بنر پیشنهاد..."></textarea>
+            <div class="actions">
+              <button id="saveOfferBanner" class="btn">ذخیره بنر</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">متن خوش‌آمدگویی (قابل تنظیم از پنل)</div>
+            <textarea id="welcomeBotInput" class="control" placeholder="متن خوش‌آمدگویی بات..."></textarea>
+            <textarea id="welcomeMiniappInput" class="control" placeholder="متن خوش‌آمدگویی مینی‌اپ..."></textarea>
+            <div class="actions">
+              <button id="saveWelcomeTexts" class="btn">ذخیره متن خوش‌آمدگویی</button>
+            </div>
+          </div>
+
+          <div class="field owner-hide" id="featureFlagsBlock">
+            <div class="label">ویژگی‌ها (فقط اونر)</div>
+            <div class="admin-row">
+              <label class="toggle">
+                <input type="checkbox" id="flagCapitalMode" />
+                <span>حالت سرمایه (Capital Mode)</span>
+              </label>
+              <label class="toggle">
+                <input type="checkbox" id="flagProfileTips" />
+                <span>نوتیف پیشنهاد روزانه</span>
+              </label>
+              <button id="saveFeatureFlags" class="btn">ذخیره</button>
+            </div>
+            <div class="muted" style="font-size:12px; line-height:1.6;">این تنظیمات روی همه کاربران اثر دارد.</div>
+          </div>
+
+          <div class="field owner-hide" id="walletSettingsBlock">
+            <div class="label">تنظیم آدرس ولت (فقط اونر)</div>
+            <textarea id="walletAddressInput" class="control" placeholder="آدرس ولت جهت پرداخت (مثلاً BEP20)..."></textarea>
+            <div class="actions">
+              <button id="saveWallet" class="btn">ذخیره آدرس</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="label">مدیریت تیکت‌ها</div>
+            <div class="actions">
+              <button id="refreshTickets" class="btn">بروزرسانی</button>
+              <button id="ticketQuickPending" class="btn ghost">فقط pending</button>
+              <button id="ticketQuickAnswered" class="btn ghost">فقط answered</button>
+            </div>
+            <select id="ticketSelect" class="control"></select>
+            <select id="ticketReplyTemplate" class="control">
+              <option value="">تمپلیت پاسخ…</option>
+              <option value="درخواست شما ثبت شد و در حال بررسی تیم پشتیبانی است. نتیجه به‌زودی ارسال می‌شود.">در حال بررسی</option>
+              <option value="مشکل اتصال مینی‌اپ برطرف شد. لطفاً یک‌بار اپ را ببندید و دوباره باز کنید.">حل مشکل اتصال</option>
+              <option value="برای این مورد به اطلاعات بیشتری نیاز داریم. لطفاً اسکرین‌شات و زمان دقیق خطا را ارسال کنید.">نیاز به اطلاعات بیشتر</option>
+              <option value="درخواست شما انجام شد و تیکت بسته می‌شود. در صورت نیاز تیکت جدید ثبت کنید.">بستن با موفقیت</option>
+            </select>
+            <textarea id="ticketReply" class="control" placeholder="پاسخ به کاربر (اختیاری)"></textarea>
+            <div class="admin-row">
+              <select id="ticketStatus" class="control">
+                <option value="pending">pending</option>
+                <option value="answered">answered</option>
+                <option value="closed">closed</option>
+              </select>
+              <button id="updateTicket" class="btn primary">ثبت وضعیت / ارسال پاسخ</button>
+            </div>
+            <div class="mini-list" id="ticketsList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">مدیریت برداشت‌ها</div>
+            <div class="actions">
+              <button id="refreshWithdrawals" class="btn">بروزرسانی</button>
+            </div>
+            <select id="withdrawSelect" class="control"></select>
+            <div class="admin-row">
+              <select id="withdrawDecision" class="control">
+                <option value="approved">approved</option>
+                <option value="rejected">rejected</option>
+              </select>
+              <input id="withdrawTxHash" class="control" placeholder="TxHash (برای approved)" />
+              <button id="reviewWithdrawalBtn" class="btn primary">ثبت</button>
+            </div>
+            <div class="mini-list" id="withdrawalsList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">درخواست‌های پرامپت اختصاصی</div>
+            <div class="actions">
+              <button id="refreshPromptReqs" class="btn">بروزرسانی</button>
+            </div>
+            <select id="promptReqSelect" class="control"></select>
+            <div class="admin-row">
+              <input id="promptReqPromptId" class="control" placeholder="Prompt ID برای فعال‌سازی (در صورت approve)" />
+              <select id="promptReqDecision" class="control">
+                <option value="approved">approve</option>
+                <option value="rejected">reject</option>
+              </select>
+              <button id="decidePromptReqBtn" class="btn primary">ثبت</button>
+            </div>
+            <div class="mini-list" id="promptReqList">—</div>
+          </div>
+
+          <div class="field">
+            <div class="label">فعال/غیرفعال کردن سرمایه برای کاربر</div>
+            <div class="admin-row">
+              <input id="capitalToggleUser" class="control" placeholder="یوزرنیم (@user)" />
+              <select id="capitalToggleEnabled" class="control">
+                <option value="true">enabled</option>
+                <option value="false">disabled</option>
+              </select>
+              <button id="saveCapitalToggle" class="btn">ثبت</button>
+            </div>
+          </div>
+<div class="field owner-hide" id="reportBlock">
+            <div class="label">گزارش کامل کاربران (فقط اونر)</div>
+            <div class="actions">
+              <button id="loadUsers" class="btn">دریافت گزارش</button>
+              <button id="downloadReportPdf" class="btn primary">دانلود PDF</button>
+            </div>
+            <div class="mini-list" id="usersReport">—</div>
+          </div>
+        </div>
       </div>
-      <div>
-        <label>Limit روزانه (Free)</label>
-        <input id="adm_limit_free" type="number" min="0" />
+
+      <div class="toast" id="toast">
+        <div class="spin" id="spin" style="display:none"></div>
+        <div style="min-width:0; flex:1;">
+          <div class="t" id="toastT">—</div>
+          <div class="s" id="toastS">—</div>
+        </div>
+        <div class="badge" id="toastB">—</div>
       </div>
-      <div>
-        <label>Limit روزانه (Premium)</label>
-        <input id="adm_limit_premium" type="number" min="0" />
-      </div>
-      <div>
-        <label>کمسیون کلی (%)</label>
-        <input id="adm_comm_global" type="number" step="0.01" min="0" />
-      </div>
-    </div>
 
-    <label>پلن‌های اشتراک (JSON)</label>
-    <textarea id="adm_plans" rows="7" spellcheck="false"></textarea>
-
-    <label>کمسیون اختصاصی (JSON - مثال: {"@user": 3.5})</label>
-    <textarea id="adm_comm_per" rows="5" spellcheck="false"></textarea>
-
-    <label>سبک‌ها (JSON - هر سبک: {label, enabled, prompt})</label>
-    <textarea id="adm_styles" rows="10" spellcheck="false"></textarea>
-
-    <div class="row">
-      <button class="btn" id="adm_reload">🔄 دریافت تنظیمات</button>
-      <button class="btn primary" id="adm_save">💾 ذخیره تنظیمات</button>
-      <button class="btn" id="adm_refresh_lists">📊 بروزرسانی گزارش‌ها</button>
-    </div>
-
-    <div class="row">
-      <div>
-        <h3 style="margin: 10px 0 6px">درخواست‌های اشتراک (Pending)</h3>
-        <div class="list" id="adm_sub_pending"></div>
-      </div>
-      <div>
-        <h3 style="margin: 10px 0 6px">برداشت‌ها</h3>
-        <div class="list" id="adm_withdraws"></div>
-      </div>
-    </div>
-
-    <h3 style="margin: 10px 0 6px">کاربران</h3>
-    <div class="list" id="adm_users"></div>
-  </div>
-
-
-  <div class="toast" id="toast">
-    <div class="spin" id="spin" style="display:none"></div>
-    <div style="min-width:0">
-      <div class="t" id="toastT">…</div>
-      <div class="s" id="toastS"></div>
-    </div>
-    <div class="badge" id="toastB"></div>
-  </div>
-
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="/app.js"></script>
+      <script src="app.js"></script>
 </body>
 </html>`;
 
-const MINI_APP_JS = "const tg = window.Telegram?.WebApp;\nif (tg) tg.ready();\n\nlet SESSION_TOKEN = \"\";\ntry { SESSION_TOKEN = localStorage.getItem(\"mq_token\") || \"\"; } catch(_) {}\n\nasync function ensureAuth(){\n  if (SESSION_TOKEN) return;\n  const initData = tg?.initData || \"\";\n  if (!initData) return;\n  const r = await fetch(\"/api/auth/login\", {\n    method: \"POST\",\n    credentials: \"include\",\n    headers: {\"content-type\":\"application/json\"},\n    body: JSON.stringify({ initData }),\n  });\n  const j = await r.json().catch(() => null);\n  if (j?.ok && j.token){\n    SESSION_TOKEN = j.token;\n    try { localStorage.setItem(\"mq_token\", SESSION_TOKEN); } catch(_) {}\n  }\n}\n\nconst out = document.getElementById(\"out\");\nconst chartBox = document.getElementById(\"chartBox\");\nconst qChart = document.getElementById(\"qChart\");\nconst meta = document.getElementById(\"meta\");\nconst sub = document.getElementById(\"sub\");\nconst pillTxt = document.getElementById(\"pillTxt\");\nconst welcome = document.getElementById(\"welcome\");\n\nfunction el(id){ return document.getElementById(id); }\nfunction val(id){ return el(id).value; }\nfunction setVal(id, v){ el(id).value = v; }\n\nconst toast = el(\"toast\");\nconst toastT = el(\"toastT\");\nconst toastS = el(\"toastS\");\nconst toastB = el(\"toastB\");\nconst spin = el(\"spin\");\n\nlet ALL_SYMBOLS = [];\nlet MARKET_SYMBOLS = {};\nlet CURRENT_MARKET = \"crypto\";\n\nfunction showToast(title, subline = \"\", badge = \"\", loading = false){\n  toastT.textContent = title || \"\";\n  toastS.textContent = subline || \"\";\n  toastB.textContent = badge || \"\";\n  spin.style.display = loading ? \"inline-block\" : \"none\";\n  toast.classList.add(\"show\");\n}\nfunction hideToast(){ toast.classList.remove(\"show\"); }\n\nfunction fillSymbols(list){\n  ALL_SYMBOLS = Array.isArray(list) ? list.slice() : [];\n  const sel = el(\"symbol\");\n  const cur = sel.value;\n  sel.innerHTML = \"\";\n  for (const s of ALL_SYMBOLS) {\n    const opt = document.createElement(\"option\");\n    opt.value = s;\n    opt.textContent = s;\n    sel.appendChild(opt);\n  }\n  if (cur && ALL_SYMBOLS.includes(cur)) sel.value = cur;\n}\n\nfunction filterSymbols(q){\n  q = (q || \"\").trim().toUpperCase();\n  const sel = el(\"symbol\");\n  const cur = sel.value;\n  sel.innerHTML = \"\";\n\n  const list = !q ? ALL_SYMBOLS : ALL_SYMBOLS.filter(s => s.includes(q));\n  for (const s of list) {\n    const opt = document.createElement(\"option\");\n    opt.value = s;\n    opt.textContent = s;\n    sel.appendChild(opt);\n  }\n  if (cur && list.includes(cur)) sel.value = cur;\n}\n\nfunction setMarket(market){\n  market = String(market || \"\").trim();\n  if (!market) return;\n  CURRENT_MARKET = market;\n  setVal(\"market\", market);\n\n  const chips = el(\"marketChips\")?.querySelectorAll(\".chip\") || [];\n  for (const c of chips) c.classList.toggle(\"on\", c.dataset.market === market);\n\n  const list = (MARKET_SYMBOLS && MARKET_SYMBOLS[market]) ? MARKET_SYMBOLS[market] : [];\n  fillSymbols(list);\n  filterSymbols(val(\"q\"));\n}\n\nfunction setTf(tf){\n  setVal(\"timeframe\", tf);\n  const chips = el(\"tfChips\")?.querySelectorAll(\".chip\") || [];\n  for (const c of chips) c.classList.toggle(\"on\", c.dataset.tf === tf);\n}\n\nasync function api(path, body){\n  await ensureAuth();\n  const headers = {\"content-type\":\"application/json\"};\n  if (SESSION_TOKEN) headers[\"authorization\"] = \"Bearer \" + SESSION_TOKEN;\n  const r = await fetch(path, {\n    method: \"POST\",\n    credentials: \"include\",\n    headers,\n    body: JSON.stringify(body),\n  });\n  const j = await r.json().catch(() => null);\n  return { status: r.status, json: j };\n}\n\nfunction prettyErr(j, status){\n  const e = String(j?.error || \"نامشخص\");\n\n  if (status === 429 && e.startsWith(\"quota_exceeded\")) return \"سهمیه امروز تمام شد.\";\n  if (status === 403 && e === \"onboarding_required\") return \"ابتدا نام و شماره را داخل ربات ثبت کنید.\";\n  if (status === 401) return \"احراز هویت تلگرام ناموفق است.\";\n\n  if (e === \"insufficient_funds\") return \"موجودی کافی نیست.\";\n  if (e === \"withdraw_bad_amount\") return \"مبلغ نامعتبر است.\";\n  if (e === \"withdraw_bad_address\") return \"آدرس نامعتبر است.\";\n  if (e === \"txid_required\") return \"TxID/رسید لازم است.\";\n  if (e === \"sub_pending_exists\") return \"یک درخواست اشتراک در انتظار دارید.\";\n\n  return \"مشکلی پیش آمد. لطفاً دوباره تلاش کنید.\";\n}\n\n\nfunction updateWallet(state, walletAddress){\n  const bal = Number(state?.wallet?.balance || 0);\n  const cur = state?.wallet?.currency || \"USDT\";\n  const wBal = el(\"wBalance\");\n  const wAddr = el(\"wAddress\");\n  const wMeta = el(\"wMeta\");\n  const wNote = el(\"wNote\");\n  if (wBal) wBal.value = String(bal) + \" \" + String(cur);\n  if (wAddr) wAddr.value = walletAddress || \"\";\n  if (wMeta) wMeta.textContent = state?.subscription?.active ? \"اشتراک: فعال ✅\" : \"اشتراک: رایگان\";\n  if (wNote) wNote.textContent = \"واریز/برداشت به‌صورت دستی توسط پشتیبانی تأیید می‌شود.\";\n}\n\nasync function refreshWallet(){\n  const initData = tg?.initData || \"\";\n  const {status, json} = await api(\"/api/wallet/balance\", { initData });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n\n  window.__STATE = window.__STATE || {};\n  window.__STATE.wallet = window.__STATE.wallet || {};\n  window.__STATE.wallet.balance = json.balance;\n  window.__STATE.wallet.currency = json.currency;\n\n  updateWallet(window.__STATE, json.walletAddress);\n  return json;\n}\n\n\nfunction updateMeta(state, quota){\n  meta.textContent = \\`سهمیه: \\${quota || \"-\"}\\`;\n  sub.textContent = \\`ID: \\${state?.userId || \"-\"} | امروز: \\${state?.dailyDate || \"-\"}\\`;\n}\n\nasync function boot(){\n  out.textContent = \"⏳ در حال آماده‌سازی…\";\n  pillTxt.textContent = \"Connecting…\";\n  showToast(\"در حال اتصال…\", \"دریافت پروفایل و تنظیمات\", \"API\", true);\n\n  const initData = tg?.initData || \"\";\n  const {status, json} = await api(\"/api/user\", { initData });\n\n  if (!json?.ok) {\n    hideToast();\n    pillTxt.textContent = \"Offline\";\n    out.textContent = \"⚠️ خطا: \" + prettyErr(json, status);\n    showToast(\"خطا\", prettyErr(json, status), \"API\", false);\n    return;\n  }\n\n  welcome.textContent = json.welcome || \"\";\n\n  window.__SUB_PLANS = json.subPlans || [];\n\n  window.__IS_ADMIN = !!json.isAdmin;\n  window.__STYLES = Array.isArray(json.styles) ? json.styles : [];\n\n  // Fill styles from server (admin can edit styles in bot_db)\n  try {\n    const styleSel = el(\"style\");\n    if (styleSel && window.__STYLES.length) {\n      styleSel.innerHTML = window.__STYLES.map(s => `<option value=\"${s}\">${s}</option>`).join(\"\");\n      // keep selection if exists\n      if (json.state?.style) styleSel.value = json.state.style;\n    }\n  } catch(_){}\n\n  MARKET_SYMBOLS = json.marketSymbols || {};\n  // Default market (from profile or fallback to crypto)\n  let defMarket = \"crypto\";\n  const pref = String(json.state?.profile?.preferredMarket || json.state?.preferredMarket || \"\");\n  if (pref.includes(\"فارکس\")) defMarket = \"forex\";\n  else if (pref.includes(\"فلز\")) defMarket = \"metals\";\n  else if (pref.includes(\"شاخص\") || pref.includes(\"سهام\")) defMarket = \"indices\";\n  else if (pref.includes(\"کریپتو\")) defMarket = \"crypto\";\n\n  setMarket(defMarket);\n\n  if (json.state?.timeframe) setTf(json.state.timeframe);\n  if (json.state?.style) setVal(\"style\", json.state.style);\n  if (json.state?.risk) setVal(\"risk\", json.state.risk);\n  setVal(\"newsEnabled\", String(!!json.state?.newsEnabled));\n\n  updateMeta(json.state, json.quota);\n  window.__STATE = json.state || window.__STATE || {};\n  updateWallet(window.__STATE, json.walletAddress || el(\"wAddress\")?.value || \"\");\n  window.__STATE = json.state || {};\n  updateWallet(window.__STATE, json.walletAddress || \"\");\n\n  if (window.__IS_ADMIN) {\n    try { await initAdmin(); } catch(_){}\n  }\n\n  out.textContent = \"آماده ✅\";\n  pillTxt.textContent = \"Online\";\n  hideToast();\n}\n\n\n// ===== Admin Panel (MiniApp) =====\nasync function adminGetCfg() {\n  const initData = tg?.initData || \"\";\n  const { status, json } = await api(\"/api/admin/config/get\", { initData });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n  return json.cfg;\n}\nasync function adminSetCfg(patch) {\n  const initData = tg?.initData || \"\";\n  const { status, json } = await api(\"/api/admin/config/set\", { initData, patch });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n  return json.cfg;\n}\nasync function adminListUsers() {\n  const initData = tg?.initData || \"\";\n  const { status, json } = await api(\"/api/admin/users/list\", { initData, limit: 20 });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n  return json.users || [];\n}\nasync function adminListSubs() {\n  const initData = tg?.initData || \"\";\n  const { status, json } = await api(\"/api/admin/sub/pending\", { initData });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n  return json.items || [];\n}\nasync function adminApprove(ticket) {\n  const initData = tg?.initData || \"\";\n  const { status, json } = await api(\"/api/admin/sub/approve\", { initData, ticket });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n  return json;\n}\nasync function adminReject(ticket) {\n  const initData = tg?.initData || \"\";\n  const reason = prompt(\"دلیل رد؟\", \"رد شد\");\n  if (reason == null) return null;\n  const { status, json } = await api(\"/api/admin/sub/reject\", { initData, ticket, reason });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n  return json;\n}\nasync function adminListWithdraws() {\n  const initData = tg?.initData || \"\";\n  const { status, json } = await api(\"/api/admin/withdraw/list\", { initData });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n  return json.items || [];\n}\n\nfunction prettyJson(x){\n  try { return JSON.stringify(x, null, 2); } catch { return \"[]\"; }\n}\nfunction parseJson(str, fallback){\n  try { return JSON.parse(str); } catch { return fallback; }\n}\n\nfunction renderSubList(items){\n  const box = el(\"adm_sub_pending\");\n  if (!box) return;\n  if (!items.length) { box.innerHTML = \"<div class='meta'>موردی نیست.</div>\"; return; }\n\n  box.innerHTML = items.map(it => {\n    const user = it.username ? (\"@\" + it.username) : (it.userId || \"\");\n    const plan = it.planTitle || it.planId || \"-\";\n    const pay = it.payMethod === \"balance\" ? \"از موجودی\" : (it.txid || \"-\");\n    return `<div class=\"item\">\n      <div>\n        <b>${it.ticket}</b>\n        <small>کاربر: ${user} | پلن: ${plan}</small>\n        <small>پرداخت: ${pay}</small>\n        <small>${it.createdAt || \"\"}</small>\n      </div>\n      <div class=\"actions\">\n        <button class=\"btn primary\" data-act=\"approve\" data-ticket=\"${it.ticket}\">تایید</button>\n        <button class=\"btn\" data-act=\"reject\" data-ticket=\"${it.ticket}\">رد</button>\n      </div>\n    </div>`;\n  }).join(\"\");\n\n  box.querySelectorAll(\"button[data-act]\").forEach(btn=>{\n    btn.addEventListener(\"click\", async ()=>{\n      const ticket = btn.dataset.ticket;\n      const act = btn.dataset.act;\n      try{\n        showToast(\"ادمین\", \"در حال انجام…\", act.toUpperCase(), true);\n        if(act===\"approve\") await adminApprove(ticket);\n        if(act===\"reject\") { const r = await adminReject(ticket); if(!r) return; }\n        await adminRefreshLists();\n        hideToast();\n      }catch(err){\n        showToast(\"خطا\", String(err?.message||err), \"ADM\", false);\n      }\n    });\n  });\n}\n\nfunction renderWithdrawList(items){\n  const box = el(\"adm_withdraws\");\n  if (!box) return;\n  if (!items.length) { box.innerHTML = \"<div class='meta'>موردی نیست.</div>\"; return; }\n\n  box.innerHTML = items.map(it => {\n    const user = it.username ? (\"@\" + it.username) : (it.userId || \"\");\n    const amt = it.amount || \"-\";\n    const fee = it.commissionFee != null ? ` | fee: ${it.commissionFee}` : \"\";\n    const net = it.netAmount != null ? ` | net: ${it.netAmount}` : \"\";\n    return `<div class=\"item\">\n      <div>\n        <b>${it.ticket || \"-\"}</b>\n        <small>کاربر: ${user}</small>\n        <small>مبلغ: ${amt}${fee}${net}</small>\n        <small>آدرس: ${it.wallet || \"-\"}</small>\n        <small>${it.createdAt || \"\"}</small>\n      </div>\n    </div>`;\n  }).join(\"\");\n}\n\nfunction renderUsers(items){\n  const box = el(\"adm_users\");\n  if (!box) return;\n  if (!items.length) { box.innerHTML = \"<div class='meta'>موردی نیست.</div>\"; return; }\n\n  box.innerHTML = items.map(u => {\n    const sub = u.subscription?.active ? \"✅\" : (u.subscription?.pendingTicket ? \"⏳\" : \"—\");\n    const bal = u.wallet?.balance ?? 0;\n    return `<div class=\"item\">\n      <div>\n        <b>${u.name || u.username || u.userId}</b>\n        <small>${u.username ? (\"@\" + u.username) : \"\"} | used: ${u.dailyUsed}/${u.dailyLimit} | sub: ${sub}</small>\n        <small>balance: ${bal} | points: ${u.points} | invites: ${u.invites}</small>\n      </div>\n    </div>`;\n  }).join(\"\");\n}\n\nasync function adminLoadCfgToUI(){\n  const cfg = await adminGetCfg();\n  el(\"adm_wallet\").value = cfg.walletAddress || \"\";\n  el(\"adm_limit_free\").value = cfg.limits?.freeDailyLimit ?? \"\";\n  el(\"adm_limit_premium\").value = cfg.limits?.premiumDailyLimit ?? \"\";\n  el(\"adm_comm_global\").value = cfg.commissions?.globalPct ?? 0;\n\n  el(\"adm_plans\").value = prettyJson(cfg.subPlans || []);\n  el(\"adm_comm_per\").value = prettyJson(cfg.commissions?.perUser || {});\n  el(\"adm_styles\").value = prettyJson(cfg.styles || []);\n\n  return cfg;\n}\n\nasync function adminSaveFromUI(){\n  const patch = {\n    walletAddress: String(el(\"adm_wallet\").value || \"\").trim(),\n    limits: {\n      freeDailyLimit: Number(el(\"adm_limit_free\").value || 0),\n      premiumDailyLimit: Number(el(\"adm_limit_premium\").value || 0),\n    },\n    commissions: {\n      globalPct: Number(el(\"adm_comm_global\").value || 0),\n      perUser: parseJson(el(\"adm_comm_per\").value, {}),\n    },\n    subPlans: parseJson(el(\"adm_plans\").value, []),\n    styles: parseJson(el(\"adm_styles\").value, []),\n  };\n  await adminSetCfg(patch);\n}\n\nasync function adminRefreshLists(){\n  const [subs, wds, users] = await Promise.all([adminListSubs(), adminListWithdraws(), adminListUsers()]);\n  renderSubList(subs);\n  renderWithdrawList(wds);\n  renderUsers(users);\n}\n\nlet __ADMIN_READY = false;\nasync function initAdmin(){\n  if (__ADMIN_READY) return;\n  __ADMIN_READY = true;\n\n  const card = el(\"adminCard\");\n  if (!card) return;\n  card.style.display = \"block\";\n\n  el(\"adm_reload\")?.addEventListener(\"click\", async ()=>{\n    try{\n      showToast(\"ادمین\", \"دریافت تنظیمات…\", \"CFG\", true);\n      await adminLoadCfgToUI();\n      hideToast();\n    }catch(err){\n      showToast(\"خطا\", String(err?.message||err), \"CFG\", false);\n    }\n  });\n\n  el(\"adm_save\")?.addEventListener(\"click\", async ()=>{\n    try{\n      showToast(\"ادمین\", \"ذخیره تنظیمات…\", \"SAVE\", true);\n      await adminSaveFromUI();\n\n      // update local dropdowns (styles & plans) without reloading the whole app\n      try{\n        const cfg = await adminGetCfg();\n        window.__SUB_PLANS = cfg.subPlans || window.__SUB_PLANS || [];\n        const styles = (cfg.styles || []).filter(s => s && s.enabled !== false).map(s => s.label).filter(Boolean);\n        window.__STYLES = styles;\n        const styleSel = el(\"style\");\n        if (styleSel && styles.length) {\n          const cur = styleSel.value;\n          styleSel.innerHTML = styles.map(s => `<option value=\"${s}\">${s}</option>`).join(\"\");\n          if (styles.includes(cur)) styleSel.value = cur;\n        }\n      }catch(_){}\n\n      hideToast();\n    }catch(err){\n      showToast(\"خطا\", String(err?.message||err), \"SAVE\", false);\n    }\n  });\n\n  el(\"adm_refresh_lists\")?.addEventListener(\"click\", async ()=>{\n    try{\n      showToast(\"ادمین\", \"بروزرسانی گزارش‌ها…\", \"RPT\", true);\n      await adminRefreshLists();\n      hideToast();\n    }catch(err){\n      showToast(\"خطا\", String(err?.message||err), \"RPT\", false);\n    }\n  });\n\n  // initial load\n  try { await adminLoadCfgToUI(); } catch(_){}\n  try { await adminRefreshLists(); } catch(_){}\n}\n\n\nel(\"q\").addEventListener(\"input\", (e) => filterSymbols(e.target.value));\n\nel(\"marketChips\").addEventListener(\"click\", (e) => {\n  const chip = e.target?.closest?.(\".chip\");\n  const m = chip?.dataset?.market;\n  if (!m) return;\n  setMarket(m);\n});\n\nel(\"tfChips\").addEventListener(\"click\", (e) => {\n  const chip = e.target?.closest?.(\".chip\");\n  const tf = chip?.dataset?.tf;\n  if (!tf) return;\n  setTf(tf);\n});\n\nel(\"save\").addEventListener(\"click\", async () => {\n  showToast(\"در حال ذخیره…\", \"تنظیمات ذخیره می‌شود\", \"SET\", true);\n  out.textContent = \"⏳ ذخیره تنظیمات…\";\n\n  const initData = tg?.initData || \"\";\n  const payload = {\n    initData,\n    timeframe: val(\"timeframe\"),\n    style: val(\"style\"),\n    risk: val(\"risk\"),\n    newsEnabled: val(\"newsEnabled\") === \"true\",\n  };\n\n  const {status, json} = await api(\"/api/settings\", payload);\n  if (!json?.ok) {\n    out.textContent = \"⚠️ خطا: \" + prettyErr(json, status);\n    showToast(\"خطا\", prettyErr(json, status), \"SET\", false);\n    return;\n  }\n\n  out.textContent = \"✅ تنظیمات ذخیره شد.\";\n  updateMeta(json.state, json.quota);\n  window.__STATE = json.state || window.__STATE || {};\n  updateWallet(window.__STATE, json.walletAddress || el(\"wAddress\")?.value || \"\");\n  showToast(\"ذخیره شد ✅\", \"تنظیمات اعمال شد\", \"OK\", false);\n  setTimeout(hideToast, 1200);\n});\n\nel(\"analyze\").addEventListener(\"click\", async () => {\n  showToast(\"در حال تحلیل…\", \"جمع‌آوری دیتا + تولید خروجی\", \"AI\", true);\n  out.textContent = \"⏳ در حال تحلیل…\";\n\n  if (!val(\"market\") || !val(\"symbol\")) {\n    const msg = \"اول بازار و نماد را انتخاب کن.\";\n    out.textContent = \"⚠️ \" + msg;\n    showToast(\"نیاز به انتخاب\", msg, \"WIZ\", false);\n    return;\n  }\n\n  const initData = tg?.initData || \"\";\n  const payload = { initData, symbol: val(\"symbol\"), userPrompt: \"\", market: val(\"market\"), style: val(\"style\"), timeframe: val(\"timeframe\") };\n\n  const {status, json} = await api(\"/api/analyze\", payload);\n  if (!json?.ok) {\n    const msg = prettyErr(json, status);\n    out.textContent = \"⚠️ \" + msg;\n    showToast(\"خطا\", msg, status === 429 ? \"Quota\" : \"AI\", false);\n    return;\n  }\n\n  out.textContent = json.result || \"⚠️ بدون خروجی\";\n  if (json.chartUrl && qChart && chartBox) {\n    qChart.src = json.chartUrl;\n    chartBox.style.display = \"block\";\n  } else if (chartBox) {\n    chartBox.style.display = \"none\";\n  }\n  updateMeta(json.state, json.quota);\n  window.__STATE = json.state || window.__STATE || {};\n  updateWallet(window.__STATE, json.walletAddress || el(\"wAddress\")?.value || \"\");\n  showToast(\"آماده ✅\", \"خروجی دریافت شد\", \"OK\", false);\n  setTimeout(hideToast, 1200);\n});\n\n// Wallet buttons\nel(\"wRefresh\")?.addEventListener(\"click\", async () => {\n  showToast(\"در حال بروزرسانی…\", \"دریافت موجودی\", \"WALLET\", true);\n  try {\n    await refreshWallet();\n    showToast(\"✅ بروزرسانی شد\", el(\"wBalance\")?.value || \"\", \"OK\", false);\n    setTimeout(hideToast, 1000);\n  } catch (e) {\n    showToast(\"خطا\", e?.message || \"نامشخص\", \"WALLET\", false);\n  }\n});\n\nel(\"wDeposit\")?.addEventListener(\"click\", async () => {\n  const addr = el(\"wAddress\")?.value || \"\";\n  if (addr && navigator?.clipboard?.writeText) {\n    try { await navigator.clipboard.writeText(addr); } catch(_){}\n  }\n  showToast(\"آدرس واریز\", addr || \"فعلاً آدرس تنظیم نشده\", \"COPY\", false);\n  setTimeout(hideToast, 1500);\n});\n\nel(\"wWithdraw\")?.addEventListener(\"click\", async () => {\n  const amount = prompt(\"مبلغ برداشت (عدد):\");\n  if (!amount) return;\n  const address = prompt(\"آدرس مقصد:\");\n  if (!address) return;\n\n  showToast(\"در حال ثبت برداشت…\", \"لطفاً صبر کنید\", \"WD\", true);\n  const initData = tg?.initData || \"\";\n  const {status, json} = await api(\"/api/wallet/withdraw\", { initData, amount, address });\n\n  if (!json?.ok) {\n    showToast(\"خطا\", prettyErr(json, status), \"WD\", false);\n    return;\n  }\n\n  await refreshWallet();\n  out.textContent = \"✅ درخواست برداشت ثبت شد: \" + json.ticket;\n  showToast(\"ثبت شد ✅\", \"کد: \" + json.ticket, \"OK\", false);\n  setTimeout(hideToast, 2000);\n});\n\n\n// Subscription buy (admin approval required)\nel(\"wSubBuy\")?.addEventListener(\"click\", async () => {\n  const initData = tg?.initData || \"\";\n\n  // check pending\n  try {\n    const st = window.__STATE || {};\n    const pendingTicket = st?.subscription?.pendingTicket || \"\";\n    if (pendingTicket) {\n      showToast(\"در انتظار تایید\", \"Ticket: \" + pendingTicket, \"SUB\", false);\n      setTimeout(hideToast, 1800);\n      return;\n    }\n  } catch(_){}\n\n  const plans = Array.isArray(window.__SUB_PLANS) && window.__SUB_PLANS.length ? window.__SUB_PLANS : [\n    { id:\"m1\", title:\"⭐ ماهانه\", days:30, price:10, currency:\"USDT\" },\n    { id:\"m3\", title:\"🔥 سه‌ماهه\", days:90, price:25, currency:\"USDT\" },\n    { id:\"y1\", title:\"👑 سالانه\", days:365, price:80, currency:\"USDT\" },\n  ];\n\n  const menu = plans.map((p,i)=> `${i+1}) ${p.title} - ${p.price} ${p.currency}`).join(\"\\\\n\");\n  const pick = prompt(\"انتخاب پلن:\\\\n\" + menu + \"\\\\n\\\\nعدد را وارد کن:\");\n  if (!pick) return;\n  const idx = Number(pick) - 1;\n  const plan = plans[idx];\n  if (!plan) { showToast(\"پلن نامعتبر\", \"\", \"SUB\", false); return; }\n\n  // payment method\n  const bal = Number(window.__STATE?.wallet?.balance || 0);\n  let payMethod = \"txid\";\n  let txid = \"\";\n\n  if (bal >= Number(plan.price || 0)) {\n    const useBal = confirm(`موجودی شما کافی است (${bal}).\\\\nمی‌خواهید از موجودی پرداخت کنید؟`);\n    if (useBal) payMethod = \"balance\";\n  }\n\n  if (payMethod === \"txid\") {\n    txid = prompt(\"TxID / رسید واریز را وارد کنید:\");\n    if (!txid) return;\n  }\n\n  showToast(\"در حال ثبت…\", \"درخواست اشتراک ارسال می‌شود\", \"SUB\", true);\n\n  const {status, json} = await api(\"/api/subscription/request\", { initData, planId: plan.id, payMethod, txid });\n  if (!json?.ok) {\n    showToast(\"خطا\", prettyErr(json, status), \"SUB\", false);\n    return;\n  }\n\n  // refresh wallet + state\n  try { await refreshWallet(); } catch(_){}\n  window.__STATE = window.__STATE || {};\n  window.__STATE.subscription = window.__STATE.subscription || {};\n  window.__STATE.subscription.pendingTicket = json.ticket;\n\n  out.textContent = \"✅ درخواست اشتراک ثبت شد: \" + json.ticket + \"\\\\nبعد از تایید مدیریت فعال می‌شود.\";\n  showToast(\"ثبت شد ✅\", \"Ticket: \" + json.ticket, \"OK\", false);\n  setTimeout(hideToast, 2200);\n});\n\nel(\"close\").addEventListener(\"click\", () => tg?.close());\n\nboot();";
+const MINI_APP_JS = `const tg = window.Telegram?.WebApp;
+if (tg) tg.ready();
+if (tg?.expand) tg.expand();
+
+const out = document.getElementById("out");
+const meta = document.getElementById("meta");
+const sub = document.getElementById("sub");
+const pillTxt = document.getElementById("pillTxt");
+const welcome = document.getElementById("welcome");
+const offerText = document.getElementById("offerText");
+const offerTag = document.getElementById("offerTag");
+const adminCard = document.getElementById("adminCard");
+const adminTitle = document.getElementById("adminTitle");
+const reportBlock = document.getElementById("reportBlock");
+
+function el(id){ return document.getElementById(id); }
+function val(id){ return el(id).value; }
+function setVal(id, v){ el(id).value = v; }
+
+const toast = el("toast");
+const toastT = el("toastT");
+const toastS = el("toastS");
+const toastB = el("toastB");
+const spin = el("spin");
+
+let ALL_SYMBOLS = [];
+let INIT_DATA = "";
+let IS_STAFF = false;
+let IS_OWNER = false;
+let OFFLINE_MODE = false;
+
+const LOCAL_KEYS = {
+  initData: "miniapp_init_data",
+  userState: "miniapp_cached_user_state_v1",
+};
+const API_BASE = window.location.origin;
+let ADMIN_TICKETS = [];
+let ADMIN_TICKETS_ALL = [];
+let ADMIN_WITHDRAWALS = [];
+let ADMIN_PROMPT_REQS = [];
+let QUOTE_TIMER = null;
+let QUOTE_BUSY = false;
+let NEWS_TIMER = null;
+const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
 
 
-/* ========================== SUBSCRIPTIONS ========================== */
-function subscriptionStatusText(st, env) {
-  refreshSubscription(st, env);
-
-  const isActive = !!st.subscription?.active;
-  const exp = st.subscription?.expiresAt || "";
-  const expLine = isActive ? (exp ? `⏳ اعتبار تا: ${exp}` : "⏳ اعتبار: نامشخص") : "⛔️ اشتراک فعال نیست";
-  const planId = st.subscription?.planId || (isActive ? "premium" : "free");
-  const pending = st.subscription?.pendingTicket ? `\n\n🕓 درخواست در انتظار تأیید مدیریت:\nTicket: ${st.subscription.pendingTicket}` : "";
-
-  const freeBase = toInt(env?.FREE_DAILY_LIMIT, 50);
-  const premiumBase = toInt(env?.PREMIUM_DAILY_LIMIT, 200);
-  const limit = isActive ? toInt(st.subscription?.dailyLimit, premiumBase) : freeBase;
-
-  const plans = getSubPlans(env).map(p => `• ${p.title}: ${p.price} ${p.currency} / ${p.days} روز`).join("\n");
-
-  return (
-    `👑 وضعیت اشتراک\n\n` +
-    `وضعیت: ${isActive ? "فعال ✅" : "رایگان"}\n` +
-    `پلن: ${planId}\n` +
-    `${expLine}\n` +
-    `📊 سهمیه روزانه: ${limit}\n` +
-    pending +
-    `\n\n🛒 پلن‌ها:\n${plans}\n\n` +
-    `برای خرید: «${BTN.SUB_BUY}»`
-  );
+function storageGet(key){
+  try { return localStorage.getItem(key) || ""; } catch { return ""; }
+}
+function storageSet(key, val){
+  try { localStorage.setItem(key, String(val || "")); } catch {}
+}
+function storageRemove(key){
+  try { localStorage.removeItem(key); } catch {}
 }
 
-async function adminApproveSub(env, ticket, adminFrom) {
-  if (!getDB(env)) return { ok: false, error: "kv_required" };
-  const req = await getSubRequest(env, ticket);
-  if (!req) return { ok: false, error: "ticket_not_found" };
-  if (req.status !== "pending") return { ok: false, error: "already_processed", status: req.status };
+function extractInitDataFromLocation(){
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const fromQuery = q.get("tgWebAppData") || q.get("initData") || "";
+    if (fromQuery) return fromQuery;
+  } catch {}
 
-  const userId = String(req.userId || "");
-  if (!userId) return { ok: false, error: "bad_user" };
-
-  const st = await ensureUser(userId, env);
-  refreshSubscription(st, env);
-
-  const nowIso = new Date().toISOString();
-  const currentExp = st.subscription?.expiresAt;
-  const baseIso = (currentExp && Number.isFinite(Date.parse(currentExp)) && Date.parse(currentExp) > Date.now()) ? currentExp : nowIso;
-  const exp = addDaysISO(baseIso, Number(req.planDays || 30));
-
-  st.subscription.active = true;
-  st.subscription.type = "premium";
-  st.subscription.planId = req.planId || "premium";
-  st.subscription.dailyLimit = toInt(req.dailyLimit, toInt(env.PREMIUM_DAILY_LIMIT, 200));
-  st.subscription.expiresAt = exp;
-
-  st.subscription.pendingTicket = "";
-  st.subscription.pendingPlanId = "";
-  st.subscription.pendingPayMethod = "";
-  st.subscription.pendingAmount = 0;
-
-  await saveUser(userId, st, env);
-
-  req.status = "approved";
-  req.approvedAt = nowIso;
-  req.approvedBy = adminFrom?.username ? ("@" + adminFrom.username) : String(adminFrom?.id || "");
-  req.resultExpiresAt = exp;
-  await putSubRequest(env, ticket, req);
-
-  await tgSendMessage(env, userId, `✅ اشتراک شما فعال شد.\n\nپلن: ${req.planTitle || req.planId}\nاعتبار تا: ${exp}`, mainMenuKeyboard(env));
-
-  return { ok: true, expiresAt: exp };
+  try {
+    const h = String(window.location.hash || "").replace(/^#/, "");
+    if (!h) return "";
+    const hp = new URLSearchParams(h);
+    const raw = hp.get("tgWebAppData") || hp.get("initData") || "";
+    return raw ? decodeURIComponent(raw) : "";
+  } catch {
+    return "";
+  }
 }
 
-async function adminRejectSub(env, ticket, adminFrom, reason) {
-  if (!getDB(env)) return { ok: false, error: "kv_required" };
-  const req = await getSubRequest(env, ticket);
-  if (!req) return { ok: false, error: "ticket_not_found" };
-  if (req.status !== "pending") return { ok: false, error: "already_processed", status: req.status };
+function showToast(title, subline = "", badge = "", loading = false){
+  if (!toast || !toastT || !toastS || !toastB || !spin) return;
+  toastT.textContent = title || "";
+  toastS.textContent = subline || "";
+  toastB.textContent = badge || "";
+  spin.style.display = loading ? "inline-block" : "none";
+  toast.classList.add("show");
+}
+function hideToast(){ if (toast) toast.classList.remove("show"); }
 
-  const userId = String(req.userId || "");
-  if (!userId) return { ok: false, error: "bad_user" };
-
-  const st = await ensureUser(userId, env);
-  // refund if paid from balance
-  if (req.paidFromBalance) {
-    st.wallet = st.wallet || { balance: 0, currency: "USDT" };
-    st.wallet.balance = Number(st.wallet.balance || 0) + Number(req.amount || 0);
+function fillSymbols(list){
+  ALL_SYMBOLS = Array.isArray(list) ? list.slice() : [];
+  const sel = el("symbol");
+  const cur = sel.value;
+  sel.innerHTML = "";
+  for (const s of ALL_SYMBOLS) {
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    sel.appendChild(opt);
   }
-
-  st.subscription.pendingTicket = "";
-  st.subscription.pendingPlanId = "";
-  st.subscription.pendingPayMethod = "";
-  st.subscription.pendingAmount = 0;
-
-  await saveUser(userId, st, env);
-
-  req.status = "rejected";
-  req.rejectedAt = new Date().toISOString();
-  req.rejectedBy = adminFrom?.username ? ("@" + adminFrom.username) : String(adminFrom?.id || "");
-  req.reason = String(reason || "").slice(0, 500);
-  await putSubRequest(env, ticket, req);
-
-  await tgSendMessage(env, userId, `❌ درخواست اشتراک شما رد شد.\n\nTicket: ${ticket}\n${req.reason ? ("دلیل: " + req.reason) : ""}`, mainMenuKeyboard(env));
-
-  return { ok: true };
+  if (cur && ALL_SYMBOLS.includes(cur)) sel.value = cur;
 }
 
-async function handleCallbackQuery(env, cq) {
-  const data = String(cq.data || "");
-  if (!data.startsWith("sub:")) {
-    await tgAnswerCallbackQuery(env, cq.id, "");
-    return;
+function fillStyles(list){
+  const styles = Array.isArray(list) ? list.slice() : [];
+  const sel = el("style");
+  const cur = sel.value;
+  sel.innerHTML = "";
+  for (const s of styles) {
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    sel.appendChild(opt);
   }
+  if (cur && styles.includes(cur)) sel.value = cur;
+}
 
-  if (!isStaff(cq.from, env)) {
-    await tgAnswerCallbackQuery(env, cq.id, "⛔️ دسترسی ندارید", true);
-    return;
+function fillCustomPrompts(list){
+  const prompts = Array.isArray(list) ? list.slice() : [];
+  const sel = el("customPrompt");
+  const cur = sel.value;
+  sel.innerHTML = "";
+  const defaultOpt = document.createElement("option");
+  defaultOpt.value = "";
+  defaultOpt.textContent = "پیش‌فرض";
+  sel.appendChild(defaultOpt);
+  for (const p of prompts) {
+    const opt = document.createElement("option");
+    opt.value = String(p?.id || "");
+    opt.textContent = p?.title ? String(p.title) : String(p?.id || "");
+    sel.appendChild(opt);
   }
+  if (cur) sel.value = cur;
+}
 
-  const parts = data.split(":");
-  const action = parts[1] || "";
-  const ticket = parts[2] || "";
+function filterSymbols(q){
+  q = (q || "").trim().toUpperCase();
+  const sel = el("symbol");
+  const cur = sel.value;
+  sel.innerHTML = "";
 
-  if (!ticket) {
-    await tgAnswerCallbackQuery(env, cq.id, "ticket نامعتبر", true);
-    return;
+  const list = !q ? ALL_SYMBOLS : ALL_SYMBOLS.filter(s => s.includes(q));
+  for (const s of list) {
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    sel.appendChild(opt);
   }
+  if (cur && list.includes(cur)) sel.value = cur;
+}
 
-  const msgChatId = cq.message?.chat?.id;
-  const msgId = cq.message?.message_id;
+function setTf(tf){
+  setVal("timeframe", tf);
+  const chips = el("tfChips")?.querySelectorAll(".chip") || [];
+  for (const c of chips) c.classList.toggle("on", c.dataset.tf === tf);
+}
 
-  if (action === "approve") {
-    const r = await adminApproveSub(env, ticket, cq.from);
-    if (r.ok) {
-      await tgAnswerCallbackQuery(env, cq.id, "✅ تایید شد", false);
-      if (msgChatId && msgId) {
-        await tgEditMessageText(env, msgChatId, msgId, `✅ تایید شد\nTicket: ${ticket}\nاعتبار تا: ${r.expiresAt}`, null);
-      }
-    } else {
-      await tgAnswerCallbackQuery(env, cq.id, "خطا: " + (r.error || "نامشخص"), true);
+async function api(path, body){
+  let lastErr = null;
+  for (let i = 0; i < 2; i++) {
+    try {
+      const ac = new AbortController();
+      const tm = setTimeout(() => ac.abort("timeout"), 12000 + (i * 4000));
+      const r = await fetch(API_BASE + path, {        method: "POST",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify(body),
+        signal: ac.signal,
+      });
+      clearTimeout(tm);
+      const j = await r.json().catch(() => null);
+      return { status: r.status, json: j };
+    } catch (e) {
+      lastErr = e;
+      await new Promise((res) => setTimeout(res, 350 * (i + 1)));
     }
+  }
+  return { status: 599, json: { ok: false, error: String(lastErr?.message || lastErr || "network_error") } };
+}
+
+async function adminApi(path, body){
+  if (!IS_STAFF) return { status: 403, json: { ok: false, error: "forbidden" } };
+  return api(path, { initData: INIT_DATA, ...body });
+}
+
+function prettyErr(j, status){
+  const e = j?.error || "نامشخص";
+  if (status === 429 && String(e).startsWith("quota_exceeded")) return "سهمیه امروز تمام شد.";
+  if (status === 403 && String(e) === "onboarding_required") return "ابتدا نام و شماره را داخل ربات ثبت کنید.";
+  if (status === 401) {
+    if (String(e).includes("initData")) return "اتصال مینی‌اپ منقضی شده؛ اپ را مجدد از داخل تلگرام باز کنید.";
+    return "احراز هویت تلگرام ناموفق است.";
+  }
+  return "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.";
+}
+
+function fmtPrice(v){
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  const digits = n >= 1000 ? 2 : (n >= 1 ? 4 : 6);
+  return n.toLocaleString("en-US", { maximumFractionDigits: digits });
+}
+
+function normStr(v){ return (v === null || v === undefined) ? "" : String(v); }
+function isBep20Address(addr){
+  const a = normStr(addr).trim();
+  return /^0x[a-fA-F0-9]{40}$/.test(a);
+}
+function shortHash(h){
+  const s = normStr(h).trim();
+  if (!s) return "—";
+  if (s.length <= 18) return s;
+  return s.slice(0, 10) + "…" + s.slice(-6);
+}
+function applyWalletInviteFromState(json){
+  if (el("planName")) el("planName").textContent = "marketi1 PRO";
+  if (el("planPrice")) el("planPrice").textContent = "25";
+  if (el("planNetwork")) el("planNetwork").textContent = "BEP20";
+
+  const st = json?.state || {};
+  const subActive = !!st?.subscription?.active;
+  if (el("subStatus")) el("subStatus").textContent = subActive ? "فعال ✅" : "غیرفعال";
+  if (el("subExpiry")) el("subExpiry").textContent = normStr(st?.subscription?.expiresAt) || "—";
+
+  const cb = Number(st?.referral?.commissionBalance || 0);
+  if (el("commissionBalanceTxt")) el("commissionBalanceTxt").textContent = fmtPrice(cb);
+
+  const pts = Number(st?.referral?.points || 0);
+  const inv = Number(st?.referral?.successfulInvites || 0);
+  if (el("refPointsTxt")) el("refPointsTxt").textContent = String(pts);
+  if (el("refInvitesTxt")) el("refInvitesTxt").textContent = String(inv);
+  if (el("refCommissionTxt")) el("refCommissionTxt").textContent = fmtPrice(cb);
+
+  const walletAddr = normStr(json?.wallet || "").trim();
+  if (el("gatewayWallet")) el("gatewayWallet").value = walletAddr;
+  if (el("depositAmount") && !el("depositAmount").value) el("depositAmount").value = "25";
+
+  const botUser = normStr(json?.botUsername || "").replace(/^@/, "");
+  const code = (st?.referral?.codes || [])[0] || "";
+  const link = (botUser && code) ? ("https://t.me/" + botUser + "?start=ref_" + code) : (code ? ("ref_" + code) : "");
+  if (el("refLinkInput")) el("refLinkInput").value = link;
+}
+
+function renderWalletHistory(items){
+  const box = el("walletHistoryList");
+  if (!box) return;
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) { box.textContent = "—"; return; }
+  const lines = list.slice(0, 25).map((x) => {
+    const type = x.type === "withdraw" ? "➖ برداشت" : "➕ واریز";
+    const st = normStr(x.status || "");
+    const amt = fmtPrice(x.amount || 0);
+    const when = normStr(x.createdAt || "").replace("T", " ").replace("Z", "");
+    const h = x.txHash ? shortHash(x.txHash) : (x.address ? shortHash(x.address) : "—");
+    return type + " | " + amt + " USDT | " + (st || "—") + " | " + h + " | " + (when || "—");
+  });
+  box.textContent = lines.join("\n");
+}
+
+async function loadWalletAndInvite(){
+  if (!INIT_DATA) return;
+  try {
+    const cached = readCachedUserSnapshot();
+    if (cached) applyWalletInviteFromState(cached);
+  } catch {}
+
+  const { status, json } = await api("/api/wallet/history", { initData: INIT_DATA });
+  if (!json?.ok) {
+    if (status !== 401) showToast("خطا", prettyErr(json, status), "WALLET", false);
     return;
   }
 
-  if (action === "reject") {
-    const r = await adminRejectSub(env, ticket, cq.from, "رد شد توسط مدیریت");
-    if (r.ok) {
-      await tgAnswerCallbackQuery(env, cq.id, "❌ رد شد", false);
-      if (msgChatId && msgId) {
-        await tgEditMessageText(env, msgChatId, msgId, `❌ رد شد\nTicket: ${ticket}`, null);
-      }
-    } else {
-      await tgAnswerCallbackQuery(env, cq.id, "خطا: " + (r.error || "نامشخص"), true);
+  if (el("commissionBalanceTxt")) el("commissionBalanceTxt").textContent = fmtPrice(json.commissionBalance || 0);
+  if (el("refPointsTxt")) el("refPointsTxt").textContent = String(json.points || 0);
+  if (el("refInvitesTxt")) el("refInvitesTxt").textContent = String(json.successfulInvites || 0);
+  if (el("refCommissionTxt")) el("refCommissionTxt").textContent = fmtPrice(json.commissionBalance || 0);
+
+  if (el("gatewayWallet")) el("gatewayWallet").value = normStr(json.wallet || "");
+  renderWalletHistory(json.transactions || []);
+}
+
+function setQuoteUi(data, errMsg = ""){
+  const qSym = el("quoteSymbol");
+  const qPrice = el("quotePrice");
+  const qChange = el("quoteChange");
+  const qTrend = el("quoteTrend");
+  const qStamp = el("quoteStamp");
+  const qMeta = el("quoteMeta");
+  if (!qSym || !qPrice || !qChange || !qTrend || !qStamp || !qMeta) return;
+
+  if (!data?.ok) {
+    qMeta.textContent = errMsg || "داده قیمت در دسترس نیست.";
+    qStamp.textContent = "—";
+    return;
+  }
+
+  const cp = Number(data.changePct || 0);
+  qSym.textContent = data.symbol || "—";
+  qPrice.textContent = fmtPrice(data.price);
+  qChange.textContent = (cp > 0 ? "+" : "") + cp.toFixed(3) + "%";  qTrend.textContent = data.trend || "نامشخص";
+
+  qChange.classList.remove("q-up","q-down","q-flat");
+  qChange.classList.add(data.status === "up" ? "q-up" : (data.status === "down" ? "q-down" : "q-flat"));
+  const dt = data.lastTs ? new Date(Number(data.lastTs)) : new Date();
+  qStamp.textContent = dt.toLocaleTimeString("fa-IR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  qMeta.textContent = "TF: " + (data.timeframe || "-") + " | candles: " + (data.candles || 0) + " | کیفیت: " + (data.quality === "full" ? "کامل" : "محدود");}
+
+async function refreshLiveQuote(force = false){
+  if (!INIT_DATA || QUOTE_BUSY) return;
+  if (!force && document.hidden) return;
+  QUOTE_BUSY = true;
+  try {
+    const symbol = val("symbol") || "";
+    const timeframe = val("timeframe") || "H4";
+    if (!symbol) return;
+    const { json } = await api("/api/quote", { initData: INIT_DATA, symbol, timeframe });
+    setQuoteUi(json, "خطا در دریافت قیمت لحظه‌ای");
+  } finally {
+    QUOTE_BUSY = false;
+  }
+}
+
+function setupLiveQuotePolling(){
+  if (QUOTE_TIMER) clearInterval(QUOTE_TIMER);
+  refreshLiveQuote(true);
+  QUOTE_TIMER = setInterval(() => { refreshLiveQuote(false); }, 12000);
+}
+
+function renderNewsList(json){
+  const target = el("newsList");
+  if (!target) return;
+  if (!json?.ok || !Array.isArray(json.articles) || !json.articles.length) {
+    target.textContent = "فعلاً خبر مرتبطی پیدا نشد.";
+    return;
+  }
+  target.innerHTML = "";
+  for (const a of json.articles.slice(0, 6)) {
+    const row = document.createElement("div");
+    const title = document.createElement("a");
+    title.href = a.url || "#";
+    title.target = "_blank";
+    title.rel = "noopener noreferrer";
+    title.textContent = "• " + String(a.title || "بدون عنوان");
+    title.style.color = "#c7d2fe";
+    title.style.textDecoration = "none";
+    const meta = document.createElement("div");
+    meta.className = "muted";
+    meta.style.fontSize = "11px";
+    meta.textContent = (a.source || "") + (a.publishedAt ? (" | " + a.publishedAt) : "");
+    row.appendChild(title);
+    row.appendChild(meta);
+    row.style.marginBottom = "8px";
+    target.appendChild(row);
+  }
+}
+
+async function refreshSymbolNews(force = false){
+  if (!INIT_DATA) return;
+  if (!force && document.hidden) return;
+  const symbol = val("symbol") || "";
+  if (!symbol) return;
+  const target = el("newsList");
+  if (target && force) target.textContent = "در حال دریافت خبر…";
+  const { json } = await api("/api/news", { initData: INIT_DATA, symbol });
+  renderNewsList(json);
+}
+
+async function refreshNewsAnalysis(force = false){
+  if (!INIT_DATA) return;
+  if (!force && document.hidden) return;
+  const symbol = val("symbol") || "";
+  if (!symbol) return;
+  const target = el("newsAnalysis");
+  if (target && force) target.textContent = "در حال تحلیل خبر…";
+  const { json } = await api("/api/news/analyze", { initData: INIT_DATA, symbol });
+  if (!target) return;
+  target.textContent = json?.ok ? (json.summary || "—") : "تحلیل خبری در دسترس نیست.";
+}
+
+function setupNewsPolling(){
+  if (NEWS_TIMER) clearInterval(NEWS_TIMER);
+  refreshSymbolNews(true);
+  refreshNewsAnalysis(true);
+  NEWS_TIMER = setInterval(() => { refreshSymbolNews(false); refreshNewsAnalysis(false); }, 60000);
+}
+function renderChartFallbackSvg(svgText){
+  const chartCard = el("chartCard");
+  const chartImg = el("chartImg");
+  if (!chartCard || !chartImg || !svgText) return;
+  const svgUrl = "data:image/svg+xml;utf8," + encodeURIComponent(svgText);
+  chartImg.src = svgUrl;
+  chartCard.style.display = "block";
+  const cm = el("chartMeta");
+  if (cm) cm.textContent = "Internal Zones Renderer";
+}
+
+function pickTicketReplyTemplate(){
+  const tpl = el("ticketReplyTemplate")?.value || "";
+  if (!tpl) return;
+  const input = el("ticketReply");
+  if (!input) return;
+  if (!input.value.trim()) input.value = tpl;
+}
+
+function updateMeta(state, quota){
+  meta.textContent = "سهمیه: " + (quota || "-");
+  sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
+}
+
+function renderStyleList(styles){
+  const target = el("styleList");
+  if (!target) return;
+  target.textContent = Array.isArray(styles) && styles.length ? styles.join(" • ") : "—";
+}
+
+function renderCommissionList(commission){
+  const target = el("commissionList");
+  if (!target) return;
+  const global = commission?.globalPercent ?? 0;
+  const overrides = commission?.overrides || {};
+  const lines = ["کلی: " + global + "%"];
+  for (const [k, v] of Object.entries(overrides)) lines.push(String(k) + ": " + String(v) + "%");
+  target.textContent = lines.join("\\n");
+}
+
+function renderPayments(list){
+  const target = el("paymentList");
+  if (!target) return;
+  if (!Array.isArray(list) || !list.length) { target.textContent = "—"; return; }
+  target.textContent = list.slice(0, 8).map((p) => {
+    const who = p.username || p.userId;
+    return "• " + who + " | " + p.amount + " | " + p.status + " | " + (p.txHash || "—");
+  }).join("\\n");
+}
+
+
+function shortText(s, n = 80){
+  s = String(s || "").replace(/\s+/g, " ").trim();
+  return s.length > n ? (s.slice(0, n) + "…") : s;
+}
+
+function renderTickets(list, keepMaster = false){
+  ADMIN_TICKETS = Array.isArray(list) ? list.slice() : [];
+  if (!keepMaster) ADMIN_TICKETS_ALL = ADMIN_TICKETS.slice();
+  const sel = el("ticketSelect");
+  const target = el("ticketsList");
+  if (sel) sel.innerHTML = "";
+  if (!ADMIN_TICKETS.length){
+    if (sel){
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent = "—";
+      sel.appendChild(o);
     }
+    if (target) target.textContent = "—";
     return;
   }
 
-  await tgAnswerCallbackQuery(env, cq.id, "اکشن نامعتبر", true);
+  const items = ADMIN_TICKETS.slice().sort((a,b) => String(b?.createdAt||"").localeCompare(String(a?.createdAt||"")));
+  if (sel){
+    for (const t of items){
+      const o = document.createElement("option");
+      o.value = t.id || "";
+      const who = t.username ? ("@"+String(t.username).replace(/^@/,"")) : (t.userId || "-");
+      o.textContent = String(t.id || "-") + " | " + who + " | " + String(t.status || "pending");
+      sel.appendChild(o);
+    }
+  }
+  if (target){
+    target.textContent = items.slice(0, 25).map((t) => {
+      const who = t.username ? ("@"+String(t.username).replace(/^@/,"")) : (t.userId || "-");
+      return "• " + t.id + " | " + who + " | " + (t.status || "pending") + " | " + shortText(t.text, 80);
+    }).join("\n");
+  }
+}
+
+function renderWithdrawals(list){
+  ADMIN_WITHDRAWALS = Array.isArray(list) ? list.slice() : [];
+  const sel = el("withdrawSelect");
+  const target = el("withdrawalsList");
+  if (sel) sel.innerHTML = "";
+  if (!ADMIN_WITHDRAWALS.length){
+    if (sel){
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent = "—";
+      sel.appendChild(o);
+    }
+    if (target) target.textContent = "—";
+    return;
+  }
+  const items = ADMIN_WITHDRAWALS.slice().sort((a,b) => String(b?.createdAt||"").localeCompare(String(a?.createdAt||"")));
+  if (sel){
+    for (const w of items){
+      const o = document.createElement("option");
+      o.value = w.id || "";
+      o.textContent = String(w.id || "-") + " | " + String(w.userId || "-") + " | " + String(w.amount || 0) + " | " + String(w.status || "pending");
+      sel.appendChild(o);
+    }
+  }
+  if (target){
+    target.textContent = items.slice(0, 25).map((w) => {
+      return "• " + w.id + " | " + (w.userId || "-") + " | " + (w.amount || 0) + " | " + (w.status || "pending") + " | " + shortText(w.address, 32);
+    }).join("\n");
+  }
+}
+
+function renderPromptReqs(list){
+  ADMIN_PROMPT_REQS = Array.isArray(list) ? list.slice() : [];
+  const sel = el("promptReqSelect");
+  const target = el("promptReqList");
+  if (sel) sel.innerHTML = "";
+  if (!ADMIN_PROMPT_REQS.length){
+    if (sel){
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent = "—";
+      sel.appendChild(o);
+    }
+    if (target) target.textContent = "—";
+    return;
+  }
+  const items = ADMIN_PROMPT_REQS.slice().sort((a,b) => String(b?.createdAt||"").localeCompare(String(a?.createdAt||"")));
+  if (sel){
+    for (const r of items){
+      const o = document.createElement("option");
+      o.value = r.id || "";
+      const who = r.username ? ("@"+String(r.username).replace(/^@/,"")) : (r.userId || "-");
+      o.textContent = String(r.id || "-") + " | " + who + " | " + String(r.status || "pending");
+      sel.appendChild(o);
+    }
+  }
+  if (target){
+    target.textContent = items.slice(0, 25).map((r) => {
+      const who = r.username ? ("@"+String(r.username).replace(/^@/,"")) : (r.userId || "-");
+      const pid = r.promptId ? (" | prompt:" + r.promptId) : "";
+      return "• " + r.id + " | " + who + " | " + (r.status || "pending") + pid;
+    }).join("\n");
+  }
+}
+
+async function refreshTickets(){
+  const { json } = await adminApi("/api/admin/tickets/list", { limit: 100 });
+  if (json?.ok) renderTickets(json.tickets || []);
+}
+
+function applyTicketFilter(status){
+  if (!status) return renderTickets(ADMIN_TICKETS_ALL || [], true);
+  const filtered = (ADMIN_TICKETS_ALL || []).filter((x) => String(x?.status || "pending") === status);
+  renderTickets(filtered, true);
+}
+
+async function refreshWithdrawals(){
+  const { json } = await adminApi("/api/admin/withdrawals/list", {});
+  if (json?.ok) renderWithdrawals(json.withdrawals || []);
+}
+
+async function refreshPromptReqs(){
+  const { json } = await adminApi("/api/admin/custom-prompts/requests", {});
+  if (json?.ok) renderPromptReqs(json.requests || []);
+}
+
+
+function renderUsers(list){
+  const target = el("usersReport");
+  if (!target) return;
+  if (!Array.isArray(list) || !list.length) { target.textContent = "—"; return; }
+  target.textContent = list.map((u) => {
+    const user = u.username ? ("@" + u.username.replace(/^@/, "")) : u.userId;
+    return "• " + user + " | تلفن: " + (u.phone || "—") + " | مدت: " + u.usageDays + " روز | تحلیل موفق: " + u.totalAnalyses + " | آخرین تحلیل: " + (u.lastAnalysisAt || "—") + " | پرداخت: " + u.paymentCount + " (" + (u.paymentTotal || 0) + ") | اشتراک: " + (u.subscriptionType || "free") + " | انقضا: " + (u.subscriptionExpiresAt || "—") + " | سهمیه: " + u.dailyUsed + "/" + u.dailyLimit + " | رفرال: " + u.referralInvites + " | TX: " + (u.lastTxHash || "—") + " | پرامپت: " + (u.customPromptId || "—");
+  }).join("\\n");
+}
+
+function renderFullAdminReport(users, payments, withdrawals, tickets) {
+  const target = el("usersReport");
+  if (!target) return;
+
+  const u = Array.isArray(users) ? users : [];
+  const p = Array.isArray(payments) ? payments : [];
+  const w = Array.isArray(withdrawals) ? withdrawals : [];
+  const t = Array.isArray(tickets) ? tickets : [];
+
+  const head = [
+    "📊 گزارش کامل ادمین (Asia/Tehran)",
+    "کاربران: " + u.length + " | پرداخت‌ها: " + p.length + " | برداشت‌ها: " + w.length + " | تیکت‌ها: " + t.length,
+    "────────────────────",
+  ];
+
+  const usersBlock = u.slice(0, 80).map((x) => {
+    const user = x.username ? ("@" + x.username.replace(/^@/, "")) : x.userId;
+    return "• " + user + " | تحلیل موفق: " + (x.totalAnalyses || 0) + " | سهمیه: " + (x.dailyUsed || 0) + "/" + (x.dailyLimit || 0) + " | اشتراک: " + (x.subscriptionType || "free") + " | TX: " + (x.lastTxHash || "—");
+  });
+
+  const payBlock = p.slice(0, 40).map((x) => "• " + (x.username || x.userId) + " | " + (x.amount || 0) + " | " + (x.status || "-") + " | " + (x.txHash || "—"));
+  const wdBlock = w.slice(0, 40).map((x) => "• " + (x.userId || "-") + " | " + (x.amount || 0) + " | " + (x.status || "pending") + " | " + (x.address || "—"));
+  const tkBlock = t.slice(0, 40).map((x) => "• " + (x.username || x.userId || "-") + " | " + (x.status || "pending") + " | " + String(x.text || "").slice(0, 80));
+
+  target.textContent = [
+    ...head,
+    "👥 کاربران:", ...(usersBlock.length ? usersBlock : ["—"]),
+    "",
+    "💳 پرداخت‌ها:", ...(payBlock.length ? payBlock : ["—"]),
+    "",
+    "➖ برداشت‌ها:", ...(wdBlock.length ? wdBlock : ["—"]),
+    "",
+    "🎫 تیکت‌ها:", ...(tkBlock.length ? tkBlock : ["—"]),
+  ].join("\n");
+}
+
+function safeJsonParse(text, fallback) {
+  try { return JSON.parse(text); } catch { return fallback; }
+}
+
+function cacheUserSnapshot(json) {
+  try {
+    const data = {
+      welcome: json?.welcome || "",
+      state: json?.state || {},
+      quota: json?.quota || "",
+      symbols: json?.symbols || [],
+      styles: json?.styles || [],
+      customPrompts: json?.customPrompts || [],
+      offerBanner: json?.offerBanner || "",
+      role: json?.role || "user",
+      isStaff: !!json?.isStaff,
+      wallet: json?.wallet || "",
+      botUsername: json?.botUsername || "",
+      cachedAt: Date.now(),
+    };
+    localStorage.setItem(LOCAL_KEYS.userState, JSON.stringify(data));
+  } catch {}
+}
+
+function readCachedUserSnapshot() {
+  try {
+    return safeJsonParse(localStorage.getItem(LOCAL_KEYS.userState) || "", null);
+  } catch {
+    return null;
+  }
+}
+
+function applyUserState(json) {
+  welcome.textContent = json.welcome || "";
+  fillSymbols(json.symbols || []);
+  const styleList = json.styles || [];
+  fillStyles(styleList);
+  fillCustomPrompts(json.customPrompts || []);
+  if (json.state?.timeframe) setTf(json.state.timeframe);
+  if (json.state?.style && styleList.includes(json.state.style)) {
+    setVal("style", json.state.style);
+  } else if (styleList.length) {
+    setVal("style", styleList[0]);
+  }
+  if (json.state?.risk) setVal("risk", json.state.risk);
+  if (typeof json.state?.customPromptId === "string") setVal("customPrompt", json.state.customPromptId);
+  setVal("newsEnabled", String(!!json.state?.newsEnabled));
+  setVal("promptMode", json.state?.promptMode || "style_plus_custom");
+
+  if (json.state?.selectedSymbol && (json.symbols || []).includes(json.state.selectedSymbol)) {
+    setVal("symbol", json.state.selectedSymbol);
+  } else if (json.symbols?.length) setVal("symbol", json.symbols[0]);
+  if (offerText) offerText.textContent = json.offerBanner || "فعال‌سازی اشتراک ویژه با تخفیف محدود.";
+  if (offerTag) offerTag.textContent = json.role === "owner" ? "Owner" : "Special";
+
+  updateMeta(json.state, json.quota);
+}
+
+
+async function boot(){
+  out.textContent = "⏳ در حال آماده‌سازی…";
+  pillTxt.textContent = "Connecting…";
+  showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
+
+  const isTelegramRuntime = !!window.Telegram?.WebApp;
+  const qsInitData = extractInitDataFromLocation();
+  const savedInitData = storageGet(LOCAL_KEYS.initData);
+  let initData = (tg?.initData || "").trim();
+
+  // Telegram WebApp may populate initData with a slight delay.
+  if (isTelegramRuntime && !initData) {
+    await new Promise((r) => setTimeout(r, 350));
+    initData = (tg?.initData || "").trim();
+  }
+
+  if (initData) {
+    INIT_DATA = initData;
+    storageSet(LOCAL_KEYS.initData, initData);
+  } else if (qsInitData) {
+    INIT_DATA = qsInitData;
+    storageSet(LOCAL_KEYS.initData, qsInitData);
+  } else if (savedInitData && !isTelegramRuntime) {
+    INIT_DATA = savedInitData;
+  } else if (!isTelegramRuntime) {
+    const devInit = "dev:999001";
+    INIT_DATA = devInit;
+    storageSet(LOCAL_KEYS.initData, devInit);
+    showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
+  } else {
+    hideToast();
+    pillTxt.textContent = "Offline";
+    out.textContent = "⚠️ اتصال مینی‌اپ برقرار نیست. " + CONNECTION_HINT;
+    return;
+  }
+
+  const {status, json} = await api("/api/user", { initData: INIT_DATA });
+
+  if (!json?.ok) {
+    if (status === 401) {
+      storageRemove(LOCAL_KEYS.initData);
+    }
+    const cached = readCachedUserSnapshot();
+    if (!cached) {
+      hideToast();
+      pillTxt.textContent = "Offline";
+      out.textContent = "⚠️ خطا: " + prettyErr(json, status);
+      showToast("خطا", prettyErr(json, status), "API", false);
+      return;
+    }
+    OFFLINE_MODE = true;
+    applyUserState(cached);
+    out.textContent = "حالت آفلاین فعال شد ✅ برخی امکانات محدود هستند.";
+    pillTxt.textContent = "Offline (Cached)";
+    hideToast();
+    showToast("آفلاین", "داده‌های ذخیره‌شده بارگذاری شد", "CACHE", false);
+    return;
+  }
+
+  OFFLINE_MODE = false;
+  cacheUserSnapshot(json);
+  applyUserState(json);
+  out.textContent = "آماده ✅";
+  try { await loadWalletAndInvite(); } catch (e) { console.error("loadWalletAndInvite failed:", e); }
+  pillTxt.textContent = "Online";
+  hideToast();
+  setupLiveQuotePolling();
+  setupNewsPolling();
+  IS_STAFF = !!json.isStaff;
+  IS_OWNER = json.role === "owner";
+
+  if (IS_STAFF && adminCard) {
+    adminCard.classList.add("show");
+    if (adminTitle) adminTitle.textContent = IS_OWNER ? "پنل اونر" : "پنل ادمین";
+
+    // Owner-only blocks
+    document.querySelectorAll(".owner-hide").forEach((x) => {
+      x.classList.toggle("hidden", !IS_OWNER);
+    });
+
+    if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
+    if (IS_OWNER && el("walletAddressInput")) el("walletAddressInput").value = json.wallet || "";
+
+    await loadAdminBootstrap();
+  }
+}
+
+async function loadAdminBootstrap(){
+  const { json } = await adminApi("/api/admin/bootstrap", {});
+  if (!json?.ok) return;
+
+  if (el("adminPrompt")) el("adminPrompt").value = json.prompt || "";
+  if (el("stylePromptJson")) el("stylePromptJson").value = JSON.stringify(json.stylePrompts || {}, null, 2);
+  if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(json.customPrompts || [], null, 2);
+  if (el("freeDailyLimit")) el("freeDailyLimit").value = String(json.freeDailyLimit ?? "");
+  if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
+  if (el("welcomeBotInput")) el("welcomeBotInput").value = json.welcomeBot || "";
+  if (el("welcomeMiniappInput")) el("welcomeMiniappInput").value = json.welcomeMiniapp || "";
+
+  if (json.adminFlags) {
+    if (el("flagCapitalMode")) el("flagCapitalMode").checked = !!json.adminFlags.capitalModeEnabled;
+    if (el("flagProfileTips")) el("flagProfileTips").checked = !!json.adminFlags.profileTipsEnabled;
+  }
+
+  renderStyleList(json.styles || []);
+  renderCommissionList(json.commission || {});
+  renderPayments(json.payments || []);
+  renderTickets(json.tickets || []);
+  renderWithdrawals(json.withdrawals || []);
+  if (offerText) offerText.textContent = json.offerBanner || (offerText.textContent || "");
+
+  // load prompt requests
+  if (el("promptReqSelect")) await refreshPromptReqs();
+}
+
+el("q").addEventListener("input", (e) => filterSymbols(e.target.value));
+el("symbol")?.addEventListener("change", () => { refreshLiveQuote(true); refreshSymbolNews(true); refreshNewsAnalysis(true); });
+el("timeframe")?.addEventListener("change", () => refreshLiveQuote(true));
+el("refreshNews")?.addEventListener("click", () => { refreshSymbolNews(true); refreshNewsAnalysis(true); });
+el("tfChips").addEventListener("click", (e) => {
+  const chip = e.target?.closest?.(".chip");
+  const tf = chip?.dataset?.tf;
+  if (!tf) return;
+  setTf(tf);
+  refreshLiveQuote(true);
+});
+
+el("save").addEventListener("click", async () => {
+  if (OFFLINE_MODE) {
+    showToast("آفلاین", "در حالت آفلاین ذخیره روی سرور ممکن نیست.", "SET", false);
+    return;
+  }
+  showToast("در حال ذخیره…", "تنظیمات ذخیره می‌شود", "SET", true);
+  out.textContent = "⏳ ذخیره تنظیمات…";
+
+  const initData = INIT_DATA || tg?.initData || "";
+  const payload = {
+    initData,
+    timeframe: val("timeframe"),
+    style: val("style"),
+    risk: val("risk"),
+    newsEnabled: val("newsEnabled") === "true",
+    promptMode: val("promptMode") || "style_plus_custom",
+    selectedSymbol: val("symbol") || "",
+    customPromptId: val("customPrompt") || "",
+  };
+
+  const {status, json} = await api("/api/settings", payload);
+  if (!json?.ok) {
+    out.textContent = "⚠️ خطا: " + prettyErr(json, status);
+    showToast("خطا", prettyErr(json, status), "SET", false);
+    return;
+  }
+
+  out.textContent = "✅ تنظیمات ذخیره شد.";
+  updateMeta(json.state, json.quota);
+  showToast("ذخیره شد ✅", "تنظیمات اعمال شد", "OK", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("analyze").addEventListener("click", async () => {
+  if (OFFLINE_MODE) {
+    out.textContent = "⚠️ تحلیل آنلاین در حالت آفلاین غیرفعال است. برای ادامه دکمه اتصال مجدد را بزنید.";
+    showToast("آفلاین", "تحلیل نیاز به اتصال دارد.", "AI", false);
+    return;
+  }
+  showToast("در حال تحلیل…", "جمع‌آوری دیتا + تولید خروجی", "AI", true);
+  out.textContent = "⏳ در حال تحلیل…";
+
+  const initData = INIT_DATA || tg?.initData || "";
+  const payload = { initData, symbol: val("symbol"), userPrompt: "" };
+
+  const {status, json} = await api("/api/analyze", payload);
+  if (!json?.ok) {
+    const msg = prettyErr(json, status);
+    out.textContent = "⚠️ " + msg;
+    showToast("خطا", msg, status === 429 ? "Quota" : "AI", false);
+    return;
+  }
+
+  out.textContent = json.result || "⚠️ بدون خروجی";
+  await refreshLiveQuote(true);
+  await refreshSymbolNews(true);
+  // Render chart if available
+  const chartCard = el("chartCard");
+  const chartImg = el("chartImg");
+  if (chartCard && chartImg) {
+      const u = json.chartUrl || "";
+      if (u) {
+        chartImg.src = u;
+        chartCard.style.display = "block";
+        const cm = el("chartMeta");
+        if (cm) cm.textContent = "QuickChart";
+      } else if (json.zonesSvg) {
+        renderChartFallbackSvg(json.zonesSvg);
+      } else {
+        chartImg.removeAttribute("src");
+        chartCard.style.display = "none";
+      }
+    }
+  updateMeta(json.state, json.quota);
+  showToast("آماده ✅", "خروجی دریافت شد", "OK", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("sendSupportTicket")?.addEventListener("click", async () => {
+  if (OFFLINE_MODE) {
+    showToast("آفلاین", "ارسال تیکت در حالت آفلاین ممکن نیست.", "SUP", false);
+    return;
+  }
+  const text = (el("supportTicketText")?.value || "").trim();
+  if (!text || text.length < 4) {
+    showToast("خطا", "متن تیکت خیلی کوتاه است.", "SUP", false);
+    return;
+  }
+  if (text.length > 300) {
+    showToast("خطا", "حداکثر ۳۰۰ کاراکتر مجاز است.", "SUP", false);
+    return;
+  }
+  showToast("در حال ارسال…", "تیکت در حال ثبت است", "SUP", true);
+  const { status, json } = await api("/api/support/ticket", { initData: INIT_DATA, text });
+  if (!json?.ok) {
+    const msg = json?.error === "support_unavailable"
+      ? "پشتیبانی در دسترس نیست."
+      : "ارسال تیکت ناموفق بود.";
+    showToast("خطا", msg, "SUP", false);
+    return;
+  }
+  if (el("supportTicketText")) el("supportTicketText").value = "";
+  showToast("ارسال شد ✅", "تیکت شما ثبت شد", "SUP", false);
+  setTimeout(hideToast, 1200);
+});
+
+el("close").addEventListener("click", () => tg?.close());
+
+el("savePrompt")?.addEventListener("click", async () => {
+  const prompt = el("adminPrompt")?.value || "";
+  const { json } = await adminApi("/api/admin/prompt", { prompt });
+  if (json?.ok) showToast("ذخیره شد ✅", "پرامپت بروزرسانی شد", "ADM", false);
+});
+
+el("saveStylePrompts")?.addEventListener("click", async () => {
+  const raw = el("stylePromptJson")?.value || "{}";
+  const stylePrompts = safeJsonParse(raw, {});
+  const { json } = await adminApi("/api/admin/style-prompts", { stylePrompts });
+  if (json?.ok) showToast("ذخیره شد ✅", "JSON سبک‌ها بروزرسانی شد", "ADM", false);
+});
+
+el("addStyle")?.addEventListener("click", async () => {
+  const style = el("newStyle")?.value || "";
+  const { json } = await adminApi("/api/admin/styles", { action: "add", style });
+  if (json?.ok) {
+    renderStyleList(json.styles || []);
+    fillStyles(json.styles || []);
+  }
+});
+
+el("removeStyle")?.addEventListener("click", async () => {
+  const style = el("removeStyleName")?.value || "";
+  const { json } = await adminApi("/api/admin/styles", { action: "remove", style });
+  if (json?.ok) {
+    renderStyleList(json.styles || []);
+    fillStyles(json.styles || []);
+  }
+});
+
+el("saveGlobalCommission")?.addEventListener("click", async () => {
+  const percent = Number(el("globalCommission")?.value || 0);
+  const { json } = await adminApi("/api/admin/commissions", { action: "setGlobal", percent });
+  if (json?.ok) renderCommissionList(json.commission || {});
+});
+
+el("saveUserCommission")?.addEventListener("click", async () => {
+  const username = el("commissionUser")?.value || "";
+  const percent = Number(el("commissionPercent")?.value || 0);
+  const { json } = await adminApi("/api/admin/commissions", { action: "setOverride", username, percent });
+  if (json?.ok) renderCommissionList(json.commission || {});
+});
+
+el("saveFreeLimit")?.addEventListener("click", async () => {
+  const limit = Number(el("freeDailyLimit")?.value || 3);
+  const { json } = await adminApi("/api/admin/free-limit", { limit });
+  if (json?.ok) showToast("ذخیره شد ✅", "سهمیه رایگان بروزرسانی شد", "ADM", false);
+});
+
+
+el("saveOfferBanner")?.addEventListener("click", async () => {
+  const offerBanner = el("offerBannerInput")?.value || "";
+  const { json } = await adminApi("/api/admin/offer", { offerBanner });
+  if (json?.ok) {
+    if (offerText) offerText.textContent = json.offerBanner || offerBanner;
+    showToast("ذخیره شد ✅", "بنر بروزرسانی شد", "ADM", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ذخیره بنر ناموفق بود", "ADM", false);
+  }
+});
+
+el("saveWelcomeTexts")?.addEventListener("click", async () => {
+  const welcomeBot = el("welcomeBotInput")?.value || "";
+  const welcomeMiniapp = el("welcomeMiniappInput")?.value || "";
+  const { json } = await adminApi("/api/admin/welcome", { welcomeBot, welcomeMiniapp });
+  if (json?.ok) {
+    if (el("welcomeBotInput")) el("welcomeBotInput").value = json.welcomeBot || welcomeBot;
+    if (el("welcomeMiniappInput")) el("welcomeMiniappInput").value = json.welcomeMiniapp || welcomeMiniapp;
+    if (welcome) welcome.textContent = json.welcomeMiniapp || welcome.textContent;
+    showToast("ذخیره شد ✅", "متن خوش‌آمدگویی بروزرسانی شد", "ADM", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ذخیره متن خوش‌آمدگویی ناموفق بود", "ADM", false);
+  }
+});
+
+el("saveFeatureFlags")?.addEventListener("click", async () => {
+  const capitalModeEnabled = !!el("flagCapitalMode")?.checked;
+  const profileTipsEnabled = !!el("flagProfileTips")?.checked;
+  const { json } = await adminApi("/api/admin/features", { capitalModeEnabled, profileTipsEnabled });
+  if (json?.ok) {
+    showToast("ذخیره شد ✅", "ویژگی‌ها بروزرسانی شد", "OWN", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ذخیره ویژگی‌ها ناموفق بود", "OWN", false);
+  }
+});
+
+el("saveWallet")?.addEventListener("click", async () => {
+  const wallet = el("walletAddressInput")?.value || "";
+  const { json } = await adminApi("/api/admin/wallet", { wallet });
+  if (json?.ok) {
+    showToast("ذخیره شد ✅", "آدرس ولت بروزرسانی شد", "OWN", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ذخیره آدرس ولت ناموفق بود", "OWN", false);
+  }
+});
+
+el("refreshTickets")?.addEventListener("click", async () => {
+  showToast("در حال دریافت…", "لیست تیکت‌ها", "TICKET", true);
+  await refreshTickets();
+  showToast("آماده ✅", "تیکت‌ها بروزرسانی شد", "TICKET", false);
+  setTimeout(hideToast, 1000);
+});
+
+el("updateTicket")?.addEventListener("click", async () => {
+  const id = el("ticketSelect")?.value || "";
+  const status = el("ticketStatus")?.value || "pending";
+  const reply = (el("ticketReply")?.value || "").trim();
+  if (!id) { showToast("خطا", "یک تیکت انتخاب کنید.", "TICKET", false); return; }
+  showToast("در حال ثبت…", "بروزرسانی تیکت", "TICKET", true);
+  const { json } = await adminApi("/api/admin/tickets/update", { id, status, reply });
+  if (json?.ok) {
+    if (el("ticketReply")) el("ticketReply").value = "";
+    await refreshTickets();
+    showToast("ثبت شد ✅", "تیکت بروزرسانی شد", "TICKET", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ثبت تیکت ناموفق بود", "TICKET", false);
+  }
+});
+
+el("ticketSelect")?.addEventListener("change", () => {
+  const id = el("ticketSelect")?.value || "";
+  const t = ADMIN_TICKETS.find((x) => x.id === id);
+  if (t && el("ticketStatus")) el("ticketStatus").value = t.status || "pending";
+});
+
+el("ticketReplyTemplate")?.addEventListener("change", pickTicketReplyTemplate);
+el("ticketQuickPending")?.addEventListener("click", () => applyTicketFilter("pending"));
+el("ticketQuickAnswered")?.addEventListener("click", () => applyTicketFilter("answered"));
+
+el("refreshWithdrawals")?.addEventListener("click", async () => {
+  showToast("در حال دریافت…", "لیست برداشت‌ها", "WD", true);
+  await refreshWithdrawals();
+  showToast("آماده ✅", "برداشت‌ها بروزرسانی شد", "WD", false);
+  setTimeout(hideToast, 1000);
+});
+
+el("reviewWithdrawalBtn")?.addEventListener("click", async () => {
+  const id = el("withdrawSelect")?.value || "";
+  const decision = el("withdrawDecision")?.value || "rejected";
+  const txHash = (el("withdrawTxHash")?.value || "").trim();
+  if (!id) { showToast("خطا", "یک برداشت انتخاب کنید.", "WD", false); return; }
+  showToast("در حال ثبت…", "بررسی برداشت", "WD", true);
+  const { json } = await adminApi("/api/admin/withdrawals/review", { id, decision, txHash });
+  if (json?.ok) {
+    if (el("withdrawTxHash")) el("withdrawTxHash").value = "";
+    await refreshWithdrawals();
+    showToast("ثبت شد ✅", "برداشت بروزرسانی شد", "WD", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ثبت برداشت ناموفق بود", "WD", false);
+  }
+});
+
+el("refreshPromptReqs")?.addEventListener("click", async () => {
+  showToast("در حال دریافت…", "درخواست‌های پرامپت", "PR", true);
+  await refreshPromptReqs();
+  showToast("آماده ✅", "لیست بروزرسانی شد", "PR", false);
+  setTimeout(hideToast, 1000);
+});
+
+el("decidePromptReqBtn")?.addEventListener("click", async () => {
+  const requestId = el("promptReqSelect")?.value || "";
+  const status = el("promptReqDecision")?.value || "rejected";
+  const promptId = (el("promptReqPromptId")?.value || "").trim();
+  if (!requestId) { showToast("خطا", "یک درخواست را انتخاب کنید.", "PR", false); return; }
+  if (status === "approved" && !promptId) {
+    showToast("خطا", "برای تایید باید Prompt ID وارد کنید.", "PR", false);
+    return;
+  }
+  showToast("در حال ثبت…", "بررسی درخواست", "PR", true);
+  const { json } = await adminApi("/api/admin/custom-prompts/requests", { action: "decide", requestId, status, promptId });
+  if (json?.ok) {
+    await refreshPromptReqs();
+    showToast("ثبت شد ✅", "درخواست بروزرسانی شد", "PR", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ثبت درخواست ناموفق بود", "PR", false);
+  }
+});
+
+el("promptReqSelect")?.addEventListener("change", () => {
+  const id = el("promptReqSelect")?.value || "";
+  const r = ADMIN_PROMPT_REQS.find((x) => x.id === id);
+  if (r && el("promptReqPromptId")) el("promptReqPromptId").value = r.promptId || "";
+  if (r && el("promptReqDecision")) el("promptReqDecision").value = (r.status === "approved" ? "approved" : (r.status === "rejected" ? "rejected" : "rejected"));
+});
+
+el("saveCapitalToggle")?.addEventListener("click", async () => {
+  const username = (el("capitalToggleUser")?.value || "").trim();
+  const enabled = (el("capitalToggleEnabled")?.value || "true") === "true";
+  if (!username) { showToast("خطا", "یوزرنیم را وارد کنید.", "CAP", false); return; }
+  const { json } = await adminApi("/api/admin/capital/toggle", { username, enabled });
+  if (json?.ok) {
+    showToast("ثبت شد ✅", "تنظیم سرمایه بروزرسانی شد", "CAP", false);
+    setTimeout(hideToast, 1200);
+  } else {
+    showToast("خطا", "ثبت ناموفق بود", "CAP", false);
+  }
+});
+
+
+el("saveCustomPrompts")?.addEventListener("click", async () => {
+  const raw = el("customPromptsJson")?.value || "[]";
+  const customPrompts = safeJsonParse(raw, []);
+  const { json } = await adminApi("/api/admin/custom-prompts", { customPrompts });
+  if (json?.ok) {
+    showToast("ذخیره شد ✅", "پرامپت‌های اختصاصی بروزرسانی شد", "ADM", false);
+    fillCustomPrompts(json.customPrompts || []);
+  }
+});
+
+el("sendCustomPrompt")?.addEventListener("click", async () => {
+  const username = el("customPromptUser")?.value || "";
+  const promptId = el("customPromptId")?.value || "";
+  const { json } = await adminApi("/api/admin/custom-prompts/send", { username, promptId });
+  if (json?.ok) showToast("ارسال شد ✅", "پرامپت برای کاربر ارسال شد", "ADM", false);
+});
+
+el("approvePayment")?.addEventListener("click", async () => {
+  const payload = {
+    username: el("payUsername")?.value || "",
+    amount: Number(el("payAmount")?.value || 0),
+    days: Number(el("payDays")?.value || 30),
+    txHash: el("payTx")?.value || "",
+  };
+  const { json } = await adminApi("/api/admin/payments/approve", payload);
+  if (json?.ok) {
+    showToast("پرداخت تایید شد ✅", "اشتراک فعال شد", "PAY", false);
+    renderPayments([json.payment].filter(Boolean));
+  } else {
+    showToast("خطا", "تایید پرداخت ناموفق بود", "PAY", false);
+  }
+});
+
+el("checkPayment")?.addEventListener("click", async () => {
+  const payload = {
+    txHash: el("payTx")?.value || "",
+    amount: Number(el("payAmount")?.value || 0),
+    address: "",
+  };
+  const { json } = await adminApi("/api/admin/payments/check", payload);
+  if (json?.ok) showToast("نتیجه بلاک‌چین", JSON.stringify(json.result || {}), "CHAIN", false);
+});
+
+el("activateSubscription")?.addEventListener("click", async () => {
+  const payload = {
+    username: el("payUsername")?.value || "",
+    days: Number(el("payDays")?.value || 30),
+    dailyLimit: Number(el("payDailyLimit")?.value || 50),
+  };
+  const { json } = await adminApi("/api/admin/subscription/activate", payload);
+  if (json?.ok) showToast("اشتراک فعال شد ✅", "فعال‌سازی دستی انجام شد", "ADM", false);
+});
+
+el("loadUsers")?.addEventListener("click", async () => {
+  const [{ json: usersJson }, { json: bootJson }] = await Promise.all([
+    adminApi("/api/admin/users", { limit: 200 }),
+    adminApi("/api/admin/bootstrap", {}),
+  ]);
+  if (usersJson?.ok && bootJson?.ok) {
+    renderFullAdminReport(usersJson.users || [], bootJson.payments || [], bootJson.withdrawals || [], bootJson.tickets || []);
+  } else if (usersJson?.ok) {
+    renderUsers(usersJson.users || []);
+  }
+});
+
+el("downloadReportPdf")?.addEventListener("click", async () => {
+  try {
+    showToast("در حال ساخت PDF…", "گزارش کامل", "PDF", true);
+    const r = await fetch(API_BASE + "/api/admin/report/pdf", {      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ initData: INIT_DATA, limit: 250 }),
+    });
+    if (!r.ok) throw new Error("http_" + r.status);
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "admin-report-" + Date.now() + ".pdf";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    showToast("دانلود شد ✅", "گزارش PDF آماده است", "PDF", false);
+    setTimeout(hideToast, 1200);
+  } catch (e) {
+    showToast("خطا", "ساخت PDF ناموفق بود", "PDF", false);
+  }
+});
+
+el("reconnect")?.addEventListener("click", async () => {
+  OFFLINE_MODE = false;
+  try { await boot(); } catch (e) { console.error("miniapp reconnect failed:", e); }
+});
+
+window.addEventListener("online", () => {
+  if (pillTxt && pillTxt.textContent.toLowerCase().includes("offline")) pillTxt.textContent = "Online";
+});
+
+window.addEventListener("offline", () => {
+  if (pillTxt) pillTxt.textContent = "Offline";
+});
+
+el("paymentPresets")?.addEventListener("click", (e) => {
+  const btn = e.target?.closest?.("[data-days]");
+  if (!btn) return;
+  const days = Number(btn.getAttribute("data-days") || 30);
+  const amount = Number(btn.getAttribute("data-amount") || 0);
+  if (el("payDays")) el("payDays").value = String(days);
+  if (el("payAmount")) el("payAmount").value = String(amount);
+  showToast("پلن انتخاب شد ✅", "روز: " + days + " | مبلغ: " + amount, "PAY", false);
+});
+
+
+el("refreshWallet")?.addEventListener("click", async () => {
+  try { await loadWalletAndInvite(); showToast("بروزرسانی شد ✅", "ولت و دعوت آپدیت شد", "REFRESH", false); } catch (e) { console.error(e); }
+});
+el("refreshInvite")?.addEventListener("click", async () => {
+  try { await loadWalletAndInvite(); showToast("بروزرسانی شد ✅", "اطلاعات دعوت آپدیت شد", "REFRESH", false); } catch (e) { console.error(e); }
+});
+
+el("copyGatewayWallet")?.addEventListener("click", async () => {
+  const v = normStr(el("gatewayWallet")?.value || "").trim();
+  if (!v) { showToast("خالیه", "آدرس ولت پیدا نشد", "COPY", false); return; }
+  try { await navigator.clipboard.writeText(v); showToast("کپی شد ✅", "آدرس ولت کپی شد", "COPY", false); }
+  catch { showToast("خطا", "کپی انجام نشد", "COPY", false); }
+});
+
+el("openBscscanWallet")?.addEventListener("click", () => {
+  const v = normStr(el("gatewayWallet")?.value || "").trim();
+  if (!v) return;
+  const link = "https://bscscan.com/address/" + encodeURIComponent(v);
+  if (tg?.openLink) tg.openLink(link);
+  else window.open(link, "_blank");
+});
+
+el("copyRefLink")?.addEventListener("click", async () => {
+  const v = normStr(el("refLinkInput")?.value || "").trim();
+  if (!v) { showToast("خالیه", "لینک دعوت آماده نیست", "COPY", false); return; }
+  try { await navigator.clipboard.writeText(v); showToast("کپی شد ✅", "لینک دعوت کپی شد", "COPY", false); }
+  catch { showToast("خطا", "کپی انجام نشد", "COPY", false); }
+});
+
+el("shareRefLink")?.addEventListener("click", () => {
+  const v = normStr(el("refLinkInput")?.value || "").trim();
+  if (!v) { showToast("خالیه", "لینک دعوت آماده نیست", "SHARE", false); return; }
+  const shareUrl = "https://t.me/share/url?url=" + encodeURIComponent(v) + "&text=" + encodeURIComponent("با لینک من عضو شو ✅");
+  if (tg?.openTelegramLink) tg.openTelegramLink(shareUrl);
+  else if (tg?.openLink) tg.openLink(shareUrl);
+  else window.open(shareUrl, "_blank");
+});
+
+el("submitDeposit")?.addEventListener("click", async () => {
+  const txid = normStr(el("depositTxId")?.value || "").trim();
+  const amtRaw = normStr(el("depositAmount")?.value || "").trim();
+  const amt = Number(amtRaw);
+  const amount = (Number.isFinite(amt) && amt > 0) ? amt : 25;
+
+  if (!txid) { showToast("نیاز به TxID", "TxID رو وارد کن", "DEPOSIT", false); return; }
+  const { status, json } = await api("/api/wallet/deposit/notify", { initData: INIT_DATA, txid: txid, amount: amount, network: "BEP20", planName: "marketi1 PRO" });
+  if (!json?.ok) { showToast("خطا", prettyErr(json, status), "DEPOSIT", false); return; }
+  el("depositTxId").value = "";
+  showToast("ثبت شد ✅", "واریز ثبت شد و بعد از بررسی تایید می‌شه", "DEPOSIT", false);
+  await loadWalletAndInvite();
+});
+
+el("submitWithdraw")?.addEventListener("click", async () => {
+  const amtRaw = normStr(el("withdrawAmountUser")?.value || "").trim();
+  const addr = normStr(el("withdrawAddressUser")?.value || "").trim();
+  const amt = Number(amtRaw);
+
+  if (!Number.isFinite(amt) || amt <= 0) { showToast("مبلغ نامعتبر", "مبلغ رو درست وارد کن", "WITHDRAW", false); return; }
+  if (!isBep20Address(addr)) { showToast("آدرس نامعتبر", "آدرس BEP20 باید با 0x شروع بشه", "WITHDRAW", false); return; }
+
+  const { status, json } = await api("/api/wallet/withdraw/request", { initData: INIT_DATA, amount: amt, address: addr, network: "BEP20" });
+  if (!json?.ok) { showToast("خطا", prettyErr(json, status), "WITHDRAW", false); return; }
+
+  el("withdrawAmountUser").value = "";
+  showToast("درخواست ثبت شد ✅", "برداشت در صف بررسی قرار گرفت", "WITHDRAW", false);
+  await loadWalletAndInvite();
+});
+
+
+boot().catch((e) => {
+  console.error("miniapp boot failed:", e);
+  if (out) out.textContent = "⚠️ خطای داخلی مینی‌اپ. یک‌بار رفرش کنید.";
+  if (pillTxt) pillTxt.textContent = "Offline";
+  showToast("خطا", "اجرای مینی‌اپ با خطا متوقف شد", "JS", false);
+});`;
+
+
+
+async function runDailySuggestions(env) {
+  if (!env.BOT_KV) return;
+  const hour = Number(new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Kyiv", hour: "2-digit", hour12: false }).format(new Date()));
+  // exactly two pushes per day (09:00 and 18:00 Kyiv)
+  if (![9, 18].includes(hour)) return;
+  const users = await listUsers(env, 400);
+  for (const u of users) {
+    if (!u?.userId || !u?.profile?.phone) continue;
+    const market = u.profile?.preferredMarket || "بازار";
+    const style = u.style || "پرایس اکشن";
+    const symbol = String(u?.selectedSymbol || u?.profile?.preferredSymbol || "BTCUSDT").toUpperCase();
+    const cap = u.capital?.enabled === false ? "" : (u.capital?.amount ? (" | سرمایه: " + u.capital.amount) : "");
+    const articles = await fetchSymbolNewsFa(symbol, env).catch(() => []);
+    const newsBlock = Array.isArray(articles) && articles.length
+      ? articles.slice(0, 2).map((x, i) => `${i + 1}) ${x?.title || ""}`).join("\n")
+      : "";
+    const newsLine = newsBlock
+      ? ("\n\n📰 خبر مرتبط " + symbol + ":\n" + newsBlock)
+      : "\n\n📰 فعلاً خبر مرتبطی برای این نماد پیدا نشد.";
+    const newsSummary = await buildNewsAnalysisSummary(symbol, articles, env);
+    const msg =
+      "🔔 نوتیف تحلیلی روزانه (۱/۲ یا ۲/۲)\n" +
+      "بر اساس پروفایل شما (" + market + " / " + style + cap + ")، برای " + symbol + " امروز ۲ تحلیل برنامه‌ریزی کن: یکی روندی، یکی برگشتی." +
+      newsLine +
+      "\n\n🧠 جمع‌بندی خبری:\n" + String(newsSummary || "-");
+    await tgSendMessage(env, Number(u.userId), msg, mainMenuKeyboard(env));
+  }
 }
