@@ -6650,7 +6650,7 @@ async function boot(){
   IS_OWNER = json.role === "owner";
   IS_GUEST = !!json.guest;
 
-  const adminTabBtn = document.querySelector(".tab-btn[data-tab="admin"]");
+  const adminTabBtn = document.querySelector('.tab-btn[data-tab="admin"]');
   if (adminTabBtn) adminTabBtn.style.display = IS_STAFF ? "inline-flex" : "none";
 
   if (IS_STAFF && adminCard) {
@@ -6796,8 +6796,9 @@ el("analyze").addEventListener("click", async () => {
   if (chartCard && chartImg) {
       const u = json.chartUrl || "";
       const fallbackSvg = json.zonesSvg || "";
-      const tf = val("timeframe") || json?.state?.timeframe || "H4";
-      const symbol = val("symbol") || "";
+      const activeSymbol = val("symbol") || "-";
+      const activeTf = val("timeframe") || "H4";
+      const cm = el("chartMeta");
       if (u) {
         chartImg.onerror = () => {
           chartImg.onerror = null;
@@ -6809,18 +6810,17 @@ el("analyze").addEventListener("click", async () => {
           }
           chartImg.removeAttribute("src");
           chartCard.style.display = "none";
+          if (fallbackSvg) renderChartFallbackSvg(fallbackSvg);
         };
         chartImg.src = u;
         chartCard.style.display = "block";
-        const cm = el("chartMeta");
-        if (cm) cm.textContent = "کندل " + symbol + " (" + tf + ") + زون تحلیل";
+        if (cm) cm.textContent = "Candlestick | " + activeSymbol + " | " + activeTf;
       } else if (fallbackSvg) {
         renderChartFallbackSvg(fallbackSvg);
-        const cm = el("chartMeta");
-        if (cm) cm.textContent = "زون تحلیل (fallback)";
       } else {
         chartImg.removeAttribute("src");
         chartCard.style.display = "none";
+        if (cm) cm.textContent = "QuickChart";
       }
     }
   updateMeta(json.state, json.quota);
