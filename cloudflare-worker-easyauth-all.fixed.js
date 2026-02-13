@@ -1107,7 +1107,7 @@ function defaultMainConfig(env) {
     { id: "y1", title: "👑 سالانه", days: 365, price: Number.isFinite(p12) ? p12 : 80, currency, dailyLimit: premiumLimit },
   ];
 
-  const styles = Object.keys(STYLE_ANALYSIS_PROMPTS_DEFAULT || {}).map(label => ({
+  const styles = ["پرایس اکشن","ICT","ATR"].map(label => ({
     id: stylePromptKey(label) || label,
     label,
     enabled: true,
@@ -1247,23 +1247,19 @@ Use a sharp, revealing, and “whistle-blower” tone.
  * Users choose st.style (Persian labels) and we inject a style-specific guide
  * into the analysis prompt. Admin can still override the global base prompt via KV.
  */
-const UNIFIED_STYLE_PROMPT = `پرامپت پایه تحلیل (مشترک برای همه سبک‌ها):
-- خروجی فقط فارسی، مرحله‌به‌مرحله، کوتاه و اجرایی باشد.
-- تحلیل فقط بر اساس داده موجود انجام شود و در نبود داده «نامشخص از داده» نوشته شود.
-- ساختار خروجی اجباری: بایاس، ساختار/نقدینگی، نواحی کلیدی، سناریوهای ورود، مدیریت ریسک، نقطه ابطال.
-- هر سناریو باید Entry، Stop Loss، TP1، TP2 و نسبت ریسک/ریوارد داشته باشد.
-- خروجی قطعی خرید/فروش نده و سناریومحور بنویس.
-
-تطبیق با سبک:
-- پرایس اکشن: وزن اصلی روی ساختار و کندل.
-- ICT: وزن اصلی روی نقدینگی، Sweep و FVG/OB.
-- ATR: وزن اصلی روی نوسان و مدیریت پوزیشن.
-- ترکیبی: خلاصه‌ای از هر سه بدون تکرار.`;
-
 const STYLE_PROMPTS_DEFAULT = {
-  "پرایس اکشن": UNIFIED_STYLE_PROMPT,
-  "ICT": UNIFIED_STYLE_PROMPT,
-  "ATR": UNIFIED_STYLE_PROMPT,
+  "پرایس اکشن": `Professional Price Action Market Analysis.
+CONTEXT: SYMBOL={SYMBOL} | TIMEFRAME={TIMEFRAME} | RISK={RISK} | CAPITAL={CAPITAL}
+Use pure Price Action only, no indicators.
+Sections: Market Structure, Key Levels, Candlestick Behavior, Entry Scenarios (Entry/SL/TP1/TP2, RR>=1:2), Bias+Alternative Scenario, Execution Plan+Invalidation.`,
+  "ICT": `ICT & Smart Money Analyst.
+CONTEXT: SYMBOL={SYMBOL} | TIMEFRAME={TIMEFRAME} | RISK={RISK} | CAPITAL={CAPITAL}
+Use ICT/SMC only: HTF Bias, Liquidity Mapping, BOS/MSS, PD Arrays(OB/FVG/Voids/PDH/PDL/PWH/PWL), Kill Zones, Entry Model, Narrative.
+Must include Entry, SL, Liquidity targets, Invalidation.`,
+  "ATR": `Quantitative ATR-based trading assistant.
+CONTEXT: SYMBOL={SYMBOL} | TIMEFRAME={TIMEFRAME} | RISK={RISK} | CAPITAL={CAPITAL}
+Sections: Volatility State, Market Condition, ATR-based Setup, Position Sizing, Trade Filtering, Risk Management, Statistical Summary.
+Must include ATR-based SL/TP and risk controls.`
 };
 
 const STYLE_ANALYSIS_PROMPTS_DEFAULT = {
@@ -2609,7 +2605,7 @@ function buildQuickChartUrl(candles, symbol, timeframe, analysisText) {
 async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env) {
   const tf = st.timeframe || "H4";
   const baseRaw = await getAnalysisPromptForStyle(env, st.style);
-  const base = baseRaw.replaceAll("{TIMEFRAME}", tf);
+  const base = baseRaw.replaceAll("{TIMEFRAME}", tf).replaceAll("{SYMBOL}", symbol || "").replaceAll("{RISK}", st.risk || "").replaceAll("{CAPITAL}", String(st.profile?.capital || st.capital?.amount || "unknown"));
 
   const userExtra = (isStaff({ username: st.profile?.username }, env) && userPrompt?.trim())
     ? userPrompt.trim()
@@ -2619,7 +2615,7 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
     `${base}\n\n` +
     (getStyleGuide(st.style) ? `STYLE_GUIDE:\n${getStyleGuide(st.style)}\n\n` : ``) +
     `ASSET: ${symbol}\n` +
-    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}\n\n` +
+    `USER SETTINGS: Symbol=${symbol}, Timeframe=${tf}, Style=${st.style}, Risk=${st.risk}, Capital=${st.profile?.capital || st.capital?.amount || "unknown"} ${st.profile?.capitalCurrency || "USDT"}\n\n` +
     `MARKET_DATA:\n${marketBlock}\n\n` +
     `RULES:\n` +
     `- خروجی فقط فارسی و دقیقاً بخش‌های ۱ تا ۵\n` +
@@ -2633,7 +2629,7 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
 async function buildVisionPrompt(st, env) {
   const tf = st.timeframe || "H4";
   const baseRaw = await getAnalysisPromptForStyle(env, st.style);
-  const base = baseRaw.replaceAll("{TIMEFRAME}", tf);
+  const base = baseRaw.replaceAll("{TIMEFRAME}", tf).replaceAll("{SYMBOL}", st.selectedSymbol || "CHART").replaceAll("{RISK}", st.risk || "").replaceAll("{CAPITAL}", String(st.profile?.capital || st.capital?.amount || "unknown"));
   return (
     `${base}\n\n` +
     `TASK: این تصویر چارت را تحلیل کن. دقیقاً خروجی ۱ تا ۵ بده و سطح‌ها را مشخص کن.\n` +
@@ -3834,7 +3830,7 @@ async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
 
     const tf = st.timeframe || "H4";
     const baseRaw = await getAnalysisPromptForStyle(env, st.style);
-    const base = baseRaw.replaceAll("{TIMEFRAME}", tf);
+    const base = baseRaw.replaceAll("{TIMEFRAME}", tf).replaceAll("{SYMBOL}", st.selectedSymbol || "CHART").replaceAll("{RISK}", st.risk || "").replaceAll("{CAPITAL}", String(st.profile?.capital || st.capital?.amount || "unknown"));
 
     const finalPrompt =
       `${base}\n\n` +

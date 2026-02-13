@@ -1114,28 +1114,84 @@ News mode:
  * Users choose st.style (Persian labels) and we inject a style-specific guide
  * into the analysis prompt. Admin can still override the global base prompt via KV.
  */
-const UNIFIED_STYLE_PROMPT = `پرامپت پایه تحلیل (مشترک برای همه سبک‌ها):
-- خروجی فقط فارسی، مرحله‌به‌مرحله، کوتاه و اجرایی باشد.
-- تحلیل باید فقط بر اساس داده موجود انجام شود و در نبود داده عبارت «نامشخص از داده» بیاید.
-- ساختار خروجی اجباری: بایاس HTF، ساختار بازار/نقدینگی، نواحی کلیدی، سناریوهای ورود، مدیریت ریسک، نقطه ابطال.
-- هر سناریو باید Entry، Stop Loss، TP1، TP2 و نسبت ریسک به ریوارد را داشته باشد.
-- خروجی قطعی خرید/فروش نده؛ سناریومحور و شرطی بنویس.
-
-ترکیب روش‌ها (بدون تعارض):
-1) Price Action: HH/HL/LH/LL، BOS/MSS، رفتار کندلی معتبر.
-2) ICT/SMC: نقدینگی Buy-side/Sell-side، Sweep، FVG/OB، Premium/Discount.
-3) ATR: سنجش نوسان، SL/TP پویا با ATR، فیلتر شرایط پرریسک.
-
-تطبیق با STYLE_MODE:
-- اگر STYLE_MODE=پرایس اکشن: وزن اصلی با ساختار و کندل.
-- اگر STYLE_MODE=ICT: وزن اصلی با نقدینگی و PD Array.
-- اگر STYLE_MODE=ATR: وزن اصلی با نوسان و مدیریت پوزیشن.
-- اگر STYLE_MODE=ترکیبی: از هر سه، به‌صورت خلاصه و بدون تکرار استفاده کن.`;
-
 const STYLE_PROMPTS_DEFAULT = {
-  "پرایس اکشن": UNIFIED_STYLE_PROMPT,
-  "ICT": UNIFIED_STYLE_PROMPT,
-  "ATR": UNIFIED_STYLE_PROMPT,
+  "پرایس اکشن": `Professional Price Action Market Analysis.
+
+CONTEXT VARIABLES:
+- SYMBOL: {SYMBOL}
+- TIMEFRAME: {TIMEFRAME}
+- RISK_PROFILE: {RISK}
+- CAPITAL: {CAPITAL}
+
+Rules:
+- Pure Price Action only
+- Indicators forbidden unless explicitly requested
+- High-probability setups only
+
+Required sections:
+1) Market Structure: Trend (Uptrend/Downtrend/Range), HH/HL/LH/LL, Structure status (Intact/BOS/MSS)
+2) Key Levels: Strong Support/Resistance, Flip zones, Psychological levels
+3) Candlestick Behavior: Pin Bar, Engulfing, Inside Bar + buyer/seller intent
+4) Entry Scenarios: Clear entry zone, structure-based SL, TP1/TP2, minimum RR=1:2
+5) Bias & Scenarios: Main bias + alternative scenario on invalidation
+6) Execution Plan: Continuation or Reversal + required confirmation
+
+Output style:
+- Step-by-step
+- Professional and execution-focused
+- No overtrading`,
+
+  "ICT": `ICT & Smart Money Analyst.
+
+CONTEXT VARIABLES:
+- SYMBOL: {SYMBOL}
+- TIMEFRAME: {TIMEFRAME}
+- RISK_PROFILE: {RISK}
+- CAPITAL: {CAPITAL}
+
+Methodology:
+- ICT (Inner Circle Trader)
+- Smart Money Concepts
+
+Restrictions:
+- No indicators
+- No retail concepts
+- ICT/SMC concepts ONLY
+
+Analysis requirements:
+1) Higher Timeframe Bias (Daily/H4): Bias, Premium/Discount, Equilibrium(50%), Imbalance vs Balance
+2) Liquidity Mapping: EQH/EQL, Buy-side/Sell-side liquidity, Stop-loss pools
+3) Market Structure: BOS, MSS/CHoCH, Manipulation vs Expansion
+4) PD Arrays: Bullish/Bearish OB, FVG, Liquidity Voids, PDH/PDL/PWH/PWL
+5) Kill Zones (Intraday only): London/NY timing relevance
+6) Entry Model: Sweep→MSS→FVG or Sweep→OB + Entry/SL/TP
+7) Narrative: Who is trapped, where smart money entered, where price is engineered to go
+
+Execution:
+- Clear confirmation rules
+- Liquidity-based targets
+- Explicit invalidation point`,
+
+  "ATR": `Quantitative Trading Assistant (ATR-based volatility trading).
+
+CONTEXT VARIABLES:
+- SYMBOL: {SYMBOL}
+- TIMEFRAME: {TIMEFRAME}
+- RISK_PROFILE: {RISK}
+- CAPITAL: {CAPITAL}
+
+Analysis requirements:
+1) Volatility State: Current ATR, compare with historical average, expansion/contraction
+2) Market Condition: Trending vs Ranging, Breakout vs Mean Reversion suitability
+3) Trade Setup: Price-structure entry, SL = Entry ± (ATR × Multiplier), TP1/TP2 via ATR expansion
+4) Position Sizing: Risk per trade (%) and size based on SL distance
+5) Trade Filtering: When NOT to trade, high-risk volatility (news/spikes)
+6) Risk Management: Max daily loss, max consecutive losses, ATR trailing stop logic
+7) Summary: Statistical justification, expected duration, risk class (Low/Medium/High)
+
+Output:
+- Practical and execution-focused
+- Step-by-step`,
 };
 
 function normalizeStyleLabel(style) {
@@ -1243,7 +1299,7 @@ async function getFreeDailyLimit(env) {
 async function setFreeDailyLimit(env, limit) {
   await setSettingText(env, "settings:free_daily_limit", String(limit));
 }
-const ALLOWED_STYLE_LIST = ["پرایس اکشن", "ICT", "ATR", "ترکیبی"];
+const ALLOWED_STYLE_LIST = ["پرایس اکشن", "ICT", "ATR"];
 const DEFAULT_STYLE_LIST = ALLOWED_STYLE_LIST.slice();
 
 async function getStyleList(env) {
@@ -3121,7 +3177,9 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
      .split("{TIMEFRAME}").join(tf)
      .split("{STYLE}").join(st.style || "")
      .split("{RISK}").join(st.risk || "")
-     .split("{NEWS}").join(st.newsEnabled ? "on" : "off");
+     .split("{NEWS}").join(st.newsEnabled ? "on" : "off")
+     .split("{SYMBOL}").join(symbol || "")
+     .split("{CAPITAL}").join(st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown")));
 
   const userExtra = (isStaff({ username: st.profile?.username }, env) && userPrompt?.trim())
     ? userPrompt.trim()
@@ -3199,7 +3257,9 @@ async function buildVisionPrompt(st, env) {
      .split("{TIMEFRAME}").join(tf)
      .split("{STYLE}").join(st.style || "")
      .split("{RISK}").join(st.risk || "")
-     .split("{NEWS}").join(st.newsEnabled ? "on" : "off");
+     .split("{NEWS}").join(st.newsEnabled ? "on" : "off")
+     .split("{SYMBOL}").join(st.selectedSymbol || "CHART")
+     .split("{CAPITAL}").join(st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown")));
   return (
     `${base}
 
