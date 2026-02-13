@@ -1267,49 +1267,22 @@ async function getCachedR2ValueAllowStale(bucket, key) {
 }
 
 /* ========================== PROMPTS (ADMIN/OWNER ONLY) ========================== */
-const DEFAULT_ANALYSIS_PROMPT = `SYSTEM OVERRIDE: تحلیل‌گر بازار چندسبکی (STYLE-AWARE)
+const DEFAULT_ANALYSIS_PROMPT = `SYSTEM: تحلیل‌گر حرفه‌ای بازار
 
-متغیرها:
-- STYLE_MODE: {STYLE}
-- RISK_PROFILE: {RISK}
-- NEWS_MODE: {NEWS}
-- TIMEFRAME: {TIMEFRAME}
+قوانین قطعی:
+1) خروجی نهایی فقط فارسی باشد.
+2) فقط بر اساس STYLE_PROMPT_JSON (سبک انتخابی کاربر) تحلیل کن.
+3) فقط از داده MARKET_DATA استفاده کن و خیال‌پردازی نکن.
+4) ورودی‌های کاربر را الزامی لحاظ کن: Symbol, Timeframe, Risk, Capital.
+5) خروجی را مرحله‌ای، اجرایی و با مدیریت ریسک ارائه بده.
+6) در صورت نبود داده کافی، شفاف اعلام کن.
 
-قوانین سخت:
-1) خروجی فقط فارسی باشد و فقط شامل بخش‌های ۱ تا ۵ با همین تیترها.
-2) فقط از داده‌های MARKET_DATA استفاده کن؛ اگر داده کافی نیست، شفاف بگو و حدس نزن.
-3) سطح‌های قیمتی را با عدد و برچسب X / Y / Z ارائه کن (اگر عدد از داده مشخص نیست: «نامشخص از داده»).
-4) شرط کندلی را واضح بنویس (Close بالا/پایین، Wick Sweep، شکست با بدنه، پولبک).
-5) هیچ توصیه قطعی «حتماً بخر/بفروش» نده؛ سناریومحور و مشروط بنویس.
-
-سوئیچ سبک (بر اساس STYLE_MODE):
-A) اگر STYLE_MODE = "پرایس اکشن"
-- تمرکز: ساختار (HH/HL یا LH/LL)، حمایت/مقاومت، شکست و پولبک، عرضه/تقاضا، الگوهای کندلی.
-- از اصطلاحات ICT فقط در صورت نیاز و با توضیح کوتاه استفاده کن.
-
-B) اگر STYLE_MODE = "ICT"
-- تمرکز: Liquidity (استاپ‌ها)، Sweep/Grab، Order Block، FVG، Breaker/Structure Shift.
-- هدف نقدینگی و واکنش در برخورد را مشخص کن.
-
-C) اگر STYLE_MODE = "ATR"
-- تمرکز: نوسان و مدیریت ریسک با ATR.
-- اگر ATR عددی در داده نبود، استاپ/اهداف را نسبی بنویس (مثلاً ۱×ATR) و بگو «ATR عددی در داده نیست».
-
-سوئیچ ریسک (بر اساس RISK_PROFILE):
-- کم‌ریسک: فقط با تایید قوی (Close + Retest)، SL محافظه‌کار، TP پله‌ای.
-- متوسط: تایید استاندارد، SL پشت ناحیه، TP دو مرحله‌ای.
-- پرریسک: ورود تهاجمی‌تر فقط اگر سناریو واضح است؛ حتماً هشدار «ریسک بالا».
-
-NEWS_MODE:
-- اگر {NEWS} = "on": تاثیر خبر/رویداد را کوتاه داخل سناریوها اضافه کن.
-- اگر {NEWS} = "off": از خبر حرف نزن.
-
-OUTPUT FORMAT (STRICT):
-۱. نقشه پول‌های پارک‌شده (شکارگاه نهنگ‌ها):
-۲. تله‌های قیمتی اخیر (فریب بازار):
-۳. ردپای ورود پول هوشمند / ساختار (طبق STYLE_MODE):
-۴. سناریوی بعدی (مسیر احتمالی + شروط فعال‌سازی):
-۵. استراتژی لحظه برخورد (ماشه نهایی + Entry/SL/TP مشروط با X/Y/Z):`;
+ساختار خروجی:
+۱) بایاس و وضعیت ساختار
+۲) نواحی و نقدینگی/سطوح کلیدی
+۳) سناریوی ورود (Entry/SL/TP)
+۴) مدیریت ریسک و اندازه پوزیشن
+۵) سناریوی ابطال و جمع‌بندی اجرایی`;
 
 /* ========================== STYLE PROMPTS (DEFAULTS) ==========================
  * Users choose st.style (Persian labels) and we inject a style-specific guide
@@ -3645,10 +3618,29 @@ async function handleUpdate(update, env) {
 
     if (text === "/wallet" || text === BTN.WALLET) {
       const wallet = await getWallet(env);
+      const txs = Array.isArray(st.wallet?.transactions) ? st.wallet.transactions.slice(-5).reverse() : [];
+      const txHistory = txs.length
+        ? txs.map((t, i) => `${i + 1}) ${t.txHash || "-"} | ${t.amount || "-"} USDT | ${String(t.createdAt || "").slice(0, 16).replace("T", " ")}`).join(String.fromCharCode(10))
+        : "—";
+      const planName = `${st.profile?.username || "marketi1"}  PRO`;
       const txt =
-        `💳 ولت و پرداخت\n\n` +
-        (wallet ? `آدرس ولت:\n${wallet}\n\n` : "") +
-        `برای مشاهده موجودی، واریز یا برداشت از دکمه‌ها استفاده کن.`;
+        `💳 ولت
+
+` +
+        `پلن: ${planName}
+با ارزش ۲۵ USDT
+
+` +
+        `📜 تاریخچه تراکنشات
+${txHistory}
+
+` +
+        (wallet ? `🏦 آدرس ولت:
+${wallet}
+
+` : "") +
+        `«واریزی فقط به آدرس ولت درگاه ممکن است
+در لیست زیر باید از واریز هش واریزی را ارسال کنید.»`;
       return tgSendMessage(env, chatId, txt, walletMenuKeyboard());
     }
 
@@ -3673,7 +3665,10 @@ ${wallet}
 Memo/Tag: ${memo}
 
 ` +
-        `TxID پرداخت را همینجا بفرست (در صورت نیاز: <txid> <amount>).`;
+        `«واریزی فقط به آدرس ولت درگاه ممکن است
+در لیست زیر باید از واریز هش واریزی را ارسال کنید.»
+
+TxID پرداخت را همینجا بفرست (در صورت نیاز: <txid> <amount>).`;
       return tgSendMessage(env, chatId, txt, kb([[BTN.BACK, BTN.HOME]]));
     }
 
@@ -3691,15 +3686,27 @@ Memo/Tag: ${memo}
     if (text === "/invite" || text === BTN.INVITE) {
       const { link, share } = inviteShareText(st, env);
       if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
+      const inv = Number(st.referral?.successfulInvites || 0);
+      const pts = Number(st.referral?.points || 0);
       const txt =
         `🤝 دعوت دوستان
 
 ` +
-        `🔗 لینک رفرال اختصاصی: <a href="${escapeHtml(link)}">باز کردن لینک دعوت</a>
+        `دعوت موفق: ${inv}
+` +
+        `امتیاز شما: ${pts}
 
 ` +
-        (share ? `برای اشتراک‌گذاری سریع: <a href="${escapeHtml(share)}">ارسال لینک</a>
-` : "");
+        `🔗 لینک رفرال قابل کپی: <code>${escapeHtml(link)}</code>
+` +
+        `لینک رفرال: <a href="${escapeHtml(link)}">باز کردن لینک دعوت</a>
+
+` +
+        (share ? `اشتراک‌گذاری سریع: <a href="${escapeHtml(share)}">ارسال لینک</a>
+
+` : "") +
+        `«با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتباز بدست می اورید در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید
+»`;
       return tgSendMessageHtml(env, chatId, txt, mainMenuKeyboard(env));
     }
 
@@ -3715,7 +3722,13 @@ Memo/Tag: ${memo}
       return tgSendMessage(
         env,
         chatId,
-        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.\n\nپیام مستقیم: ${handle}${walletLine}`,
+        `🆘 پشتیبانی
+
+«با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.»
+
+برای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.
+
+پیام مستقیم: ${handle}${walletLine}`,
         kb([[BTN.SUPPORT_FAQ, BTN.SUPPORT_TICKET], [BTN.SUPPORT_CUSTOM_PROMPT], [BTN.HOME]])
       );
     }
@@ -3914,12 +3927,29 @@ ${MINIAPP_EXEC_CHECKLIST}`, kbInline);
       await saveUser(userId, st, env);
 
       const marketFa = ({crypto:"کریپتو", forex:"فارکس", metals:"فلزات", stocks:"سهام"})[result.recommendedMarket] || "کریپتو";
-      return tgSendMessage(
+      await tgSendMessage(
         env,
         chatId,
-        `✅ تعیین سطح انجام شد.\n\nسطح: ${st.profile.level}\nپیشنهاد بازار: ${marketFa}\n\nتنظیمات پیشنهادی:\n⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}\n\nیادداشت:\n${st.profile.levelNotes || "—"}\n\nاگر می‌خوای دوباره تعیین‌سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
+        `✅ تعیین سطح انجام شد.
+
+سطح: ${st.profile.level}
+پیشنهاد بازار: ${marketFa}
+
+تنظیمات پیشنهادی:
+⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}
+
+یادداشت:
+${st.profile.levelNotes || "—"}
+
+اگر می‌خوای دوباره تعیین‌سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
         mainMenuKeyboard(env)
       );
+      const teaserSymbol = st.profile?.preferredMarket?.includes("فارکس") ? "EURUSD" : (st.profile?.preferredMarket?.includes("فلز") ? "XAUUSD" : (st.profile?.preferredMarket?.includes("سهام") ? "US500" : "BTCUSDT"));
+      const teaser = `📌 یک تحلیل کوتاه ویژه پروفایل شما:
+${teaserSymbol} در ${st.timeframe} با ریسک ${st.risk} → در صورت تثبیت بالای ناحیه حمایتی اخیر، سناریوی ادامه‌دار صعودی فعال می‌شود؛ در غیر این صورت پولبک عمیق‌تر محتمل است.
+
+برای تحلیل کامل از منوی سیگنال استفاده کن 🚀`;
+      return tgSendMessage(env, chatId, teaser, mainMenuKeyboard(env));
     }
 
     if (text === BTN.CAT_MAJORS) return tgSendMessage(env, chatId, "💱 ماجورها:", listKeyboard(MAJORS));
