@@ -3929,7 +3929,8 @@ ${summary || "تحلیل خبری در دسترس نیست."}`, mainMenuKeyboard
       return tgSendMessage(env, chatId, `🧩 مینی‌اپ فعال شد.
 
 از دکمه زیر وارد شوید. اگر دکمه باز نشد، این لینک را مستقیم باز کنید:
-${finalUrl}`, kbInline);
+${finalUrl}\n\nچک‌لیست سریع اتصال:
+${MINIAPP_EXEC_CHECKLIST}`, kbInline);
     }
 
 
@@ -5163,7 +5164,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const authDate = Number(params.get("auth_date") || "0");
   if ((!Number.isFinite(authDate) || authDate <= 0) && !lenient) return { ok: false, reason: "auth_date_invalid" };
   const now = Math.floor(Date.now() / 1000);
-  const maxAgeSec = Math.max(60, Number(maxAgeSecRaw || 0) || (lenient ? 7 * 24 * 60 * 60 : 24 * 60 * 60));
+  const maxAgeSec = Math.max(60, Number(maxAgeSecRaw || 0) || (7 * 24 * 60 * 60));
   if (Number.isFinite(authDate) && authDate > 0 && (now - authDate > maxAgeSec) && !lenient) return { ok: false, reason: "initData_expired" };
 
   const pairs = [];
@@ -5933,6 +5934,14 @@ let QUOTE_TIMER = null;
 let QUOTE_BUSY = false;
 let NEWS_TIMER = null;
 const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
+const MINIAPP_EXEC_CHECKLIST = [
+  "1) مینی‌اپ را فقط از داخل تلگرام باز کنید.",
+  "2) تاریخ/ساعت گوشی را روی حالت خودکار بگذارید.",
+  "3) VPN/Proxy را یک‌بار خاموش/روشن و دوباره تست کنید.",
+  "4) اپ تلگرام را آپدیت کنید و Mini App cache را پاک کنید.",
+  "5) اگر خطای 401 بود، اپ را کامل ببندید و از دکمه /miniapp دوباره وارد شوید.",
+  "6) اگر هنوز وصل نشد، لاگ /health و پاسخ /api/user را برای پشتیبانی ارسال کنید."
+].join("\n");
 
 function getFreshInitData() {
   const latestTg = (tg?.initData || "").trim();
@@ -6118,7 +6127,7 @@ function prettyErr(j, status){
   if (status === 403 && String(e) === "forbidden") return "دسترسی این بخش برای نقش فعلی شما مجاز نیست.";
   if (status === 401) {
     if (String(e).includes("initData")) return "اتصال مینی‌اپ منقضی شده؛ اپ را مجدد از داخل تلگرام باز کنید.";
-    return "احراز هویت تلگرام ناموفق است.";
+    return "احراز هویت تلگرام ناموفق است.\n\n" + MINIAPP_EXEC_CHECKLIST;
   }
   return "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.";
 }
@@ -6735,6 +6744,7 @@ async function boot(){
       pillTxt.textContent = "Offline (Guest)";
       out.textContent = "حالت محدود فعال شد ✅ داده‌های پایه بارگذاری شدند.";
       showToast("حالت محدود", "برای همه امکانات، مینی‌اپ را از داخل تلگرام باز کنید.", "GUEST", false);
+      if (status === 401) out.textContent = "اتصال کامل برقرار نشد.\n\n" + MINIAPP_EXEC_CHECKLIST;
       setupLiveQuotePolling();
       setupNewsPolling();
       return;
