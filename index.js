@@ -1962,9 +1962,17 @@ function contactKeyboard() {
   };
 }
 
+const DEFAULT_MINIAPP_URL = "https://sniperim.mad-pyc.workers.dev/";
+
 function getMiniappUrl(env) {
-  const u = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || "").toString().trim();
-  return u;
+  const configured = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || "").toString().trim();
+  const raw = configured || DEFAULT_MINIAPP_URL;
+  try {
+    const u = new URL(raw);
+    return u.toString();
+  } catch {
+    return DEFAULT_MINIAPP_URL;
+  }
 }
 async function miniappInlineKeyboard(env, st, from) {
   const url = getMiniappUrl(env);
