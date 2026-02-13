@@ -1060,8 +1060,9 @@ async function finalizeOnboardingRewards(env, st) {
 
   const inviterId = String(st.referral.referredBy);
   const inviter = await ensureUser(inviterId, env);
+  const invitePoints = Math.max(1, Number(env.REFERRAL_INVITE_POINTS || 6));
   inviter.referral.successfulInvites = (inviter.referral.successfulInvites || 0) + 1;
-  inviter.referral.points = (inviter.referral.points || 0) + 3;
+  inviter.referral.points = (inviter.referral.points || 0) + invitePoints;
   if (inviter.referral.points >= 500) {
     inviter.referral.points -= 500;
     inviter.subscription.active = true;
@@ -3084,7 +3085,6 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
       lastErr = e;
       markProviderFailure(p, env, "market");
       console.error("market provider failed:", p, e?.message || e);
-      markProviderFailure(p, env);
     }
   }
 
@@ -3158,7 +3158,7 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
       markProviderFailure(p, env, "market");
     } catch (e) {
       lastErr = e;
-      markProviderFailure(p, env);
+      markProviderFailure(p, env, "market");
     }
   }
   throw lastErr || new Error("market_data_alt_failed");
@@ -4400,7 +4400,7 @@ function getSupportFaq() {
     { q: "چطور سهمیه روزانه شارژ می‌شود؟", a: "سهمیه هر روز (Tehran) صفر می‌شود و مجدداً قابل استفاده است." },
     { q: "چرا تحلیل ناموفق شد؟", a: "اتصال دیتا یا مدل ممکن است موقتاً قطع باشد. چند دقیقه بعد دوباره تلاش کن." },
     { q: "چطور اشتراک فعال کنم؟", a: "پرداخت را انجام بده و هش تراکنش را برای ادمین ارسال کن تا تأیید و فعال شود." },
-    { q: "چطور رفرال کار می‌کند؟", a: "هر دعوت موفق با شماره جدید ۳ امتیاز دارد. هر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه." },
+    { q: "چطور رفرال کار می‌کند؟", a: "هر دعوت موفق با شماره جدید ۶ امتیاز دارد. هر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه." },
   ];
 }
 
@@ -4431,7 +4431,7 @@ function profileText(st, from, env) {
   const code = (st.referral?.codes || [])[0] || "";
   const deep = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "-";
 
-  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Tehran): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
+  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Tehran): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۶ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
 }
 
 function inviteShareText(st, env) {
@@ -5504,6 +5504,7 @@ const MINI_APP_HTML = `<!doctype html>
             <button type="button" class="chip" data-tab="content">محتوا</button>
             <button type="button" class="chip" data-tab="operations">عملیات</button>
             <button type="button" class="chip" data-tab="support">پشتیبانی</button>
+            <button type="button" class="chip" data-tab="wallet">ولت</button>
             <button type="button" class="chip" data-tab="reports">گزارش</button>
           </div>
           <div class="field admin-tab" data-tab="overview">
@@ -5553,7 +5554,7 @@ const MINI_APP_HTML = `<!doctype html>
           </div>
 
           <div class="field">
-            <div class="label">کمیسیون دعوت</div>
+            <div class="label">کمیسیون دعوت (۶ امتیاز برای هر دعوت موفق)</div>
             <div class="admin-row">
               <input id="globalCommission" class="control" placeholder="درصد کمیسیون کلی (مثلاً 5)" />
               <button id="saveGlobalCommission" class="btn">ذخیره کلی</button>
@@ -5656,6 +5657,17 @@ const MINI_APP_HTML = `<!doctype html>
             <textarea id="walletAddressInput" class="control" placeholder="آدرس ولت جهت پرداخت (مثلاً TRC20)..."></textarea>
             <div class="actions">
               <button id="saveWallet" class="btn">ذخیره آدرس</button>
+            </div>
+          </div>
+
+          <div class="field admin-tab" data-tab="wallet">
+            <div class="label">راهنمای ولت / واریز / برداشت</div>
+            <div class="mini-list">
+• حداقل واریز: 25 USDT
+• آدرس ولت از بخش «تنظیم آدرس ولت» توسط اونر ثبت می‌شود.
+• پس از واریز، TxID را ارسال کنید تا تایید انجام شود.
+• برداشت پس از بررسی تیم انجام می‌شود (کارمزد شبکه لحاظ می‌شود).
+• در صورت خطا، از تب «پشتیبانی» تیکت ثبت کنید.
             </div>
           </div>
 
@@ -6659,7 +6671,7 @@ async function boot(){
   IS_OWNER = json.role === "owner";
   IS_GUEST = !!json.guest;
 
-  const adminTabBtn = document.querySelector(".tab-btn[data-tab="admin"]");
+  const adminTabBtn = document.querySelector('.tab-btn[data-tab="admin"]');
   if (adminTabBtn) adminTabBtn.style.display = IS_STAFF ? "inline-flex" : "none";
 
   if (IS_STAFF && adminCard) {
