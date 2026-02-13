@@ -33,7 +33,9 @@ export default {
           return jsonResponse({ ok: false, error: v.reason }, 401);
         }
 
-        const st = await ensureUser(v.userId, env);
+        const st = await ensureUser(v.userId, env, v.fromLike);
+        applyLocaleFromTelegramUser(st, v.fromLike || {});
+        if (env.BOT_KV) await saveUser(v.userId, st, env);
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
         const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
         const miniToken = await issueMiniappToken(env, v.userId, v.fromLike || {});
@@ -784,13 +786,19 @@ TxID: ${txid}
         const v = await verifyMiniappAuth(body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
-        const st = await ensureUser(v.userId, env);
+        const st = await ensureUser(v.userId, env, v.fromLike);
         const symbol = String(body.symbol || "").trim();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
 
-        // lightweight onboarding gate for mini-app: block only if absolutely no identity fields exist
-        const hasAnyIdentity = !!(st.profile?.name || st.profile?.phone || st.profile?.username || v.fromLike?.username);
-        if (!hasAnyIdentity) {
+        const isOnboardingReady = !!(
+          st.profile?.onboardingDone &&
+          st.profile?.name &&
+          st.profile?.phone &&
+          st.profile?.preferredStyle &&
+          st.profile?.preferredMarket &&
+          Number(st.profile?.capital || 0) > 0
+        );
+        if (!isOnboardingReady) {
           return jsonResponse({ ok: false, error: "onboarding_required" }, 403);
         }
 
@@ -847,6 +855,13 @@ TxID: ${txid}
           return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec, quickchartConfig, chartMeta, zonesSvg });
         } catch (e) {
           console.error("api/analyze error:", e);
+          const msg = String(e?.message || e || "");
+          if (msg.includes("api_analyze_timeout") || msg.includes("text_") || msg.includes("timeout")) {
+            let candles = [];
+            try { candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4"); } catch {}
+            const fallback = buildLocalFallbackAnalysis(symbol, st, candles, msg || "analysis_timeout");
+            return jsonResponse({ ok: true, result: fallback, state: st, quota: isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`, fallback: true, reason: msg || "timeout" });
+          }
           return jsonResponse({ ok: false, error: "server_error" }, 500);
         }
       }
@@ -977,7 +992,7 @@ const BTN = {
 };
 
 const TYPING_INTERVAL_MS = 4000;
-const TIMEOUT_TEXT_MS = 26000;
+const TIMEOUT_TEXT_MS = 38000;
 const TIMEOUT_VISION_MS = 12000;
 const TIMEOUT_POLISH_MS = 15000;
 
@@ -1036,15 +1051,41 @@ function applyLocaleDefaults(st) {
   st.profile.countryCode = st.profile.countryCode || loc.country;
   st.profile.timezone = st.profile.timezone || loc.tz;
 
-  if (!st.timeframe) st.timeframe = (loc.country === "IR" ? "H1" : "H4");
-  if (!st.risk) st.risk = "متوسط";
-  if (!st.style) st.style = "پرایس اکشن";
+  const policy = localePolicy(st.profile.language, st.profile.countryCode);
+  if (!st.timeframe) st.timeframe = policy.timeframe;
+  if (!st.risk) st.risk = policy.risk;
+  if (!st.style) st.style = policy.style;
   if (st.profile.preferredStyle && ALLOWED_STYLE_LIST.includes(st.profile.preferredStyle)) {
     st.style = st.profile.preferredStyle;
   }
   if (typeof st.newsEnabled !== "boolean") st.newsEnabled = true;
   if (!st.promptMode) st.promptMode = "style_plus_custom";
   return st;
+}
+
+function localePolicy(language = "fa", country = "IR") {
+  const lang = String(language || "fa").toLowerCase();
+  const c = String(country || "IR").toUpperCase();
+  if (c === "IR") return { timeframe: "H1", risk: "متوسط", style: "پرایس اکشن" };
+  if (lang.startsWith("ar")) return { timeframe: "H1", risk: "متوسط", style: "ترکیبی" };
+  if (lang.startsWith("tr") || lang.startsWith("ru")) return { timeframe: "H4", risk: "متوسط", style: "ICT" };
+  return { timeframe: "H4", risk: "medium", style: "پرایس اکشن" };
+}
+
+function applyLocaleFromTelegramUser(st, fromLike = {}) {
+  st.profile = st.profile || {};
+  const langRaw = String(fromLike?.language_code || "").trim().toLowerCase();
+  if (!st.profile.language && langRaw) st.profile.language = langRaw.split("-")[0];
+  if (!st.profile.countryCode && langRaw.includes("-")) st.profile.countryCode = langRaw.split("-")[1].toUpperCase();
+  if (!st.profile.countryCode) st.profile.countryCode = st.profile.language === "fa" ? "IR" : "INT";
+  if (!st.profile.timezone) {
+    const tzMap = { fa: "Asia/Tehran", ar: "Asia/Riyadh", tr: "Europe/Istanbul", ru: "Europe/Moscow", en: "UTC" };
+    st.profile.timezone = tzMap[st.profile.language] || "UTC";
+  }
+  const policy = localePolicy(st.profile.language, st.profile.countryCode);
+  if (!st.timeframe) st.timeframe = policy.timeframe;
+  if (!st.risk) st.risk = policy.risk;
+  if (!st.style) st.style = policy.style;
 }
 
 async function finalizeOnboardingRewards(env, st) {
@@ -2143,6 +2184,7 @@ async function ensureUser(userId, env, from) {
   if (from?.username) st.profile.username = String(from.username);
   if (from?.first_name) st.profile.firstName = String(from.first_name);
   if (from?.last_name) st.profile.lastName = String(from.last_name);
+  applyLocaleFromTelegramUser(st, from || {});
   if (st.profile?.phone) applyLocaleDefaults(st);
 
   const today = kyivDateString();
@@ -3451,7 +3493,7 @@ ${newsAnalysisBlock}
 ` : ``) +
     `RULES:
 ` +
-    `- خروجی فقط فارسی و دقیقاً بخش‌های ۱ تا ۵
+    `- خروجی به زبان کاربر باشد (Lang=${st.profile?.language || "fa"}) و دقیقاً بخش‌های ۱ تا ۵
 ` +
     (st.style === "ترکیبی" || promptMode === "combined_all"
       ? `- از ترکیب سبک‌ها (پرایس اکشن، اسمارت‌مانی، ساختار بازار، حجم، سناریو) استفاده کن
@@ -4320,8 +4362,7 @@ async function startOnboarding(env, chatId, from, st) {
     await saveUser(st.userId, st, env);
     return tgSendMessage(env, chatId, "🎯 سبک ترجیحی‌ات را انتخاب کن:", optionsKeyboard(ALLOWED_STYLE_LIST));
   }
-  const flags = await getAdminFlags(env);
-  if (flags.capitalModeEnabled && !Number(st.profile?.capital || 0)) {
+  if (!Number(st.profile?.capital || 0)) {
     st.state = "onb_capital";
     await saveUser(st.userId, st, env);
     return tgSendMessage(env, chatId, "💼 سرمایه تقریبی‌ات را وارد کن (عدد). مثال: 1000", kb([[BTN.BACK, BTN.HOME]]));
@@ -4685,6 +4726,14 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
   } catch (e) {
     console.error("runSignalTextFlow error:", e);
     t.stop = true;
+    const msg = String(e?.message || e || "");
+    if (msg.includes("timeout") || msg.includes("text_")) {
+      let candles = [];
+      try { candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4"); } catch {}
+      const fallback = buildLocalFallbackAnalysis(symbol, st, candles, msg || "signal_timeout");
+      await tgSendLongMessage(env, chatId, fallback, kb([[BTN.HOME]]));
+      return false;
+    }
     await tgSendMessage(env, chatId, "⚠️ فعلاً امکان انجام این عملیات نیست. لطفاً بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
     return false;
   }
@@ -4751,14 +4800,21 @@ async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
     console.error("text providers failed (retry compact):", e?.message || e);
     try {
       const compactBlock = buildMarketBlock(candles, 40);
-      const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env, newsBlock);      draft = await runTextProviders(compactPrompt, env, st.textOrder);
+      const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env, newsBlock);
+      draft = await runTextProviders(compactPrompt, env, st.textOrder);
     } catch (e2) {
       console.error("text providers failed (fallback local):", e2?.message || e2);
       draft = buildLocalFallbackAnalysis(symbol, st, candles, e2?.message || "text_provider_timeout");
     }
   }
-  const polished = await runPolishProviders(draft, env, st.polishOrder);
-  const clean = stripHiddenModelOutput(polished);
+  let polished = draft;
+  try {
+    polished = await runPolishProviders(draft, env, st.polishOrder);
+  } catch (e) {
+    console.error("polish flow failed:", e?.message || e);
+    polished = draft;
+  }
+  const clean = stripHiddenModelOutput(polished || draft);
   if (useCache && clean) await setAnalysisCache(env, cacheKey, clean);
   return clean;
 }
@@ -5067,7 +5123,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const userId = user?.id || Number(params.get("user_id") || "0");
   if (!userId) return { ok: false, reason: "user_missing" };
 
-  const fromLike = { username: user?.username || "" };
+  const fromLike = { username: user?.username || "", first_name: user?.first_name || "", last_name: user?.last_name || "", language_code: user?.language_code || "" };
   return { ok: true, userId, fromLike };
 }
 
@@ -5999,7 +6055,7 @@ async function adminApi(path, body){
 function prettyErr(j, status){
   const e = j?.error || "نامشخص";
   if (status === 429 && String(e).startsWith("quota_exceeded")) return "سهمیه امروز تمام شد.";
-  if (status === 403 && String(e) === "onboarding_required") return "ابتدا حداقل نام یا یوزرنیم خود را تکمیل کنید.";
+  if (status === 403 && String(e) === "onboarding_required") return "لطفاً آنبوردینگ را کامل کن: نام، شماره، سرمایه، تعیین‌سطح و سبک.";
   if (status === 403 && String(e) === "forbidden") return "دسترسی این بخش برای نقش فعلی شما مجاز نیست.";
   if (status === 401) {
     if (String(e).includes("initData")) return "اتصال مینی‌اپ منقضی شده؛ اپ را مجدد از داخل تلگرام باز کنید.";
