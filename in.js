@@ -5280,21 +5280,18 @@ function extractSessionTokenFromRequest(request) {
 }
 
 async function authMiniappRequest(request, body, env) {
-  const hasSessionSecret = !!String(env.SESSION_SECRET || env.MINIAPP_SESSION_SECRET || "").trim();
-  if (hasSessionSecret) {
-    const tok = extractSessionTokenFromRequest(request);
-    if (tok) {
-      const vt = await verifySessionToken(tok, env);
-      if (vt.ok) {
-        const pl = vt.payload;
-        const fromLike = {
-          id: pl.uid,
-          username: pl.un || "",
-          first_name: pl.fn || "",
-          last_name: pl.ln || "",
-        };
-        return { ok: true, userId: pl.uid, fromLike, via: "session" };
-      }
+  const tok = extractSessionTokenFromRequest(request);
+  if (tok) {
+    const vt = await verifySessionToken(tok, env);
+    if (vt.ok) {
+      const pl = vt.payload;
+      const fromLike = {
+        id: pl.uid,
+        username: pl.un || "",
+        first_name: pl.fn || "",
+        last_name: pl.ln || "",
+      };
+      return { ok: true, userId: pl.uid, fromLike, via: "session" };
     }
   }
 
