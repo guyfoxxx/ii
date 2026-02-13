@@ -2,6 +2,7 @@ export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
+      env.__BASE_URL = url.origin;
 
       if (url.pathname === "/health") return new Response("ok", { status: 200 });
 
@@ -36,7 +37,6 @@ export default {
         const st = await ensureUser(v.userId, env);
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
         const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
-        const miniToken = await issueMiniappToken(env, v.userId, v.fromLike || {});
         const styles = await getStyleList(env);
         const [offerBanner, offerBannerImage] = await Promise.all([getOfferBanner(env), getOfferBannerImage(env)]);
         const customPrompts = await getCustomPrompts(env);
@@ -61,7 +61,6 @@ export default {
             timezone: st.profile?.timezone || "Asia/Tehran",
             entrySource: st.profile?.entrySource || "",
           },
-          miniToken,
         });
       }
 
@@ -1237,7 +1236,7 @@ async function getCachedR2ValueAllowStale(bucket, key) {
 }
 
 /* ========================== PROMPTS (ADMIN/OWNER ONLY) ========================== */
-const DEFAULT_ANALYSIS_PROMPT = `SYSTEM OVERRIDE: تحلیل‌گر بازار چندسبکی (STYLE-AWARE)
+const DEFAULT_ANALYSIS_PROMPT = `SYSTEM OVERRIDE: تحلیل‌گر چندسبکی بازار (BASE PROMPT)
 
 متغیرها:
 - STYLE_MODE: {STYLE}
@@ -1245,174 +1244,151 @@ const DEFAULT_ANALYSIS_PROMPT = `SYSTEM OVERRIDE: تحلیل‌گر بازار �
 - NEWS_MODE: {NEWS}
 - TIMEFRAME: {TIMEFRAME}
 
-قوانین سخت:
-1) خروجی فقط فارسی باشد و فقط شامل بخش‌های ۱ تا ۵ با همین تیترها.
-2) فقط از داده‌های MARKET_DATA استفاده کن؛ اگر داده کافی نیست، شفاف بگو و حدس نزن.
-3) سطح‌های قیمتی را با عدد و برچسب X / Y / Z ارائه کن (اگر عدد از داده مشخص نیست: «نامشخص از داده»).
-4) شرط کندلی را واضح بنویس (Close بالا/پایین، Wick Sweep، شکست با بدنه، پولبک).
-5) هیچ توصیه قطعی «حتماً بخر/بفروش» نده؛ سناریومحور و مشروط بنویس.
+قوانین قطعی:
+1) خروجی فقط فارسی باشد.
+2) فقط از MARKET_DATA استفاده کن و اگر داده ناکافی است شفاف اعلام کن.
+3) سیگنال قطعی نده؛ سناریومحور و شرطی بنویس.
+4) اعداد کلیدی را دقیق بنویس و اگر ناموجود بود «نامشخص از داده» درج کن.
+5) مدیریت ریسک را الزامی بیاور (Entry / SL / TP).
 
-سوئیچ سبک (بر اساس STYLE_MODE):
-A) اگر STYLE_MODE = "پرایس اکشن"
-- تمرکز: ساختار (HH/HL یا LH/LL)، حمایت/مقاومت، شکست و پولبک، عرضه/تقاضا، الگوهای کندلی.
-- از اصطلاحات ICT فقط در صورت نیاز و با توضیح کوتاه استفاده کن.
+راهنمای سبک:
+- پرایس اکشن: ساختار بازار، شکست/پولبک، نواحی حمایت/مقاومت، رفتار کندل.
+- ICT: نقدینگی، Sweep/Grab، OB/FVG، شکست ساختار و جهت حرکت پول هوشمند.
+- ATR: وضعیت نوسان، SL/TP مبتنی بر ATR، فیلتر ورود در نوسان‌های پرریسک.
+- ترکیبی: بهترین اجزای سه سبک را بدون تناقض ادغام کن.
 
-B) اگر STYLE_MODE = "ICT"
-- تمرکز: Liquidity (استاپ‌ها)، Sweep/Grab، Order Block، FVG، Breaker/Structure Shift.
-- هدف نقدینگی و واکنش در برخورد را مشخص کن.
+راهنمای ریسک:
+- کم: ورود با تایید قوی، SL محافظه‌کار.
+- متوسط: تایید استاندارد، TP مرحله‌ای.
+- زیاد: هشدار ریسک بالا + سناریوی ابطال دقیق.
 
-C) اگر STYLE_MODE = "ATR"
-- تمرکز: نوسان و مدیریت ریسک با ATR.
-- اگر ATR عددی در داده نبود، استاپ/اهداف را نسبی بنویس (مثلاً ۱×ATR) و بگو «ATR عددی در داده نیست».
-
-سوئیچ ریسک (بر اساس RISK_PROFILE):
-- کم‌ریسک: فقط با تایید قوی (Close + Retest)، SL محافظه‌کار، TP پله‌ای.
-- متوسط: تایید استاندارد، SL پشت ناحیه، TP دو مرحله‌ای.
-- پرریسک: ورود تهاجمی‌تر فقط اگر سناریو واضح است؛ حتماً هشدار «ریسک بالا».
-
-NEWS_MODE:
-- اگر {NEWS} = "on": تاثیر خبر/رویداد را کوتاه داخل سناریوها اضافه کن.
-- اگر {NEWS} = "off": از خبر حرف نزن.
-
-OUTPUT FORMAT (STRICT):
-۱. نقشه پول‌های پارک‌شده (شکارگاه نهنگ‌ها):
-۲. تله‌های قیمتی اخیر (فریب بازار):
-۳. ردپای ورود پول هوشمند / ساختار (طبق STYLE_MODE):
-۴. سناریوی بعدی (مسیر احتمالی + شروط فعال‌سازی):
-۵. استراتژی لحظه برخورد (ماشه نهایی + Entry/SL/TP مشروط با X/Y/Z):`;
+فرمت خروجی (اجباری):
+۱) ساختار و وضعیت بازار
+۲) نواحی کلیدی و نقدینگی
+۳) سناریوهای ورود/خروج مشروط
+۴) مدیریت ریسک و ابطال تحلیل
+۵) جمع‌بندی کوتاه اجرایی`;
 
 /* ========================== STYLE PROMPTS (DEFAULTS) ==========================
  * Users choose st.style (Persian labels) and we inject a style-specific guide
  * into the analysis prompt. Admin can still override the global base prompt via KV.
  */
 const STYLE_PROMPTS_DEFAULT = {
-  "پرایس اکشن": `You are a professional Price Action trader and market analyst.
+  "پرایس اکشن": `Professional Price Action Market Analysis Prompt
 
-Analyze the given market (Symbol, Timeframe) using pure Price Action concepts only.
-Do NOT use indicators unless explicitly requested.
+Constraints:
+- Pure Price Action Only
+- Indicators are forbidden unless explicitly requested
+- Focus on high-probability setups only
+- Step-by-step and execution-focused
 
-Your analysis must include:
+Required Sections:
+1) Market Structure
+- Uptrend / Downtrend / Range
+- HH / HL / LH / LL labeling
+- Structure status: Intact / BOS / MSS
 
-1. Market Structure
-- Identify the current structure (Uptrend / Downtrend / Range)
-- Mark HH, HL, LH, LL
-- Specify whether structure is intact or broken (BOS / MSS)
-
-2. Key Levels
-- Strong Support & Resistance zones
-- Flip zones (SR → Resistance / Resistance → Support)
+2) Key Levels
+- Strong Support zones
+- Strong Resistance zones
+- Flip zones (SR->Resistance / Resistance->Support)
 - Psychological levels (if relevant)
 
-3. Candlestick Behavior
-- Identify strong rejection candles (Pin bar, Engulfing, Inside bar)
-- Explain what these candles indicate about buyers/sellers
+3) Candlestick Behavior
+- Pin Bar / Engulfing / Inside Bar
+- Explain buyer/seller intent
 
-4. Entry Scenarios
-For each valid setup:
-- Entry zone
-- Stop Loss (logical, structure-based)
-- Take Profit targets (TP1 / TP2)
-- Risk to Reward (minimum 1:2)
+4) Entry Scenarios
+- Clear entry zone
+- Logical structure-based Stop Loss
+- TP1 and TP2
+- Minimum RR = 1:2
 
-5. Bias & Scenarios
+5) Bias & Scenarios
 - Main bias (Bullish / Bearish / Neutral)
-- Alternative scenario if price invalidates the setup
+- Alternative scenario on invalidation
 
-6. Execution Plan
-- Is this a continuation or reversal trade?
-- What confirmation is required before entry?
+6) Execution Plan
+- Continuation or Reversal
+- Required confirmation before entry`,
+  "ICT": `ICT & Smart Money Analyst
 
-Explain everything step-by-step, clearly and professionally.
-Avoid overtrading. Focus on high-probability setups only.`,
-  "ICT": `You are an ICT (Inner Circle Trader) & Smart Money analyst.
+Methodology:
+- ICT (Inner Circle Trader)
+- Smart Money Concepts only
+- No indicators, no retail concepts
 
-Analyze the market (Symbol, Timeframe) using ICT & Smart Money Concepts ONLY.
+Analyze Symbol/Timeframe with these sections:
+1) Higher Timeframe Bias (Daily/H4)
+- HTF bias (Bullish/Bearish/Neutral)
+- Premium / Discount / Equilibrium(50%)
+- Imbalance vs Balance
 
-Your analysis must include:
+2) Liquidity Mapping
+- EQH / EQL
+- Buy-side and Sell-side liquidity
+- Stop-loss pools
+- Where liquidity is likely engineered toward
 
-1. Higher Timeframe Bias
-- Determine HTF bias (Daily / H4)
-- Identify Premium & Discount zones
-- Is price in equilibrium or imbalance?
+3) Market Structure
+- BOS and MSS/CHoCH
+- Manipulation phase vs Expansion phase
 
-2. Liquidity Mapping
-- Identify:
-  - Equal Highs / Equal Lows
-  - Buy-side liquidity
-  - Sell-side liquidity
-- Mark likely stop-loss pools
+4) PD Arrays
+- Bullish/Bearish Order Blocks
+- FVG / Liquidity Voids
+- PDH / PDL / PWH / PWL
 
-3. Market Structure
-- Identify:
-  - BOS (Break of Structure)
-  - MSS (Market Structure Shift)
-- Clarify whether the move is manipulation or expansion
+5) Kill Zones (Intraday only)
+- London Kill Zone / New York Kill Zone
+- Why timing matters
 
-4. PD Arrays
-- Order Blocks (Bullish / Bearish)
-- Fair Value Gaps (FVG)
-- Liquidity Voids
-- Previous High / Low (PDH, PDL, PWH, PWL)
+6) Entry Model
+- Liquidity Sweep -> MSS -> FVG Entry
+- Liquidity Sweep -> Order Block Entry
+- Entry, Stop Loss, Liquidity-based Targets
 
-5. Kill Zones (if intraday)
-- London Kill Zone
-- New York Kill Zone
-- Explain timing relevance
+7) Narrative
+- Who is trapped?
+- Where smart money entered?
+- Where price is likely engineered to go?
 
-6. Entry Model
-- Entry model used (e.g. Liquidity Sweep → MSS → FVG entry)
-- Entry price
-- Stop Loss (below/above OB or swing)
-- Take Profits (liquidity targets)
+Execution Plan:
+- Clear bias, entry rules, targets, invalidation level`,
+  "ATR": `Quantitative Trading Assistant (ATR-based Volatility)
 
-7. Narrative
-- Explain the story:
-  - Who is trapped?
-  - Where did smart money enter?
-  - Where is price likely engineered to go?
-
-Provide a clear bullish/bearish execution plan and an invalidation point.`,
-  "ATR": `You are a quantitative trading assistant specializing in volatility-based strategies.
-
-Analyze the market (Symbol, Timeframe) using ATR (Average True Range) as the core tool.
-
-Your analysis must include:
-
-1. Volatility State
+Analysis Requirements:
+1) Volatility State
 - Current ATR value
-- Compare current ATR with historical average
-- Is volatility expanding or contracting?
+- Compare with historical ATR average
+- Expansion or contraction
 
-2. Market Condition
-- Trending or Ranging?
-- Is the market suitable for breakout or mean reversion?
+2) Market Condition
+- Trending or Ranging
+- Breakout vs Mean Reversion suitability
 
-3. Trade Setup
-- Optimal Entry based on price structure
-- ATR-based Stop Loss:
-  - SL = Entry ± (ATR × Multiplier)
-- ATR-based Take Profit:
-  - TP1, TP2 based on ATR expansion
+3) Trade Setup
+- Entry based on price structure
+- SL = Entry ± (ATR x Multiplier)
+- TP1/TP2 based on ATR expansion
 
-4. Position Sizing
+4) Position Sizing
 - Risk per trade (%)
-- Position size calculation based on SL distance
+- Position size based on SL distance
 
-5. Trade Filtering
+5) Trade Filtering
 - When NOT to trade based on ATR
-- High-risk volatility conditions (news, spikes)
+- High-risk volatility conditions (news/spikes)
 
-6. Risk Management
+6) Risk Management
 - Max daily loss
 - Max consecutive losses
-- Trailing Stop logic using ATR
+- ATR-based trailing stop logic
 
-7. Summary
-- Is this trade statistically justified?
+7) Summary
+- Statistical justification
 - Expected trade duration
-- Risk classification (Low / Medium / High)
-
-Keep the explanation practical and execution-focused.`,
+- Risk classification (Low/Medium/High)`,
 };
 
 function normalizeStyleLabel(style) {
@@ -1576,6 +1552,11 @@ async function getOfferBannerImage(env) {
   if (!env.BOT_KV) return (env.SPECIAL_OFFER_IMAGE || "").toString().trim();
   const raw = await env.BOT_KV.get("settings:offer_banner_image");
   return (raw || env.SPECIAL_OFFER_IMAGE || "").toString().trim();
+}
+
+async function setOfferBanner(env, text) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
 }
 
 
@@ -1943,16 +1924,14 @@ function contactKeyboard() {
 }
 
 function getMiniappUrl(env) {
-  // Canonical Mini App URL (also configured in BotFather)
-  const fallback = "https://sniperim.mad-pyc.workers.dev/";
-  const u = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || fallback).toString().trim();
-  return u.endsWith("/") ? u : (u + "/");
+  const raw = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || env.__BASE_URL || "").toString().trim();
+  if (!raw) return "";
+  return raw.endsWith("/") ? raw : (raw + "/");
 }
 async function miniappInlineKeyboard(env, st, from) {
   const url = getMiniappUrl(env);
   if (!url) return null;
-  const token = await issueMiniappToken(env, st?.userId, from || {});
-  const finalUrl = token ? appendQuery(url, { miniToken: token }) : url;
+  const finalUrl = url;
   return { inline_keyboard: [[{ text: BTN.MINIAPP, web_app: { url: finalUrl } }]] };
 }
 
@@ -3825,7 +3804,7 @@ Memo/Tag: ${memo}
     }
 
     if (text === "/invite" || text === BTN.INVITE) {
-      const { link, share, points, invites } = inviteShareText(st, env);
+      const { link, share, points, invites, commissionBalance } = inviteShareText(st, env);
       if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
       const txt =
         `🤝 دعوت
@@ -3854,7 +3833,10 @@ Memo/Tag: ${memo}
     if (text === "/support" || text === BTN.SUPPORT) {
       const handle = env.SUPPORT_HANDLE || "@support";
       const wallet = await getWallet(env);
-      const walletLine = wallet ? `\n\n💳 آدرس ولت جهت پرداخت:\n${wallet}` : "";
+      const walletLine = wallet ? `
+
+💳 آدرس ولت جهت پرداخت:
+${wallet}` : "";
       return tgSendMessage(
         env,
         chatId,
@@ -3915,23 +3897,15 @@ ${summary || "تحلیل خبری در دسترس نیست."}`, mainMenuKeyboard
     if (text === "/miniapp" || text === BTN.MINIAPP) {
       const url = getMiniappUrl(env);
       if (!url) {
-        return tgSendMessage(env, chatId, `⚠️ لینک مینی‌اپ تنظیم نشده.
-
-پیش‌فرض سیستم روی https://sniperim.mad-pyc.workers.dev/ است؛ اگر دامنه دیگری می‌خواهی، در Wrangler / داشبورد مقدار MINIAPP_URL یا PUBLIC_BASE_URL را ست کن و Deploy بزن.`, mainMenuKeyboard(env));
+        return tgSendMessage(env, chatId, "⚠️ لینک مینی‌اپ تنظیم نشده. مقدار MINIAPP_URL یا PUBLIC_BASE_URL را تنظیم کنید.", mainMenuKeyboard(env));
       }
-      const token = await issueMiniappToken(env, st.userId, from);
-      const finalUrl = token ? appendQuery(url, { miniToken: token }) : url;
+      const finalUrl = url;
       const kbInline = {
         inline_keyboard: [
           [{ text: "🧩 ورود داخل تلگرام", web_app: { url: finalUrl } }],
-          [{ text: "🔗 اتصال جایگزین", url: finalUrl }],
         ],
       };
-      return tgSendMessage(env, chatId, `🧩 مینی‌اپ فعال شد.
-
-روش جدید اتصال: ابتدا دکمه «ورود داخل تلگرام» را بزن.
-اگر باز نشد، دکمه «اتصال جایگزین» را بزن یا لینک زیر را باز کن:
-${finalUrl}`, kbInline);
+      return tgSendMessage(env, chatId, "🧩 مینی‌اپ فعال شد. فقط از دکمه ورود داخل تلگرام استفاده کنید.", kbInline);
     }
 
 
@@ -4526,7 +4500,40 @@ function inviteShareText(st, env) {
   const code = (st.referral?.codes || [])[0] || "";
   const link = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "";
   const share = link ? `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent("با لینک من عضو شو و اشتراک هدیه بگیر ✅")}` : "";
-  return { link, share, points: Number(st?.referral?.points || 0), invites: Number(st?.referral?.successfulInvites || 0) };
+  return {
+    link,
+    share,
+    points: Number(st?.referral?.points || 0),
+    invites: Number(st?.referral?.successfulInvites || 0),
+    commissionBalance: Number(st?.referral?.commissionBalance || 0),
+  };
+}
+
+
+function fmtNudgePrice(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return "نامشخص";
+  const abs = Math.abs(x);
+  const dp = abs >= 1000 ? 0 : (abs >= 100 ? 2 : (abs >= 1 ? 4 : 6));
+  return x.toFixed(dp);
+}
+
+async function buildOnboardingNudge(env, st) {
+  const market = String(st?.profile?.preferredMarket || "").toLowerCase();
+  const symbol = market.includes("forex") ? "EURUSD" : (market.includes("metal") ? "XAUUSD" : "BTCUSDT");
+  const tf = String(st?.timeframe || "H4").toUpperCase();
+  try {
+    const candles = await getMarketCandlesWithFallback(env, symbol, tf);
+    const tail = Array.isArray(candles) ? candles.slice(-30) : [];
+    const highs = tail.map((c) => Number(c.high ?? c.h)).filter(Number.isFinite);
+    const lows = tail.map((c) => Number(c.low ?? c.l)).filter(Number.isFinite);
+    if (!highs.length || !lows.length) throw new Error("no_data");
+    const hi = Math.max(...highs);
+    const lo = Math.min(...lows);
+    return `تحلیل کوتاه نمونه (${symbol}/${tf}): حمایت حوالی ${fmtNudgePrice(lo)} و مقاومت حوالی ${fmtNudgePrice(hi)}؛ با توجه به سبک ${st?.style || "پرایس اکشن"} بعد از تثبیت کندلی می‌توان سناریوی ورود امن‌تری داشت.`;
+  } catch {
+    return "تحلیل کوتاه نمونه: با توجه به پروفایل شما، ربات روی سناریوهای مرحله‌ای (حمایت/مقاومت + تایید کندلی) خروجی دقیق‌تری می‌دهد؛ یک نماد انتخاب کن تا تحلیل کامل بگیری.";
+  }
 }
 
 function buildOnboardingNudge(st) {
@@ -5138,42 +5145,10 @@ async function buildMiniappGuestPayload(env) {
   };
 }
 
-async function issueMiniappToken(env, userId, fromLike = {}) {
-  if (!env.BOT_KV) return "";
-  const raw = crypto.getRandomValues(new Uint8Array(24));
-  const token = Array.from(raw).map((b) => b.toString(16).padStart(2, "0")).join("");
-  const payload = {
-    userId: String(userId || ""),
-    username: String(fromLike?.username || ""),
-    createdAt: Date.now(),
-  };
-  await env.BOT_KV.put(`miniapp_token:${token}`, JSON.stringify(payload), { expirationTtl: Math.max(300, Number(env.MINIAPP_TOKEN_TTL_SEC || 86400)) });
-  return token;
-}
-
-async function verifyMiniappToken(token, env) {
-  if (!env.BOT_KV || !token) return { ok: false, reason: "token_missing" };
-  const raw = await env.BOT_KV.get(`miniapp_token:${String(token).trim()}`);
-  if (!raw) return { ok: false, reason: "token_invalid" };
-  try {
-    const j = JSON.parse(raw);
-    const userId = String(j?.userId || "").trim();
-    if (!userId) return { ok: false, reason: "token_user_missing" };
-    return { ok: true, userId, fromLike: { username: String(j?.username || "") }, via: "mini_token" };
-  } catch {
-    return { ok: false, reason: "token_bad_json" };
-  }
-}
 
 async function verifyMiniappAuth(body, env) {
   const initData = body?.initData;
-  const v = await verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
-  if (v.ok) return v;
-  const token = String(body?.miniToken || "").trim();
-  if (!token) return v;
-  const tv = await verifyMiniappToken(token, env);
-  if (tv.ok) return tv;
-  return v;
+  return verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
 }
 
 /* ========================== TELEGRAM MINI APP initData verification ========================== */
@@ -5980,7 +5955,6 @@ const spin = el("spin");
 
 let ALL_SYMBOLS = [];
 let INIT_DATA = "";
-let MINI_TOKEN = "";
 let IS_STAFF = false;
 let IS_OWNER = false;
 let IS_GUEST = false;
@@ -5988,7 +5962,6 @@ let OFFLINE_MODE = false;
 
 const LOCAL_KEYS = {
   initData: "miniapp_init_data",
-  miniToken: "miniapp_auth_token",
   userState: "miniapp_cached_user_state_v1",
   quoteCache: "miniapp_quote_cache_v1",
   newsCache: "miniapp_news_cache_v1",
@@ -6051,21 +6024,12 @@ function showOpenInTelegramState(msg) {
   out.appendChild(box);
 }
 
-function parseMiniTokenStartParam(raw) {
-  const v = String(raw || "").trim();
-  if (!v) return "";
-  try {
-    const qp = new URLSearchParams(v);
-    const t = String(qp.get("miniToken") || qp.get("token") || "").trim();
-    if (t) return t;
-  } catch {}
-  const m = v.match(/(?:^|[?&])(?:miniToken|token)=([^&]+)/i);
-  if (m?.[1]) {
-    try { return decodeURIComponent(m[1]).trim(); } catch { return String(m[1] || "").trim(); }
-  }
-  if (/^[a-f0-9]{24,96}$/i.test(v)) return v;
-  return "";
+function isTelegramLikelyContext() {
+  const ua = String(navigator.userAgent || "").toLowerCase();
+  const hasTgData = !!(window.Telegram || getParamEverywhere("tgWebAppData") || getParamEverywhere("tgWebAppVersion"));
+  return ua.includes("telegram") || hasTgData;
 }
+
 
 function getParamEverywhere(name) {
   const n = String(name || "").trim();
@@ -6793,14 +6757,6 @@ async function boot(){
   const maybeTelegram = isTelegramRuntime || isTelegramLikelyContext();
   const qsInitData = getParamEverywhere("initData") || "";
   const savedInitData = localStorage.getItem(LOCAL_KEYS.initData) || "";
-  const qsMiniToken = getParamEverywhere("miniToken") || getParamEverywhere("token") || "";
-  const startParamToken = parseMiniTokenStartParam(tg?.initDataUnsafe?.start_param || "");
-  const savedMiniToken = localStorage.getItem(LOCAL_KEYS.miniToken) || "";
-  const resolvedMiniToken = qsMiniToken || startParamToken || savedMiniToken || "";
-  if (resolvedMiniToken) {
-    MINI_TOKEN = resolvedMiniToken;
-    try { localStorage.setItem(LOCAL_KEYS.miniToken, resolvedMiniToken); } catch {}
-  }
   let initData = (tg?.initData || "").trim();
 
   // Telegram WebApp may populate initData with a slight delay.
@@ -6837,13 +6793,15 @@ async function boot(){
   }
   let {status, json} = await api("/api/user", buildAuthBody({ allowGuest: true }));
 
-  if (!json?.ok && status === 401 && (MINI_TOKEN || localStorage.getItem(LOCAL_KEYS.miniToken))) {
-    const initBackup = INIT_DATA;
-    INIT_DATA = "";
-    const retry = await api("/api/user", buildAuthBody({ allowGuest: true }));
-    status = retry.status;
-    json = retry.json;
-    if (!json?.ok) INIT_DATA = initBackup;
+
+  if (!json?.ok && status === 401 && isTelegramRuntime && tg?.initData && !INIT_DATA) {
+    INIT_DATA = tg.initData.trim();
+    if (INIT_DATA) {
+      try { localStorage.setItem(LOCAL_KEYS.initData, INIT_DATA); } catch {}
+      const retryTg = await api("/api/user", buildAuthBody({ allowGuest: true }));
+      status = retryTg.status;
+      json = retryTg.json;
+    }
   }
 
   if (!json?.ok && status === 401 && isTelegramRuntime && tg?.initData && !INIT_DATA) {
@@ -6900,10 +6858,6 @@ async function boot(){
 }
 
   OFFLINE_MODE = false;
-  if (json?.miniToken) {
-    MINI_TOKEN = String(json.miniToken || "").trim();
-    try { localStorage.setItem(LOCAL_KEYS.miniToken, MINI_TOKEN); } catch {}
-  }
   cacheUserSnapshot(json);
   applyUserState(json);
   out.textContent = "آماده ✅";
