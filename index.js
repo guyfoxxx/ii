@@ -5772,6 +5772,11 @@ const reportBlock = document.getElementById("reportBlock");
 const roleLabel = document.getElementById("roleLabel");
 const energyToday = document.getElementById("energyToday");
 const remainingAnalyses = document.getElementById("remainingAnalyses");
+const energyText = document.getElementById("energyText");
+const remainingText = document.getElementById("remainingText");
+const energyFill = document.getElementById("energyFill");
+const offerMedia = document.getElementById("offerMedia");
+const offerImg = document.getElementById("offerImg");
 
 function el(id){ return document.getElementById(id); }
 function val(id){ return el(id).value; }
@@ -6170,23 +6175,6 @@ function pickTicketReplyTemplate(){
 }
 
 function updateMeta(state, quota){
-  const q = String(quota || "-");
-  let energy = "—";
-  let remainTxt = "∞";
-  const m = q.match(/^(\d+)\/(\d+)$/);
-  if (m) {
-    const used = Number(m[1] || 0);
-    const lim = Math.max(1, Number(m[2] || 1));
-    const remain = Math.max(0, lim - used);
-    const pct = Math.max(0, Math.min(100, Math.round((remain / lim) * 100)));
-    energy = pct + "%";
-    remainTxt = String(remain);
-  } else if (q === "∞") {
-    energy = "100%";
-    remainTxt = "∞";
-  }
-  meta.textContent = "انرژی: " + energy + " | تحلیل باقی‌مانده: " + remainTxt + " | سهمیه: " + q;
-  sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
   const q = String(quota || "");
   const m = q.match(/(\d+)\s*\/\s*(\d+)/);
   let used = 0;
@@ -6197,6 +6185,10 @@ function updateMeta(state, quota){
   }
   const remaining = Math.max(0, limit - used);
   const pct = limit > 0 ? Math.max(0, Math.min(100, Math.round((remaining / limit) * 100))) : 100;
+  const energy = q === "∞" ? "100%" : (limit > 0 ? (pct + "%") : "—");
+  const remainTxt = q === "∞" ? "∞" : (limit > 0 ? String(remaining) : "—");
+  meta.textContent = "انرژی: " + energy + " | تحلیل باقی‌مانده: " + remainTxt + " | سهمیه: " + (q || "-");
+  sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
   if (remainingText) remainingText.textContent = "تحلیل باقی‌مانده: " + (limit > 0 ? String(remaining) : "∞");
   if (energyText) energyText.textContent = "انرژی: " + (limit > 0 ? (pct + "%") : "نامحدود");
   if (energyFill) energyFill.style.width = (limit > 0 ? pct : 100) + "%";
@@ -6804,18 +6796,28 @@ el("analyze").addEventListener("click", async () => {
   if (chartCard && chartImg) {
       const u = json.chartUrl || "";
       const fallbackSvg = json.zonesSvg || "";
-      if (fallbackSvg) {
-        renderChartFallbackSvg(fallbackSvg);
-      } else if (u) {
+      const tf = val("timeframe") || json?.state?.timeframe || "H4";
+      const symbol = val("symbol") || "";
+      if (u) {
         chartImg.onerror = () => {
           chartImg.onerror = null;
+          if (fallbackSvg) {
+            renderChartFallbackSvg(fallbackSvg);
+            const cm = el("chartMeta");
+            if (cm) cm.textContent = "زون تحلیل + " + symbol + " (" + tf + ")";
+            return;
+          }
           chartImg.removeAttribute("src");
           chartCard.style.display = "none";
         };
         chartImg.src = u;
         chartCard.style.display = "block";
         const cm = el("chartMeta");
-        if (cm) cm.textContent = "QuickChart";
+        if (cm) cm.textContent = "کندل " + symbol + " (" + tf + ") + زون تحلیل";
+      } else if (fallbackSvg) {
+        renderChartFallbackSvg(fallbackSvg);
+        const cm = el("chartMeta");
+        if (cm) cm.textContent = "زون تحلیل (fallback)";
       } else {
         chartImg.removeAttribute("src");
         chartCard.style.display = "none";
