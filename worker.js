@@ -575,7 +575,7 @@ ${text}`);
           status: "pending",
           createdAt: new Date().toISOString(),
           source: "user_txid",
-          planName: String(body.planName || "marketi1 PRO"),
+          planName: String(body.planName || "marketIQ PRO"),
           network: String(body.network || "BEP20"),
           currency: "USDT",
         };
@@ -1114,37 +1114,28 @@ News mode:
  * Users choose st.style (Persian labels) and we inject a style-specific guide
  * into the analysis prompt. Admin can still override the global base prompt via KV.
  */
+const UNIFIED_STYLE_PROMPT = `پرامپت پایه تحلیل (مشترک برای همه سبک‌ها):
+- خروجی فقط فارسی، مرحله‌به‌مرحله، کوتاه و اجرایی باشد.
+- تحلیل باید فقط بر اساس داده موجود انجام شود و در نبود داده عبارت «نامشخص از داده» بیاید.
+- ساختار خروجی اجباری: بایاس HTF، ساختار بازار/نقدینگی، نواحی کلیدی، سناریوهای ورود، مدیریت ریسک، نقطه ابطال.
+- هر سناریو باید Entry، Stop Loss، TP1، TP2 و نسبت ریسک به ریوارد را داشته باشد.
+- خروجی قطعی خرید/فروش نده؛ سناریومحور و شرطی بنویس.
+
+ترکیب روش‌ها (بدون تعارض):
+1) Price Action: HH/HL/LH/LL، BOS/MSS، رفتار کندلی معتبر.
+2) ICT/SMC: نقدینگی Buy-side/Sell-side، Sweep، FVG/OB، Premium/Discount.
+3) ATR: سنجش نوسان، SL/TP پویا با ATR، فیلتر شرایط پرریسک.
+
+تطبیق با STYLE_MODE:
+- اگر STYLE_MODE=پرایس اکشن: وزن اصلی با ساختار و کندل.
+- اگر STYLE_MODE=ICT: وزن اصلی با نقدینگی و PD Array.
+- اگر STYLE_MODE=ATR: وزن اصلی با نوسان و مدیریت پوزیشن.
+- اگر STYLE_MODE=ترکیبی: از هر سه، به‌صورت خلاصه و بدون تکرار استفاده کن.`;
+
 const STYLE_PROMPTS_DEFAULT = {
-  "پرایس اکشن": `You are a professional Price Action market analyst. Use PURE price action only; indicators are forbidden unless explicitly requested.
-Output must be clear, step-by-step, execution-focused.
-Your analysis MUST include these labeled sections:
-1) Market Structure: trend (up/down/range), label HH/HL/LH/LL, and state (Intact / BOS / MSS).
-2) Key Levels: strong support zones, strong resistance zones, flip zones, psychological levels if relevant.
-3) Candlestick Behavior: pin bar / engulfing / inside bar; explain buyer vs seller intent.
-4) Entry Scenarios: entry zone, structure-based SL, TP1 & TP2, minimum R:R 1:2.
-5) Bias & Scenarios: main bias + alternative scenario with invalidation.
-6) Execution Plan: continuation vs reversal; required confirmation before entry.
-Avoid overtrading; only high-probability setups.`,
-  "ICT": `You are an ICT (Inner Circle Trader) & Smart Money Concepts analyst. Use ICT/SMC concepts ONLY. No indicators. No retail concepts.
-Provide a professional, precise, educational, step-by-step analysis.
-Required sections:
-1) Higher Timeframe Bias (Daily/H4): bias, premium/discount, equilibrium (50%), imbalance vs balance.
-2) Liquidity Mapping: EQH/EQL, buy-side/sell-side liquidity, stop-loss pools; where price is likely engineered.
-3) Market Structure: BOS and MSS/CHoCH; explain manipulation vs expansion.
-4) PD Arrays: bullish/bearish order blocks, FVG, liquidity voids, PDH/PDL, PWH/PWL.
-5) Kill Zones (intraday only): London/NY; explain timing.
-6) Entry Model: (e.g., sweep→MSS→FVG or sweep→OB); include entry, SL, liquidity-based targets, invalidation.
-7) Narrative: who is trapped, where smart money entered, where price is likely going.`,
-  "ATR": `You are a quantitative trading assistant focused on ATR-based volatility trading.
-Use ATR for risk and target sizing. Also consider price structure for entries.
-Required sections:
-1) Volatility State: current ATR value, compare to historical average, expansion vs contraction.
-2) Market Condition: trending vs ranging; breakout vs mean-reversion suitability.
-3) Trade Setup: structure-based entry; SL = Entry ± (ATR × multiplier); TP1/TP2 based on ATR expansion.
-4) Position Sizing: risk% and size based on SL distance.
-5) Trade Filtering: when NOT to trade; high-risk volatility conditions (news/spikes).
-6) Risk Management: max daily loss, max consecutive losses, ATR trailing stop logic.
-7) Summary: statistical justification, expected duration, risk classification.`,
+  "پرایس اکشن": UNIFIED_STYLE_PROMPT,
+  "ICT": UNIFIED_STYLE_PROMPT,
+  "ATR": UNIFIED_STYLE_PROMPT,
 };
 
 function normalizeStyleLabel(style) {
@@ -3513,7 +3504,7 @@ async function handleUpdate(update, env) {
         `➕ واریز (BEP20)
 
 ` +
-        `پلن: marketi1 PRO | با ارزش: ۲۵ USDT
+        `پلن: marketIQ PRO | با ارزش: ۲۵ USDT
 
 ` +
         (wallet ? `آدرس ولت:
@@ -3551,7 +3542,7 @@ Memo/Tag: ${memo}
         `🤝 دعوت دوستان
 
 ` +
-        `امتیاز شما: ${pts} | دعوت موفق: ${inv} | کمیسیون قابل برداشت: ${com} USDT
+        `دعوت موفق: ${inv} | امتیاز شما: ${pts} | کمیسیون قابل برداشت: ${com} USDT
 
 ` +
         `🔗 لینک رفرال اختصاصی: <a href="${escapeHtml(link)}">باز کردن لینک دعوت</a>
@@ -4144,14 +4135,14 @@ async function sendPostOnboardingNudge(env, chatId, st) {
       `🚀 آماده‌ای شروع کنیم؟
 
 ` +
-      `🎁 یه نمونه تحلیل خیلی کوتاه (برای اینکه ببینی خروجی چه شکلیه):
+      `🎁 یه نمونه تحلیل خیلی کوتاه متناسب با پروفایل خودت (برای اینکه ببینی خروجی چه شکلیه):
 ` +
       `نماد: ${symbol} | تایم‌فریم: ${tf} | سبک: ${st.style || "—"}
 ` +
       `${teaser}
 
 ` +
-      `حالا از منوی «📈 تحلیل» نماد دلخواهت رو انتخاب کن، یا یه عکس چارت بفرست تا تحلیل کامل بگیر ✅`;
+      `اگر این سبک خروجی برات مفیده، از منوی «📈 تحلیل» نماد دلخواهت رو انتخاب کن یا یه عکس چارت بفرست تا تحلیل کامل و شخصی‌سازی‌شده بگیری ✅`;
 
     await tgSendMessage(env, chatId, msg, mainMenuKeyboard(env));
   } catch (e) {
@@ -5127,7 +5118,7 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
         <div class="card-b">
           <div class="mini-list">
-            <div>پلن: <b id="planName">marketi1 PRO</b> — با ارزش <b id="planPrice">۲۵</b> USDT (<span id="planNetwork">BEP20</span>)</div>
+            <div>پلن: <b id="planName">marketIQ PRO</b> — با ارزش <b id="planPrice">۲۵</b> USDT (<span id="planNetwork">BEP20</span>)</div>
             <div>وضعیت اشتراک: <span id="subStatus">—</span></div>
             <div>انقضا: <span id="subExpiry">—</span></div>
             <div>موجودی قابل برداشت (کمیسیون): <b id="commissionBalanceTxt">0</b> USDT</div>
@@ -5178,8 +5169,8 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
         <div class="card-b">
           <div class="mini-list">
-            <div>امتیاز شما: <b id="refPointsTxt">0</b></div>
             <div>دعوت موفق: <b id="refInvitesTxt">0</b></div>
+            <div>امتیاز شما: <b id="refPointsTxt">0</b></div>
             <div>کمیسیون قابل برداشت: <b id="refCommissionTxt">0</b> USDT</div>
           </div>
 
@@ -5191,7 +5182,7 @@ const MINI_APP_HTML = `<!doctype html>
               <button id="shareRefLink" class="btn ghost">ارسال سریع</button>
             </div>
             <div class="muted" style="font-size:12px; line-height:1.7;">
-              با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتباز بدست می اورید • در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید
+              با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتباز بدست می اورید در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید
             </div>
           </div>
         </div>
@@ -5752,7 +5743,7 @@ function shortHash(h){
   return s.slice(0, 10) + "…" + s.slice(-6);
 }
 function applyWalletInviteFromState(json){
-  if (el("planName")) el("planName").textContent = "marketi1 PRO";
+  if (el("planName")) el("planName").textContent = "marketIQ PRO";
   if (el("planPrice")) el("planPrice").textContent = "25";
   if (el("planNetwork")) el("planNetwork").textContent = "BEP20";
 
@@ -6807,7 +6798,7 @@ el("submitDeposit")?.addEventListener("click", async () => {
   const amount = (Number.isFinite(amt) && amt > 0) ? amt : 25;
 
   if (!txid) { showToast("نیاز به TxID", "TxID رو وارد کن", "DEPOSIT", false); return; }
-  const { status, json } = await api("/api/wallet/deposit/notify", { initData: INIT_DATA, txid: txid, amount: amount, network: "BEP20", planName: "marketi1 PRO" });
+  const { status, json } = await api("/api/wallet/deposit/notify", { initData: INIT_DATA, txid: txid, amount: amount, network: "BEP20", planName: "marketIQ PRO" });
   if (!json?.ok) { showToast("خطا", prettyErr(json, status), "DEPOSIT", false); return; }
   el("depositTxId").value = "";
   showToast("ثبت شد ✅", "واریز ثبت شد و بعد از بررسی تایید می‌شه", "DEPOSIT", false);
