@@ -5074,6 +5074,18 @@ let NEWS_TIMER = null;
 
 const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
 
+function extractInitDataFromUrl() {
+  const q = new URLSearchParams(window.location.search || "");
+  const h = new URLSearchParams((window.location.hash || "").replace(/^#/, ""));
+  return (
+    q.get("initData") ||
+    q.get("tgWebAppData") ||
+    h.get("initData") ||
+    h.get("tgWebAppData") ||
+    ""
+  );
+}
+
 function showToast(title, subline = "", badge = "", loading = false){
   if (!toast || !toastT || !toastS || !toastB || !spin) return;
   toastT.textContent = title || "";
@@ -5570,7 +5582,12 @@ async function boot(){
   pillTxt.textContent = "Connecting…";
   showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
 
-  const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
+  try {
+    if (tg?.expand) tg.expand();
+    if (tg?.setHeaderColor) tg.setHeaderColor("secondary_bg_color");
+  } catch {}
+
+  const qsInitData = extractInitDataFromUrl();
   const savedInitData = localStorage.getItem("miniapp_init_data") || "";
   const initData = tg?.initData || qsInitData || savedInitData;
   if (!initData) {
@@ -5683,7 +5700,7 @@ el("save").addEventListener("click", async () => {
   showToast("در حال ذخیره…", "تنظیمات ذخیره می‌شود", "SET", true);
   out.textContent = "⏳ ذخیره تنظیمات…";
 
-  const initData = tg?.initData || "";
+  const initData = INIT_DATA || tg?.initData || "";
   const payload = {
     initData,
     timeframe: val("timeframe"),
@@ -5710,7 +5727,7 @@ el("analyze").addEventListener("click", async () => {
   showToast("در حال تحلیل…", "جمع‌آوری دیتا + تولید خروجی", "AI", true);
   out.textContent = "⏳ در حال تحلیل…";
 
-  const initData = tg?.initData || "";
+  const initData = INIT_DATA || tg?.initData || "";
   const payload = { initData, symbol: val("symbol"), userPrompt: "" };
 
   const {status, json} = await api("/api/analyze", payload);
