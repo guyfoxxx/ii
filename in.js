@@ -641,6 +641,17 @@ TxID: ${txid}
         }
 
         if (!Array.isArray(candles) || candles.length === 0) {
+          if (Array.isArray(levels) && levels.length) {
+            const svg = buildLevelsOnlySvg(symbol, tf, levels);
+            return new Response(svg, {
+              status: 200,
+              headers: {
+                "Content-Type": "image/svg+xml; charset=utf-8",
+                "Cache-Control": "public, max-age=30",
+                "X-Chart-Fallback": "levels_only_svg",
+              },
+            });
+          }
           return jsonResponse({ ok: false, error: "no_market_data" }, 404);
         }
 
@@ -5999,7 +6010,11 @@ async function api(path, body){
       await new Promise((res) => setTimeout(res, 350 * (i + 1)));
     }
   }
-  return { status: 599, json: { ok: false, error: String(lastErr?.message || lastErr || "network_error") } };
+  const errText = String(lastErr?.message || lastErr || "network_error");
+  const normalized = errText.toLowerCase().includes("timeout") || errText.toLowerCase().includes("abort")
+    ? "request_timeout"
+    : errText;
+  return { status: 599, json: { ok: false, error: normalized } };
 }
 
 async function adminApi(path, body){
