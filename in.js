@@ -25,14 +25,20 @@ export default {
       if (url.pathname === "/api/user" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+        const v = await verifyMiniappAuth(body, env);
+        if (!v.ok) {
+          if (miniappGuestEnabled(env)) {
+            return jsonResponse(await buildMiniappGuestPayload(env));
+          }
+          return jsonResponse({ ok: false, error: v.reason }, 401);
+        }
 
         const st = await ensureUser(v.userId, env);
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
         const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
         const styles = await getStyleList(env);
         const offerBanner = await getOfferBanner(env);
+        const offerBannerImage = await getOfferBannerImage(env);
         const customPrompts = await getCustomPrompts(env);
         const role = isOwner(v.fromLike, env) ? "owner" : (isAdmin(v.fromLike, env) ? "admin" : "user");
 
@@ -44,10 +50,17 @@ export default {
           symbols,
           styles,
           offerBanner,
+          offerBannerImage,
           customPrompts,
           role,
           isStaff: role !== "user",
           wallet: (await getWallet(env)) || "",
+          locale: {
+            language: st.profile?.language || "fa",
+            countryCode: st.profile?.countryCode || "IR",
+            timezone: st.profile?.timezone || "Asia/Tehran",
+            entrySource: st.profile?.entrySource || "",
+          },
         });
       }
 
@@ -55,7 +68,7 @@ export default {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+        const v = await verifyMiniappAuth(body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -89,6 +102,8 @@ export default {
           const id = body.customPromptId.trim();
           st.customPromptId = prompts.find((p) => String(p?.id || "") === id) ? id : "";
         }
+        if (typeof body.language === "string") st.profile.language = String(body.language || "").trim() || st.profile.language;
+        if (typeof body.timezone === "string") st.profile.timezone = String(body.timezone || "").trim() || st.profile.timezone;
 
         if (env.BOT_KV) await saveUser(v.userId, st, env);
 
@@ -105,11 +120,12 @@ export default {
         if (!isStaff(v.fromLike, env)) return jsonResponse({ ok: false, error: "forbidden" }, 403);
 
         if (url.pathname === "/api/admin/bootstrap") {
-          const [prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals, tickets, adminFlags, welcomeBot, welcomeMiniapp] = await Promise.all([
+          const [prompt, styles, commission, offerBanner, offerBannerImage, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals, tickets, adminFlags, welcomeBot, welcomeMiniapp] = await Promise.all([
             getAnalysisPrompt(env),
             getStyleList(env),
             getCommissionSettings(env),
             getOfferBanner(env),
+            getOfferBannerImage(env),
             listPayments(env, 25),
             getStylePromptMap(env),
             getCustomPrompts(env),
@@ -120,7 +136,7 @@ export default {
             getBotWelcomeText(env),
             getMiniappWelcomeText(env),
           ]);
-          return jsonResponse({ ok: true, prompt, styles, commission, offerBanner, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals, tickets, adminFlags, welcomeBot, welcomeMiniapp });
+          return jsonResponse({ ok: true, prompt, styles, commission, offerBanner, offerBannerImage, payments, stylePrompts, customPrompts, freeDailyLimit, withdrawals, tickets, adminFlags, welcomeBot, welcomeMiniapp });
         }
 
         if (url.pathname === "/api/admin/welcome") {
@@ -240,9 +256,16 @@ ${reply}`;
 
         if (url.pathname === "/api/admin/offer") {
           if (typeof body.offerBanner === "string" && env.BOT_KV) {
-            await setOfferBanner(env, body.offerBanner);
+            await setOfferBannerSafe(env, body.offerBanner);
           }
-          return jsonResponse({ ok: true, offerBanner: await getOfferBanner(env) });
+          if (env.BOT_KV) {
+            if (typeof body.offerBannerImage === "string") {
+              await setOfferBannerImage(env, body.offerBannerImage);
+            } else if (body.clearOfferBannerImage) {
+              await setOfferBannerImage(env, "");
+            }
+          }
+          return jsonResponse({ ok: true, offerBanner: await getOfferBanner(env), offerBannerImage: await getOfferBannerImage(env) });
         }
 
         if (url.pathname === "/api/admin/commissions") {
@@ -468,7 +491,8 @@ ${reply}`;
           if (st.referral?.referredBy) {
             const inviter = await ensureUser(String(st.referral.referredBy), env);
             const commission = await getCommissionSettings(env);
-            const pct = resolveCommissionPercent(inviter.profile?.username, commission);
+            const pctRaw = resolveCommissionPercent(inviter.profile?.username, commission);
+            const pct = Math.max(10, Number.isFinite(Number(pctRaw)) ? Number(pctRaw) : 0);
             const reward = pct > 0 ? Math.round((amount * pct) * 100) / 100 : 0;
             inviter.referral.commissionTotal = (inviter.referral.commissionTotal || 0) + reward;
             inviter.referral.commissionBalance = (inviter.referral.commissionBalance || 0) + reward;
@@ -573,7 +597,7 @@ ${reply}`;
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+        const v = await verifyMiniappAuth(body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
@@ -670,6 +694,17 @@ TxID: ${txid}
         }
 
         if (!Array.isArray(candles) || candles.length === 0) {
+          if (Array.isArray(levels) && levels.length) {
+            const svg = buildLevelsOnlySvg(symbol, tf, levels);
+            return new Response(svg, {
+              status: 200,
+              headers: {
+                "Content-Type": "image/svg+xml; charset=utf-8",
+                "Cache-Control": "public, max-age=30",
+                "X-Chart-Fallback": "levels_only_svg",
+              },
+            });
+          }
           return jsonResponse({ ok: false, error: "no_market_data" }, 404);
         }
 
@@ -703,13 +738,18 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+        const v = await verifyMiniappAuth(body, env);
+        const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
+        if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
-        const st = await ensureUser(v.userId, env);
+        const st = v.ok ? await ensureUser(v.userId, env) : defaultUser("guest");
         const symbol = String(body.symbol || "").trim();
         const tf = String(body.timeframe || st.timeframe || "H4").toUpperCase();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
+
+        const quoteRespKey = `quote|${symbol}|${tf}`;
+        const quoteCachedResp = apiRespCacheGet(quoteRespKey);
+        if (quoteCachedResp) return jsonResponse(quoteCachedResp);
 
         let candles = [];
         try {
@@ -733,7 +773,7 @@ TxID: ${txid}
         const status = cp > 0.08 ? "up" : (cp < -0.08 ? "down" : "flat");
         const quality = candles.length >= minCandlesForTimeframe(tf) ? "full" : "limited";
 
-        return jsonResponse({
+        const quotePayload = {
           ok: true,
           symbol,
           timeframe: tf,
@@ -746,22 +786,30 @@ TxID: ${txid}
           candles: candles.length,
           quality,
           status,
-        });
+        };
+        apiRespCacheSet(quoteRespKey, quotePayload, Number(env.QUOTE_RESPONSE_CACHE_MS || 10000));
+        return jsonResponse(quotePayload);
       }
 
       if (url.pathname === "/api/news" && request.method === "POST") {
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+        const v = await verifyMiniappAuth(body, env);
+        const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
+        if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const symbol = String(body.symbol || "").trim().toUpperCase();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
 
+        const newsRespKey = `news|${symbol}`;
+        const newsCachedResp = apiRespCacheGet(newsRespKey);
+        if (newsCachedResp) return jsonResponse(newsCachedResp);
         try {
           const articles = await fetchSymbolNewsFa(symbol, env);
-          return jsonResponse({ ok: true, symbol, articles, count: articles.length });
+          const payload = { ok: true, symbol, articles, count: articles.length };
+          apiRespCacheSet(newsRespKey, payload, Number(env.NEWS_RESPONSE_CACHE_MS || 30000));
+          return jsonResponse(payload);
         } catch (e) {
           console.error("api/news failed:", e?.message || e);
           return jsonResponse({ ok: false, error: "news_unavailable", symbol, articles: [] }, 502);
@@ -772,16 +820,22 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
-        if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
+        const v = await verifyMiniappAuth(body, env);
+        const allowGuest = miniappGuestEnabled(env) && !v.ok && !!body.allowGuest;
+        if (!v.ok && !allowGuest) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const symbol = String(body.symbol || "").trim().toUpperCase();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
 
+        const newsAnRespKey = `news_an|${symbol}`;
+        const newsAnCachedResp = apiRespCacheGet(newsAnRespKey);
+        if (newsAnCachedResp) return jsonResponse(newsAnCachedResp);
         try {
           const articles = await fetchSymbolNewsFa(symbol, env);
           const summary = await buildNewsAnalysisSummary(symbol, articles, env);
-          return jsonResponse({ ok: true, symbol, summary, articles, count: articles.length });
+          const payload = { ok: true, symbol, summary, articles, count: articles.length };
+          apiRespCacheSet(newsAnRespKey, payload, Number(env.NEWS_ANALYSIS_RESPONSE_CACHE_MS || 45000));
+          return jsonResponse(payload);
         } catch (e) {
           console.error("api/news/analyze failed:", e?.message || e);
           return jsonResponse({ ok: false, error: "news_analysis_unavailable", symbol, summary: "", articles: [] }, 502);
@@ -791,15 +845,16 @@ TxID: ${txid}
         const body = await request.json().catch(() => null);
         if (!body) return jsonResponse({ ok: false, error: "bad_json" }, 400);
 
-        const v = await verifyTelegramInitData(body.initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+        const v = await verifyMiniappAuth(body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
         const st = await ensureUser(v.userId, env);
         const symbol = String(body.symbol || "").trim();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
 
-        // must complete onboarding before using AI analysis (name+contact at least)
-        if (!st.profile?.name || !st.profile?.phone) {
+        // lightweight onboarding gate for mini-app: block only if absolutely no identity fields exist
+        const hasAnyIdentity = !!(st.profile?.name || st.profile?.phone || st.profile?.username || v.fromLike?.username);
+        if (!hasAnyIdentity) {
           return jsonResponse({ ok: false, error: "onboarding_required" }, 403);
         }
 
@@ -829,9 +884,9 @@ TxID: ${txid}
           try {
             if (String(env.QUICKCHART || "") !== "0") {
               const tf = st.timeframe || "H4";
-              levels = extractLevels(result);
-              const origin = new URL(request.url).origin;
               const candles = await getMarketCandlesWithFallback(env, symbol, tf).catch(() => []);
+              levels = refineLevelsByCandles(extractLevels(result), candles);
+              const origin = new URL(request.url).origin;
               if (Array.isArray(candles) && candles.length) {
                 chartUrl = `${origin}/api/chart?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&levels=${encodeURIComponent(levels.join(","))}`;
                 quickChartSpec = buildQuickChartSpec(candles, symbol, tf, levels);
@@ -958,6 +1013,9 @@ const BTN = {
   BACK: "⬅️ برگشت",
   HOME: "🏠 منوی اصلی",
   MINIAPP: "🧩 مینی‌اپ",
+  QUOTE: "💹 قیمت لحظه‌ای",
+  NEWS: "📰 اخبار نماد",
+  NEWS_ANALYSIS: "🧠 تحلیل خبر",
 
   WALLET: "💳 ولت",
   WALLET_BALANCE: "💰 موجودی",
@@ -1016,25 +1074,96 @@ function normHandle(h) {
   return "@" + String(h).replace(/^@/, "").toLowerCase();
 }
 
+function inferLocaleByPhone(phone) {
+  const p = String(phone || "").replace(/[^+\d]/g, "");
+  const map = [
+    { prefix: "+98", country: "IR", lang: "fa", tz: "Asia/Tehran" },
+    { prefix: "+971", country: "AE", lang: "ar", tz: "Asia/Dubai" },
+    { prefix: "+90", country: "TR", lang: "tr", tz: "Europe/Istanbul" },
+    { prefix: "+7", country: "RU", lang: "ru", tz: "Europe/Moscow" },
+    { prefix: "+44", country: "GB", lang: "en", tz: "Europe/London" },
+    { prefix: "+1", country: "US", lang: "en", tz: "America/New_York" },
+  ];
+  for (const x of map) if (p.startsWith(x.prefix)) return x;
+  if (p.startsWith("09") || p.startsWith("98")) return { country: "IR", lang: "fa", tz: "Asia/Tehran" };
+  return { country: "INT", lang: "en", tz: "UTC" };
+}
+
+function applyLocaleDefaults(st) {
+  const loc = inferLocaleByPhone(st?.profile?.phone || "");
+  st.profile = st.profile || {};
+  st.profile.language = st.profile.language || loc.lang;
+  st.profile.countryCode = st.profile.countryCode || loc.country;
+  st.profile.timezone = st.profile.timezone || loc.tz;
+
+  if (!st.timeframe) st.timeframe = (loc.country === "IR" ? "H1" : "H4");
+  if (!st.risk) st.risk = "متوسط";
+  if (!st.style) st.style = "پرایس اکشن";
+  if (st.profile.preferredStyle && ALLOWED_STYLE_LIST.includes(st.profile.preferredStyle)) {
+    st.style = st.profile.preferredStyle;
+  }
+  if (typeof st.newsEnabled !== "boolean") st.newsEnabled = true;
+  if (!st.promptMode) st.promptMode = "style_plus_custom";
+  return st;
+}
+
+async function finalizeOnboardingRewards(env, st) {
+  if (!st?.profile?.onboardingDone) return;
+  if (!st?.referral?.referredBy || !st?.referral?.referredByCode) return;
+  if (st?.referral?.onboardingRewardDone) return;
+
+  const phone = st.profile?.phone || "";
+  if (!phone) return;
+  const isNew = await isPhoneNew(env, phone);
+  await markPhoneSeen(env, phone, st.userId);
+  if (!isNew) {
+    st.referral.onboardingRewardDone = true;
+    st.referral.onboardingRewardAt = new Date().toISOString();
+    return;
+  }
+
+  const inviterId = String(st.referral.referredBy);
+  const inviter = await ensureUser(inviterId, env);
+  inviter.referral.successfulInvites = (inviter.referral.successfulInvites || 0) + 1;
+  inviter.referral.points = (inviter.referral.points || 0) + 3;
+  if (inviter.referral.points >= 500) {
+    inviter.referral.points -= 500;
+    inviter.subscription.active = true;
+    inviter.subscription.type = "gift";
+    inviter.subscription.dailyLimit = 50;
+    inviter.subscription.expiresAt = futureISO(30);
+  }
+  await saveUser(inviterId, inviter, env);
+
+  st.referral.onboardingRewardDone = true;
+  st.referral.onboardingRewardAt = new Date().toISOString();
+}
+
 function isStaff(from, env) {
   // staff = admin or owner
   return isOwner(from, env) || isAdmin(from, env);
 }
 
 function isOwner(from, env) {
+  const uid = String(from?.userId || from?.id || "").trim();
+  const ownerIds = String(env.OWNER_USER_IDS || env.OWNER_IDS || "").split(",").map((x) => String(x || "").trim()).filter(Boolean);
+  if (uid && ownerIds.includes(uid)) return true;
+
   const u = normHandle(from?.username);
-  if (!u) return false;
   const raw = (env.OWNER_HANDLES || "").toString().trim();
-  if (!raw) return false;
+  if (!u || !raw) return false;
   const set = new Set(raw.split(",").map(normHandle).filter(Boolean));
   return set.has(u);
 }
 
 function isAdmin(from, env) {
+  const uid = String(from?.userId || from?.id || "").trim();
+  const adminIds = String(env.ADMIN_USER_IDS || env.ADMIN_IDS || "").split(",").map((x) => String(x || "").trim()).filter(Boolean);
+  if (uid && adminIds.includes(uid)) return true;
+
   const u = normHandle(from?.username);
-  if (!u) return false;
   const raw = (env.ADMIN_HANDLES || "").toString().trim();
-  if (!raw) return false;
+  if (!u || !raw) return false;
   const set = new Set(raw.split(",").map(normHandle).filter(Boolean));
   return set.has(u);
 }
@@ -1079,6 +1208,36 @@ function randomCode(len = 10) {
 
 const MARKET_CACHE = new Map();
 const ANALYSIS_CACHE = new Map();
+const PROVIDER_COOLDOWNS = new Map();
+
+function providerCooldownMs(env) {
+  return Math.max(1000, Number(env?.PROVIDER_COOLDOWN_MS || 45000));
+}
+
+function providerCooldownKey(kind, provider) {
+  return `${String(kind || "generic").toLowerCase()}:${String(provider || "").toLowerCase()}`;
+}
+
+function providerInCooldown(provider, env, kind = "generic") {
+  const key = providerCooldownKey(kind, provider);
+  const until = Number(PROVIDER_COOLDOWNS.get(key) || 0);
+  if (!Number.isFinite(until) || until <= 0) return false;
+  if (Date.now() >= until) {
+    PROVIDER_COOLDOWNS.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function markProviderFailure(provider, env, kind = "generic") {
+  const key = providerCooldownKey(kind, provider);
+  PROVIDER_COOLDOWNS.set(key, Date.now() + providerCooldownMs(env));
+}
+
+function markProviderSuccess(provider, kind = "generic") {
+  const key = providerCooldownKey(kind, provider);
+  PROVIDER_COOLDOWNS.delete(key);
+}
 
 function cacheGet(map, key) {
   const hit = map.get(key);
@@ -1458,11 +1617,25 @@ async function getOfferBanner(env) {
   return (raw || env.SPECIAL_OFFER_TEXT || "").toString().trim();
 }
 
+async function getOfferBannerImage(env) {
+  if (!env.BOT_KV) return (env.SPECIAL_OFFER_IMAGE || "").toString().trim();
+  const raw = await env.BOT_KV.get("settings:offer_banner_image");
+  return (raw || env.SPECIAL_OFFER_IMAGE || "").toString().trim();
+}
+
+async function setOfferBannerImage(env, image) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put("settings:offer_banner_image", String(image || "").trim());
+}
+
 async function setOfferBanner(env, text) {
   if (!env.BOT_KV) return;
   await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
 }
 
+
+// Compatibility alias for editor diagnostics in mirrored index.js files.
+const setOfferBannerSafe = async (env, text) => setOfferBanner(env, text);
 async function getCommissionSettings(env) {
   if (!env.BOT_KV) return { globalPercent: 0, overrides: {} };
   const g = await env.BOT_KV.get("settings:commission:globalPercent");
@@ -1757,16 +1930,18 @@ function kb(rows) {
 
 function mainMenuKeyboard(env) {
   return kb([
-    [BTN.SIGNAL, BTN.SETTINGS],
-    [BTN.WALLET, BTN.PROFILE],
-    [BTN.INVITE, BTN.SUPPORT],
+    [BTN.MINIAPP, BTN.SIGNAL],
+    [BTN.QUOTE, BTN.NEWS],
+    [BTN.NEWS_ANALYSIS, BTN.SETTINGS],
+    [BTN.PROFILE, BTN.INVITE],
+    [BTN.WALLET, BTN.SUPPORT],
     [BTN.EDUCATION, BTN.LEVELING],
     [BTN.HOME],
   ]);
 }
 
 function signalMenuKeyboard() {
-  return kb([[BTN.CAT_MAJORS, BTN.CAT_METALS], [BTN.CAT_INDICES, BTN.CAT_CRYPTO], [BTN.BACK, BTN.HOME]]);
+  return kb([[BTN.CAT_MAJORS, BTN.CAT_METALS], [BTN.CAT_INDICES, BTN.CAT_CRYPTO], [BTN.QUOTE, BTN.NEWS], [BTN.BACK, BTN.HOME]]);
 }
 
 function settingsMenuKeyboard() {
@@ -1806,13 +1981,32 @@ function contactKeyboard() {
 }
 
 function getMiniappUrl(env) {
-  const u = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || "").toString().trim();
-  return u;
+  // Canonical Mini App URL (also configured in BotFather)
+  const fallback = "https://sniperim.mad-pyc.workers.dev/";
+  const u = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || fallback).toString().trim();
+  return u.endsWith("/") ? u : (u + "/");
 }
-function miniappInlineKeyboard(env) {
+async function miniappInlineKeyboard(env, st, from) {
   const url = getMiniappUrl(env);
   if (!url) return null;
-  return { inline_keyboard: [[{ text: BTN.MINIAPP, web_app: { url } }]] };
+  const token = await issueMiniappToken(env, st?.userId, from || {});
+  const finalUrl = token ? appendQuery(url, { miniToken: token }) : url;
+  return {
+    inline_keyboard: [
+      [{ text: BTN.MINIAPP, web_app: { url: finalUrl } }],
+      [{ text: "🔗 اتصال جایگزین", url: finalUrl }],
+    ],
+  };
+}
+
+function appendQuery(url, params) {
+  try {
+    const u = new URL(url);
+    Object.entries(params || {}).forEach(([k,v]) => { if (v != null && String(v) !== "") u.searchParams.set(k, String(v)); });
+    return u.toString();
+  } catch {
+    return url;
+  }
 }
 
 
@@ -1910,6 +2104,11 @@ function defaultUser(userId) {
       preferredMarket: "",
       level: "", // beginner/intermediate/pro
       levelNotes: "",
+      preferredStyle: "",
+      language: "fa",
+      countryCode: "IR",
+      timezone: "Asia/Tehran",
+      entrySource: "",
       onboardingDone: false,
       capital: 0,
       capitalCurrency: "USDT",
@@ -1930,6 +2129,8 @@ function defaultUser(userId) {
       points: 0,
       commissionTotal: 0,
       commissionBalance: 0,
+      onboardingRewardDone: false,
+      onboardingRewardAt: "",
     },
     subscription: {
       active: false,
@@ -2008,6 +2209,7 @@ async function ensureUser(userId, env, from) {
   if (from?.username) st.profile.username = String(from.username);
   if (from?.first_name) st.profile.firstName = String(from.first_name);
   if (from?.last_name) st.profile.lastName = String(from.last_name);
+  if (st.profile?.phone) applyLocaleDefaults(st);
 
   const today = kyivDateString();
   if (st.dailyDate !== today) {
@@ -2245,18 +2447,55 @@ function extractImageFileId(msg, env) {
 }
 
 /* ========================== PROVIDER CHAINS ========================== */
+
+function resolveTextProviderChain(env, orderOverride, prompt = "") {
+  const raw = orderOverride || env.TEXT_PROVIDER_ORDER;
+  const base = [...new Set(parseOrder(raw, ["cf","openai","openrouter","deepseek","gemini"]))];
+  if (base.length <= 1) return base;
+  const minuteBucket = Math.floor(Date.now() / 60000);
+  const promptSeed = String(prompt || "").slice(0, 64);
+  return rotateBySeed(base, `text|${promptSeed}|${minuteBucket}`);
+}
+
+function providerApiKey(name, env, seed = "") {
+  const key = String(name || "").toLowerCase();
+  if (key === "openai") {
+    const pool = parseApiKeyPool(env.OPENAI_API_KEY, env.OPENAI_API_KEYS);
+    return pickApiKey(pool, `openai|${seed}`);
+  }
+  if (key === "openrouter") {
+    const pool = parseApiKeyPool(env.OPENROUTER_API_KEY, env.OPENROUTER_API_KEYS);
+    return pickApiKey(pool, `openrouter|${seed}`);
+  }
+  if (key === "deepseek") {
+    const pool = parseApiKeyPool(env.DEEPSEEK_API_KEY, env.DEEPSEEK_API_KEYS);
+    return pickApiKey(pool, `deepseek|${seed}`);
+  }
+  if (key === "gemini") {
+    const pool = parseApiKeyPool(env.GEMINI_API_KEY, env.GEMINI_API_KEYS);
+    return pickApiKey(pool, `gemini|${seed}`);
+  }
+  return "";
+}
+
 async function runTextProviders(prompt, env, orderOverride) {
-  const chain = [...new Set(parseOrder(orderOverride || env.TEXT_PROVIDER_ORDER, ["cf","openai","openrouter","deepseek","gemini"]))];
+  const chain = resolveTextProviderChain(env, orderOverride, prompt);
   let lastErr = null;
   for (const p of chain) {
+    if (providerInCooldown(p, env, "text")) continue;
     try {
       const out = await Promise.race([
         textProvider(p, prompt, env),
         timeoutPromise(TIMEOUT_TEXT_MS, `text_${p}_timeout`)
       ]);
-      if (out && String(out).trim()) return String(out).trim();
+      if (out && String(out).trim()) {
+        markProviderSuccess(p, "text");
+        return String(out).trim();
+      }
+      markProviderFailure(p, env, "text");
     } catch (e) {
       lastErr = e;
+      markProviderFailure(p, env, "text");
       console.error("text provider failed:", p, e?.message || e);
     }
   }
@@ -2274,13 +2513,19 @@ async function runPolishProviders(draft, env, orderOverride) {
     `متن:\n${draft}`;
 
   for (const p of chain) {
+    if (providerInCooldown(p, env, "polish")) continue;
     try {
       const out = await Promise.race([
         textProvider(p, polishPrompt, env),
         timeoutPromise(TIMEOUT_POLISH_MS, `polish_${p}_timeout`)
       ]);
-      if (out && String(out).trim()) return String(out).trim();
+      if (out && String(out).trim()) {
+        markProviderSuccess(p, "polish");
+        return String(out).trim();
+      }
+      markProviderFailure(p, env, "polish");
     } catch (e) {
+      markProviderFailure(p, env, "polish");
       console.error("polish provider failed:", p, e?.message || e);
     }
   }
@@ -2330,11 +2575,12 @@ async function textProvider(name, prompt, env) {
   }
 
   if (name === "openai") {
-    if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY_missing");
+    const apiKey = providerApiKey("openai", env, prompt);
+    if (!apiKey) throw new Error("OPENAI_API_KEY_missing");
     const r = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -2348,11 +2594,12 @@ async function textProvider(name, prompt, env) {
   }
 
   if (name === "openrouter") {
-    if (!env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY_missing");
+    const apiKey = providerApiKey("openrouter", env, prompt);
+    if (!apiKey) throw new Error("OPENROUTER_API_KEY_missing");
     const r = await fetchWithTimeout("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -2366,11 +2613,12 @@ async function textProvider(name, prompt, env) {
   }
 
   if (name === "deepseek") {
-    if (!env.DEEPSEEK_API_KEY) throw new Error("DEEPSEEK_API_KEY_missing");
+    const apiKey = providerApiKey("deepseek", env, prompt);
+    if (!apiKey) throw new Error("DEEPSEEK_API_KEY_missing");
     const r = await fetchWithTimeout("https://api.deepseek.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${env.DEEPSEEK_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -2384,9 +2632,10 @@ async function textProvider(name, prompt, env) {
   }
 
   if (name === "gemini") {
-    if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY_missing");
+    const apiKey = providerApiKey("gemini", env, prompt);
+    if (!apiKey) throw new Error("GEMINI_API_KEY_missing");
     const r = await fetchWithTimeout(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2441,7 +2690,7 @@ async function visionProvider(name, imageUrl, visionPrompt, env, getCache, setCa
   name = String(name || "").toLowerCase();
 
   if (name === "openai") {
-    if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY_missing");
+    if (!providerApiKey("openai", env, imageUrl) && !env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY_missing");
     const body = {
       model: env.OPENAI_MODEL || "gpt-4o-mini",
       messages: [{
@@ -2456,7 +2705,7 @@ async function visionProvider(name, imageUrl, visionPrompt, env, getCache, setCa
     const r = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${providerApiKey("openai", env, imageUrl) || env.OPENAI_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
@@ -2474,11 +2723,11 @@ async function visionProvider(name, imageUrl, visionPrompt, env, getCache, setCa
   }
 
   if (name === "gemini") {
-    if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY_missing");
+    if (!providerApiKey("gemini", env, imageUrl) && !env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY_missing");
     const c = await ensureImageCache(imageUrl, env, getCache, setCache);
     if (c.tooLarge) return "";
     const r = await fetchWithTimeout(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(providerApiKey("gemini", env, imageUrl) || env.GEMINI_API_KEY || "")}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2535,18 +2784,49 @@ function assetKind(symbol) {
 function providerSupportsSymbol(provider, symbol, env) {
   const kind = assetKind(symbol);
   if (provider === "binance") return kind === "crypto";
-  if (provider === "twelvedata") return !!env.TWELVEDATA_API_KEY && ["crypto", "forex", "metal"].includes(kind);
-  if (provider === "alphavantage") return !!env.ALPHAVANTAGE_API_KEY && ["forex", "metal"].includes(kind);
-  if (provider === "finnhub") return !!env.FINNHUB_API_KEY && kind === "forex";
+  if (provider === "twelvedata") return !!(env.TWELVEDATA_API_KEY || env.TWELVEDATA_API_KEYS) && ["crypto", "forex", "metal"].includes(kind);
+  if (provider === "alphavantage") return !!(env.ALPHAVANTAGE_API_KEY || env.ALPHAVANTAGE_API_KEYS) && ["forex", "metal"].includes(kind);
+  if (provider === "finnhub") return !!(env.FINNHUB_API_KEY || env.FINNHUB_API_KEYS) && kind === "forex";
   if (provider === "yahoo") return true;
   return true;
 }
 
-function resolveMarketProviderChain(env, symbol) {
+function parseApiKeyPool(primary, many) {
+  const arr = [];
+  const one = String(primary || "").trim();
+  if (one) arr.push(one);
+  const list = String(many || "").split(",").map((x) => x.trim()).filter(Boolean);
+  for (const k of list) if (!arr.includes(k)) arr.push(k);
+  return arr;
+}
+
+function stableHashInt(s) {
+  const str = String(s || "");
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0);
+}
+
+function rotateBySeed(arr, seed) {
+  if (!Array.isArray(arr) || arr.length <= 1) return Array.isArray(arr) ? arr.slice() : [];
+  const i = stableHashInt(seed) % arr.length;
+  return arr.slice(i).concat(arr.slice(0, i));
+}
+
+function pickApiKey(pool, seed) {
+  if (!Array.isArray(pool) || !pool.length) return "";
+  return pool[stableHashInt(seed) % pool.length];
+}
+
+function resolveMarketProviderChain(env, symbol, timeframe = "H4") {
   const desired = parseOrder(env.MARKET_DATA_PROVIDER_ORDER, ["binance","twelvedata","alphavantage","finnhub","yahoo"]);
   const filtered = desired.filter((p) => providerSupportsSymbol(p, symbol, env));
-  if (filtered.length) return filtered;
-  return ["yahoo"];
+  const chain = filtered.length ? filtered : ["yahoo"];
+  const minuteBucket = Math.floor(Date.now() / 60000);
+  return rotateBySeed(chain, `${symbol}|${timeframe}|${minuteBucket}`);
 }
 
 function mapTimeframeToBinance(tf) {
@@ -2634,13 +2914,15 @@ async function fetchBinanceCandles(symbol, timeframe, limit, timeoutMs) {
 }
 
 async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) {
-  if (!env.TWELVEDATA_API_KEY) throw new Error("twelvedata_key_missing");
+  const tdPool = parseApiKeyPool(env.TWELVEDATA_API_KEY, env.TWELVEDATA_API_KEYS);
+  if (!tdPool.length) throw new Error("twelvedata_key_missing");
   const kind = assetKind(symbol);
   if (kind === "unknown") throw new Error("twelvedata_unknown_symbol");
 
   const interval = mapTimeframeToTwelve(timeframe);
   const sym = mapForexSymbolForTwelve(symbol);
-  const base = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${encodeURIComponent(env.TWELVEDATA_API_KEY)}`;
+  const tdKey = pickApiKey(tdPool, `${symbol}|${timeframe}|${Math.floor(Date.now() / 60000)}`);
+  const base = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&outputsize=${limit}&apikey=${encodeURIComponent(tdKey)}`;
   const sources = [];
   if (kind === "crypto") sources.push("binance");
   if (kind === "forex" || kind === "metal") sources.push("fx");
@@ -2674,20 +2956,22 @@ async function fetchTwelveDataCandles(symbol, timeframe, limit, timeoutMs, env) 
 }
 
 async function fetchAlphaVantageFxIntraday(symbol, timeframe, limit, timeoutMs, env) {
-  if (!env.ALPHAVANTAGE_API_KEY) throw new Error("alphavantage_key_missing");
+  const avPool = parseApiKeyPool(env.ALPHAVANTAGE_API_KEY, env.ALPHAVANTAGE_API_KEYS);
+  if (!avPool.length) throw new Error("alphavantage_key_missing");
   if (!/^[A-Z]{6}$/.test(symbol) && symbol !== "XAUUSD" && symbol !== "XAGUSD") throw new Error("alphavantage_only_fx_like");
 
   const from = symbol.slice(0,3);
   const to = symbol.slice(3,6);
   const interval = mapTimeframeToAlphaVantage(timeframe);
 
+  const avKey = pickApiKey(avPool, `${symbol}|${timeframe}|${Math.floor(Date.now() / 60000)}`);
   const url =
     `https://www.alphavantage.co/query?function=FX_INTRADAY` +
     `&from_symbol=${encodeURIComponent(from)}` +
     `&to_symbol=${encodeURIComponent(to)}` +
     `&interval=${encodeURIComponent(interval)}` +
     `&outputsize=compact` +
-    `&apikey=${encodeURIComponent(env.ALPHAVANTAGE_API_KEY)}`;
+    `&apikey=${encodeURIComponent(avKey)}`;
 
   const r = await fetchWithTimeout(url, {}, timeoutMs);
   if (!r.ok) throw new Error(`alphavantage_http_${r.status}`);
@@ -2717,7 +3001,8 @@ function mapTimeframeToFinnhubResolution(tf) {
   return m[tf] || "240";
 }
 async function fetchFinnhubForexCandles(symbol, timeframe, limit, timeoutMs, env) {
-  if (!env.FINNHUB_API_KEY) throw new Error("finnhub_key_missing");
+  const fhPool = parseApiKeyPool(env.FINNHUB_API_KEY, env.FINNHUB_API_KEYS);
+  if (!fhPool.length) throw new Error("finnhub_key_missing");
   if (!/^[A-Z]{6}$/.test(symbol)) throw new Error("finnhub_only_forex");
 
   const res = mapTimeframeToFinnhubResolution(timeframe);
@@ -2727,7 +3012,8 @@ async function fetchFinnhubForexCandles(symbol, timeframe, limit, timeoutMs, env
   const lookbackSec = 60 * 60 * 24 * 10;
   const from = now - lookbackSec;
 
-  const url = `https://finnhub.io/api/v1/forex/candle?symbol=${encodeURIComponent(inst)}&resolution=${encodeURIComponent(res)}&from=${from}&to=${now}&token=${encodeURIComponent(env.FINNHUB_API_KEY)}`;
+  const fhKey = pickApiKey(fhPool, `${symbol}|${timeframe}|${Math.floor(Date.now() / 60000)}`);
+  const url = `https://finnhub.io/api/v1/forex/candle?symbol=${encodeURIComponent(inst)}&resolution=${encodeURIComponent(res)}&from=${from}&to=${now}&token=${encodeURIComponent(fhKey)}`;
 
   const r = await fetchWithTimeout(url, {}, timeoutMs);
   if (!r.ok) throw new Error(`finnhub_http_${r.status}`);
@@ -2845,10 +3131,11 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
   const cached = await getMarketCache(env, cacheKey);
   if (Array.isArray(cached) && cached.length >= Math.min(6, minNeed)) return cached;
 
-  const chain = resolveMarketProviderChain(env, symbol);
+  const chain = resolveMarketProviderChain(env, symbol, tf);
   let lastErr = null;
 
   for (const p of chain) {
+    if (providerInCooldown(p, env, "market")) continue;
     try {
       let candles = null;
       if (p === "binance") candles = await fetchBinanceCandles(symbol, tf, limit, timeoutMs);
@@ -2858,10 +3145,14 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
       if (p === "yahoo") candles = await fetchYahooChartCandles(symbol, tf, limit, timeoutMs);
       if (Array.isArray(candles) && candles.length) {
         await setMarketCache(env, cacheKey, candles);
+        markProviderSuccess(p, "market");
         if (candles.length >= minNeed) return candles;
+      } else {
+        markProviderFailure(p, env, "market");
       }
     } catch (e) {
       lastErr = e;
+      markProviderFailure(p, env, "market");
       console.error("market provider failed:", p, e?.message || e);
     }
   }
@@ -2917,9 +3208,10 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
   const cacheKey = marketCacheKey(symbol, timeframe);
   const cached = await getMarketCache(env, cacheKey);
   if (Array.isArray(cached) && cached.length) return cached;
-  const chain = resolveMarketProviderChain(env, symbol);
+  const chain = resolveMarketProviderChain(env, symbol, timeframe);
   let lastErr = null;
   for (const p of chain) {
+    if (providerInCooldown(p, env, "market")) continue;
     try {
       let candles = null;
       if (p === "binance") candles = await fetchBinanceCandles(symbol, timeframe, limit, timeoutMs);
@@ -2929,13 +3221,28 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
       if (p === "yahoo") candles = await fetchYahooChartCandles(symbol, timeframe, limit, timeoutMs);
       if (Array.isArray(candles) && candles.length) {
         await setMarketCache(env, cacheKey, candles);
+        markProviderSuccess(p, "market");
         return candles;
       }
+      markProviderFailure(p, env, "market");
     } catch (e) {
       lastErr = e;
+      markProviderFailure(p, env, "market");
     }
   }
   throw lastErr || new Error("market_data_alt_failed");
+}
+
+const API_RESP_CACHE = new Map();
+
+function apiRespCacheGet(key) {
+  const it = API_RESP_CACHE.get(key);
+  if (!it) return null;
+  if (Date.now() > it.exp) { API_RESP_CACHE.delete(key); return null; }
+  return it.val;
+}
+function apiRespCacheSet(key, val, ttlMs) {
+  API_RESP_CACHE.set(key, { val, exp: Date.now() + Math.max(500, Number(ttlMs || 10000)) });
 }
 
 async function fetchSymbolNewsFa(symbol, env) {
@@ -3188,7 +3495,7 @@ ${customPrompt.text}
     `ASSET: ${symbol}
 ` +
 
-    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}, Capital=${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}
+    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}, Capital=${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}, Lang=${st.profile?.language || "fa"}, TZ=${st.profile?.timezone || "Asia/Tehran"}, Country=${st.profile?.countryCode || "IR"}
 
 ` +
     `MARKET_DATA:
@@ -3207,8 +3514,11 @@ ${newsAnalysisBlock}
 ` +
     `- خروجی فقط فارسی و دقیقاً بخش‌های ۱ تا ۵
 ` +
-    `- از ترکیب سبک‌ها (پرایس اکشن، اسمارت‌مانی، ساختار بازار، حجم، سناریو) استفاده کن
-` +
+    (st.style === "ترکیبی" || promptMode === "combined_all"
+      ? `- از ترکیب سبک‌ها (پرایس اکشن، اسمارت‌مانی، ساختار بازار، حجم، سناریو) استفاده کن
+`
+      : `- فقط بر اساس سبک انتخابی (${st.style || "مشخص نشده"}) تحلیل کن و سبک‌های دیگر را دخیل نکن
+`) +
     `- مدیریت سرمایه متناسب با Capital را لحاظ کن و سایز پوزیشن پیشنهادی بده
 ` +
     `- quickchart_config را به شکل JSON داخلی بساز اما به کاربر نمایش نده
@@ -3368,30 +3678,8 @@ async function markPhoneSeen(env, phone, userId) {
 }
 
 async function awardReferralIfEligible(env, newUserSt) {
-  if (!env.BOT_KV) return;
-  const phone = newUserSt.profile?.phone || "";
-  if (!phone) return;
-
-  const isNew = await isPhoneNew(env, phone);
-  await markPhoneSeen(env, phone, newUserSt.userId);
-
-  if (!newUserSt.referral?.referredBy || !newUserSt.referral?.referredByCode) return;
-  if (!isNew) return;
-
-  const inviterId = String(newUserSt.referral.referredBy);
-  const inviter = await ensureUser(inviterId, env);
-  inviter.referral.successfulInvites = (inviter.referral.successfulInvites || 0) + 1;
-  inviter.referral.points = (inviter.referral.points || 0) + 3;
-
-  if (inviter.referral.points >= 500) {
-    inviter.referral.points -= 500;
-    inviter.subscription.active = true;
-    inviter.subscription.type = "gift";
-    inviter.subscription.dailyLimit = 50;
-    inviter.subscription.expiresAt = futureISO(30);
-  }
-
-  await saveUser(inviterId, inviter, env);
+  // kept for backward compatibility; referral reward is finalized after full onboarding
+  return finalizeOnboardingRewards(env, newUserSt);
 }
 
 function futureISO(days) {
@@ -3545,7 +3833,7 @@ Memo/Tag: ${memo}
     }
 
     if (text === "/invite" || text === BTN.INVITE) {
-      const { link, share } = inviteShareText(st, env);
+      const { link, share, points, invites } = inviteShareText(st, env);
       if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
       const txt =
         `🤝 دعوت دوستان
@@ -3555,7 +3843,13 @@ Memo/Tag: ${memo}
 
 ` +
         (share ? `برای اشتراک‌گذاری سریع: <a href="${escapeHtml(share)}">ارسال لینک</a>
-` : "");
+
+` : "") +
+        `🎁 امتیاز فعلی: ${points}
+👥 دعوت موفق: ${invites}
+
+ℹ️ هر دعوت موفق ۳ امتیاز.
+هر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
       return tgSendMessageHtml(env, chatId, txt, mainMenuKeyboard(env));
     }
 
@@ -3576,15 +3870,73 @@ Memo/Tag: ${memo}
       );
     }
 
+
+    if (text === "/quote" || text === BTN.QUOTE) {
+      const symbol = String(st.selectedSymbol || "BTCUSDT").toUpperCase();
+      const tf = String(st.timeframe || "H4").toUpperCase();
+      try {
+        const candles = await getMarketCandlesWithFallback(env, symbol, tf);
+        const snap = computeSnapshot(candles || []);
+        if (!snap) throw new Error("quote_unavailable");
+        const msgQ = `💹 قیمت لحظه‌ای
+
+نماد: ${symbol}
+TF: ${tf}
+قیمت: ${snap.lastPrice}
+تغییر: ${snap.changePct}%
+روند: ${snap.trend || "نامشخص"}`;
+        return tgSendMessage(env, chatId, msgQ, mainMenuKeyboard(env));
+      } catch (e) {
+        return tgSendMessage(env, chatId, "⚠️ قیمت لحظه‌ای در دسترس نیست. کمی بعد دوباره تلاش کن.", mainMenuKeyboard(env));
+      }
+    }
+
+    if (text === "/news" || text === BTN.NEWS) {
+      const symbol = String(st.selectedSymbol || "BTCUSDT").toUpperCase();
+      try {
+        const rows = await fetchSymbolNewsFa(symbol, env);
+        const lines = (rows || []).slice(0, 5).map((x, i) => `${i + 1}) ${x.title || "-"}`).join(String.fromCharCode(10));
+        return tgSendMessage(env, chatId, `📰 اخبار ${symbol}
+
+${lines || "خبری پیدا نشد."}`, mainMenuKeyboard(env));
+      } catch (e) {
+        return tgSendMessage(env, chatId, "⚠️ خبر مرتبط در دسترس نیست.", mainMenuKeyboard(env));
+      }
+    }
+
+    if (text === "/newsanalyze" || text === BTN.NEWS_ANALYSIS) {
+      const symbol = String(st.selectedSymbol || "BTCUSDT").toUpperCase();
+      try {
+        const rows = await fetchSymbolNewsFa(symbol, env);
+        const summary = await buildNewsAnalysisSummary(symbol, rows || [], env);
+        return tgSendMessage(env, chatId, `🧠 تحلیل خبر ${symbol}
+
+${summary || "تحلیل خبری در دسترس نیست."}`, mainMenuKeyboard(env));
+      } catch (e) {
+        return tgSendMessage(env, chatId, "⚠️ تحلیل خبر در دسترس نیست.", mainMenuKeyboard(env));
+      }
+    }
+
     if (text === "/miniapp" || text === BTN.MINIAPP) {
       const url = getMiniappUrl(env);
       if (!url) {
         return tgSendMessage(env, chatId, `⚠️ لینک مینی‌اپ تنظیم نشده.
 
-در Wrangler / داشبورد یک متغیر ENV به نام MINIAPP_URL یا PUBLIC_BASE_URL بگذار (مثلاً https://<your-worker-domain>/ ) و دوباره Deploy کن.`, mainMenuKeyboard(env));
+پیش‌فرض سیستم روی https://sniperim.mad-pyc.workers.dev/ است؛ اگر دامنه دیگری می‌خواهی، در Wrangler / داشبورد مقدار MINIAPP_URL یا PUBLIC_BASE_URL را ست کن و Deploy بزن.`, mainMenuKeyboard(env));
       }
-      return tgSendMessage(env, chatId, `🧩 لینک مینی‌اپ:
-${url}`, mainMenuKeyboard(env));
+      const token = await issueMiniappToken(env, st.userId, from);
+      const finalUrl = token ? appendQuery(url, { miniToken: token }) : url;
+      const kbInline = {
+        inline_keyboard: [
+          [{ text: "🧩 ورود داخل تلگرام", web_app: { url: finalUrl } }],
+          [{ text: "🔗 اتصال جایگزین", url: finalUrl }],
+        ],
+      };
+      return tgSendMessage(env, chatId, `🧩 مینی‌اپ فعال شد.
+
+روش جدید اتصال: ابتدا دکمه «ورود داخل تلگرام» را بزن.
+اگر باز نشد، دکمه «اتصال جایگزین» را بزن یا لینک زیر را باز کن:
+${finalUrl}`, kbInline);
     }
 
 
@@ -3668,8 +4020,17 @@ ${url}`, mainMenuKeyboard(env));
 
     if (st.state === "onb_market") {
       st.profile.preferredMarket = text;
+      st.state = "onb_style";
       await saveUser(userId, st, env);
-      await startLeveling(env, chatId, from, st);
+      return tgSendMessage(env, chatId, "🎯 سبک ترجیحی‌ات را انتخاب کن:", optionsKeyboard(ALLOWED_STYLE_LIST));
+    }
+
+    if (st.state === "onb_style") {
+      const style = ALLOWED_STYLE_LIST.includes(text) ? text : "پرایس اکشن";
+      st.profile.preferredStyle = style;
+      st.style = style;
+      await saveUser(userId, st, env);
+      await startOnboarding(env, chatId, from, st);
       return;
     }
 
@@ -3702,6 +4063,8 @@ ${url}`, mainMenuKeyboard(env));
       st.style = result.settings?.style || st.style;
       st.risk = result.settings?.risk || st.risk;
       st.profile.onboardingDone = true;
+      applyLocaleDefaults(st);
+      await finalizeOnboardingRewards(env, st);
 
       await saveUser(userId, st, env);
 
@@ -3986,12 +4349,18 @@ async function onStart(env, chatId, from, st, refArg) {
     if (ownerId && String(ownerId) !== String(st.userId)) {
       st.referral.referredBy = String(ownerId);
       st.referral.referredByCode = code;
+      st.profile.entrySource = `referral:${code}`;
     }
+  } else if (!st.profile.entrySource) {
+    st.profile.entrySource = refArg ? `start_arg:${refArg}` : "direct";
   }
 
   await saveUser(st.userId, st, env);
 
   await tgSendMessage(env, chatId, await getBotWelcomeText(env), mainMenuKeyboard(env));
+
+  const mkb = await miniappInlineKeyboard(env, st, from);
+  if (mkb) await tgSendMessage(env, chatId, "🧩 ورود سریع به مینی‌اپ:", mkb);
 
   if (!st.profile?.name || !st.profile?.phone) {
     await startOnboarding(env, chatId, from, st);
@@ -4019,6 +4388,11 @@ async function startOnboarding(env, chatId, from, st) {
     await saveUser(st.userId, st, env);
     return tgSendMessage(env, chatId, "بازار مورد علاقه‌ات کدام است؟", optionsKeyboard(["کریپتو", "فارکس", "فلزات", "سهام"]));
   }
+  if (!st.profile?.preferredStyle) {
+    st.state = "onb_style";
+    await saveUser(st.userId, st, env);
+    return tgSendMessage(env, chatId, "🎯 سبک ترجیحی‌ات را انتخاب کن:", optionsKeyboard(ALLOWED_STYLE_LIST));
+  }
   const flags = await getAdminFlags(env);
   if (flags.capitalModeEnabled && !Number(st.profile?.capital || 0)) {
     st.state = "onb_capital";
@@ -4035,9 +4409,8 @@ async function handleContact(env, chatId, from, st, contact) {
 
   const phone = String(contact.phone_number || "").trim();
   st.profile.phone = phone;
-  st.profile.onboardingDone = Boolean(st.profile.name && st.profile.phone);
-
-  await awardReferralIfEligible(env, st);
+  st.profile.onboardingDone = false;
+  applyLocaleDefaults(st);
 
   if (st.state === "onb_contact") st.state = "onb_experience";
   await saveUser(st.userId, st, env);
@@ -4126,15 +4499,19 @@ async function sendSettingsSummary(env, chatId, st, from) {
 function profileText(st, from, env) {
   const quota = isStaff(from, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
   const adminTag = isStaff(from, env) ? "✅ ادمین/اونر" : "👤 کاربر";
-  const level = st.profile?.level ? `\nسطح: ${st.profile.level}` : "";
-  const pts = st.referral?.points || 0;
-  const inv = st.referral?.successfulInvites || 0;
+  const level = st.profile?.level ? `
+سطح: ${st.profile.level}` : "";
 
-  const botUser = env.BOT_USERNAME ? String(env.BOT_USERNAME).replace(/^@/, "") : "";
-  const code = (st.referral?.codes || [])[0] || "";
-  const deep = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "-";
+  return `👤 پروفایل
 
-  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Tehran): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
+وضعیت: ${adminTag}
+🆔 ID: ${st.userId}
+نام: ${st.profile?.name || "-"}
+یوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}
+شماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}
+
+📅 امروز(Tehran): ${kyivDateString()}
+سهمیه امروز: ${quota}`;
 }
 
 function inviteShareText(st, env) {
@@ -4142,7 +4519,7 @@ function inviteShareText(st, env) {
   const code = (st.referral?.codes || [])[0] || "";
   const link = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "";
   const share = link ? `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent("با لینک من عضو شو و اشتراک هدیه بگیر ✅")}` : "";
-  return { link, share };
+  return { link, share, points: Number(st?.referral?.points || 0), invites: Number(st?.referral?.successfulInvites || 0) };
 }
 
 /* ========================== FLOWS ========================== */
@@ -4191,6 +4568,23 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
     c: Number(c.c),
   })).filter((x) => Number.isFinite(x.x) && Number.isFinite(x.o) && Number.isFinite(x.h) && Number.isFinite(x.l) && Number.isFinite(x.c));
 
+  const zoneLines = (levels || []).map((v) => Number(v)).filter((v) => Number.isFinite(v)).slice(0, 8).map((lvl, idx) => ({
+    type: "line",
+    scaleID: "y",
+    value: lvl,
+    borderColor: idx < 2 ? "#00d1ff" : (idx < 4 ? "#ffb020" : "#ff6b6b"),
+    borderWidth: idx < 2 ? 2 : 1.4,
+    borderDash: idx < 2 ? [] : [6, 4],
+    label: {
+      enabled: true,
+      backgroundColor: "rgba(10,15,28,.78)",
+      color: "#fff",
+      content: `Z${idx + 1}: ${lvl.toFixed(4)}`,
+      position: "end",
+      yAdjust: -2,
+    },
+  }));
+
   const cfg = {
     type: "candlestick",
     data: {
@@ -4204,7 +4598,10 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
     },
     options: {
       parsing: false,
-      plugins: { legend: { display: false } },
+      plugins: {
+        legend: { display: false },
+        annotation: { annotations: zoneLines },
+      },
       scales: {
         x: { ticks: { maxRotation: 0, autoSkip: true } },
       },
@@ -4212,7 +4609,7 @@ function buildQuickChartCandlestickUrl(candles, symbol, tf, levels = []) {
   };
 
   const encoded = encodeURIComponent(JSON.stringify(cfg));
-  return `https://quickchart.io/chart?version=4&format=png&w=900&h=450&devicePixelRatio=2&plugins=chartjs-chart-financial&c=${encoded}`;
+  return `https://quickchart.io/chart?version=4&format=png&w=900&h=450&devicePixelRatio=2&plugins=chartjs-chart-financial,chartjs-plugin-annotation&c=${encoded}`;
 }
 
 function buildQuickChartLevelsOnlyUrl(symbol, tf, levels = []) {
@@ -4543,11 +4940,49 @@ function buildLevelsOnlySvg(symbol, timeframe, levels = []) {
 }
 
 function extractLevels(text) {
-  const nums = (String(text || "").match(/\b\d{1,6}(?:\.\d{1,6})?\b/g) || [])
+  const src = String(text || "");
+  const allNums = (src.match(/\b\d{1,7}(?:\.\d{1,6})?\b/g) || [])
     .map(Number)
-    .filter(n => Number.isFinite(n));
-  const uniq = [...new Set(nums)].sort((a,b)=>a-b);
-  return uniq.slice(0, 6);
+    .filter((n) => Number.isFinite(n) && n > 0);
+
+  const keyLines = src
+    .split(/\n+/)
+    .filter((ln) => /(?:support|resistance|zone|entry|sl|tp|حمایت|مقاومت|زون|ورود|حد\s*ضرر|حد\s*سود)/i.test(ln));
+  const hinted = (keyLines.join("\n").match(/\b\d{1,7}(?:\.\d{1,6})?\b/g) || [])
+    .map(Number)
+    .filter((n) => Number.isFinite(n) && n > 0);
+
+  const base = hinted.length ? hinted : allNums;
+  const cleanNums = base.filter((n) => n > 0.0000001 && n < 10000000);
+  cleanNums.sort((a, b) => a - b);
+
+  const merged = [];
+  for (const v of cleanNums) {
+    if (!merged.length) { merged.push(v); continue; }
+    const prev = merged[merged.length - 1];
+    const tol = Math.max(0.0001, prev * 0.0025);
+    if (Math.abs(v - prev) <= tol) {
+      merged[merged.length - 1] = Number(((prev + v) / 2).toFixed(6));
+    } else {
+      merged.push(v);
+    }
+  }
+  return merged.slice(0, 10);
+}
+
+function refineLevelsByCandles(levels, candles) {
+  const lv = (Array.isArray(levels) ? levels : []).map(Number).filter((n) => Number.isFinite(n) && n > 0);
+  if (!lv.length) return [];
+  if (!Array.isArray(candles) || !candles.length) return lv.slice(0, 8);
+  const highs = candles.map((x) => Number(x?.h)).filter((n) => Number.isFinite(n));
+  const lows = candles.map((x) => Number(x?.l)).filter((n) => Number.isFinite(n));
+  if (!highs.length || !lows.length) return lv.slice(0, 8);
+  const hi = Math.max(...highs), lo = Math.min(...lows);
+  const minV = lo * 0.7;
+  const maxV = hi * 1.3;
+  const filtered = lv.filter((n) => n >= minV && n <= maxV);
+  if (!filtered.length) return extractLevelsFromCandles(candles).slice(0, 8);
+  return [...new Set(filtered.map((n) => Number(n.toFixed(6))))].sort((a,b)=>a-b).slice(0, 8);
 }
 
 function extractLevelsFromCandles(candles) {
@@ -4654,6 +5089,74 @@ function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json; charset=utf-8" } });
 }
 
+
+function miniappGuestEnabled(env) {
+  const v = String(env.MINIAPP_GUEST_READONLY || "1").trim().toLowerCase();
+  return !(v === "0" || v === "false" || v === "no");
+}
+
+async function buildMiniappGuestPayload(env) {
+  const st = defaultUser("guest");
+  const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
+  const styles = await getStyleList(env);
+  return {
+    ok: true,
+    guest: true,
+    welcome: await getMiniappWelcomeText(env),
+    state: st,
+    quota: "guest",
+    symbols,
+    styles,
+    offerBanner: await getOfferBanner(env),
+    offerBannerImage: await getOfferBannerImage(env),
+    customPrompts: await getCustomPrompts(env),
+    role: "user",
+    isStaff: false,
+    wallet: "",
+  };
+}
+
+async function issueMiniappToken(env, userId, fromLike = {}) {
+  if (!env.BOT_KV) return "";
+  const raw = crypto.getRandomValues(new Uint8Array(24));
+  const token = Array.from(raw).map((b) => b.toString(16).padStart(2, "0")).join("");
+  const payload = {
+    userId: String(userId || ""),
+    username: String(fromLike?.username || ""),
+    telegramId: String(fromLike?.id || fromLike?.userId || userId || ""),
+    createdAt: Date.now(),
+  };
+  await env.BOT_KV.put(`miniapp_token:${token}`, JSON.stringify(payload), { expirationTtl: Math.max(300, Number(env.MINIAPP_TOKEN_TTL_SEC || 86400)) });
+  return token;
+}
+
+async function verifyMiniappToken(token, env) {
+  if (!env.BOT_KV || !token) return { ok: false, reason: "token_missing" };
+  const raw = await env.BOT_KV.get(`miniapp_token:${String(token).trim()}`);
+  if (!raw) return { ok: false, reason: "token_invalid" };
+  try {
+    const j = JSON.parse(raw);
+    const userId = String(j?.userId || "").trim();
+    if (!userId) return { ok: false, reason: "token_user_missing" };
+    return { ok: true, userId, fromLike: { username: String(j?.username || ""), userId: String(j?.telegramId || userId || ""), id: Number(j?.telegramId || userId || 0) || undefined }, via: "mini_token" };
+  } catch {
+    return { ok: false, reason: "token_bad_json" };
+  }
+}
+
+async function verifyMiniappAuth(body, env) {
+  // روش اتصال جدید: token-first برای پایداری در initData منقضی/خالی.
+  const token = String(body?.miniToken || "").trim();
+  if (token) {
+    const tv = await verifyMiniappToken(token, env);
+    if (tv.ok) return tv;
+  }
+  const initData = body?.initData;
+  const v = await verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN, env.INITDATA_MAX_AGE_SEC, env.MINIAPP_AUTH_LENIENT);
+  if (v.ok) return v;
+  return token ? { ok: false, reason: "token_and_init_invalid" } : v;
+}
+
 /* ========================== TELEGRAM MINI APP initData verification ========================== */
 async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientRaw) {
   if (!initData || typeof initData !== "string") return { ok: false, reason: "initData_missing" };
@@ -4661,7 +5164,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const initRaw = String(initData || "").trim();
   if (lenient && initRaw.startsWith("dev:")) {
     const devId = Number(initRaw.split(":")[1] || "0") || 999001;
-    return { ok: true, userId: devId, fromLike: { username: "dev_user" } };
+    return { ok: true, userId: devId, fromLike: { username: "dev_user", userId: String(devId), id: devId } };
   }
   if (!botToken && !lenient) return { ok: false, reason: "bot_token_missing" };
 
@@ -4690,7 +5193,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const userId = user?.id || Number(params.get("user_id") || "0");
   if (!userId) return { ok: false, reason: "user_missing" };
 
-  const fromLike = { username: user?.username || "" };
+  const fromLike = { username: user?.username || "", userId: String(userId), id: Number(userId) || undefined };
   return { ok: true, userId, fromLike };
 }
 
@@ -4936,6 +5439,17 @@ const MINI_APP_HTML = `<!doctype html>
     .q-up{ color: var(--good); }
     .q-down{ color: var(--bad); }
     .q-flat{ color: var(--warn); }
+    .tabs{ display:flex; gap:8px; overflow:auto; padding-bottom:4px; margin-bottom:10px; }
+    .tab-btn{ border:1px solid rgba(255,255,255,.14); background:rgba(255,255,255,.06); color:var(--text); border-radius:999px; padding:8px 12px; font-size:12px; cursor:pointer; white-space:nowrap; }
+    .tab-btn.active{ background:linear-gradient(135deg,var(--primary),var(--accent)); border-color:transparent; color:#fff; }
+    .tab-panel{ display:none; }
+    .tab-panel.active{ display:block; }
+    .energy{ display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:12px; color:var(--muted); margin-top:8px; }
+    .energy-bar{ height:8px; width:100%; border-radius:999px; background:rgba(255,255,255,.08); overflow:hidden; }
+    .energy-fill{ height:100%; width:0%; background:linear-gradient(90deg,var(--accent),var(--primary)); transition:width .25s ease; }
+    .offer-media{ margin-top:10px; border-radius:16px; overflow:hidden; border:1px solid rgba(255,255,255,.12); display:none; }
+    .offer-media.show{ display:block; }
+    .offer-media img{ width:100%; display:block; }
   </style>
 </head>
 <body>
@@ -4951,17 +5465,25 @@ const MINI_APP_HTML = `<!doctype html>
       <div class="pill"><span class="dot"></span><span id="pillTxt">Online</span></div>
     </div>
 
+    <div class="tabs" id="mainTabs">
+      <button class="tab-btn active" data-tab="dashboard">داشبورد</button>
+      <button class="tab-btn" data-tab="analyze">تحلیل</button>
+      <button class="tab-btn" data-tab="support">پشتیبانی</button>
+      <button class="tab-btn" data-tab="admin">پنل ادمین/اونر</button>
+    </div>
+
     <div class="grid">
-      <div class="card">
+      <div class="card tab-panel active" data-panel="dashboard">
         <div class="card-b offer" id="offerCard">
           <div>
             <h3>🎁 پیشنهاد ویژه</h3>
             <p id="offerText">فعال‌سازی اشتراک ویژه با تخفیف محدود.</p>
           </div>
           <div class="tag" id="offerTag">Special</div>
+          <div class="offer-media" id="offerMedia"><img id="offerImg" alt="offer" /></div>
         </div>
       </div>
-      <div class="card" id="quoteCard">
+      <div class="card tab-panel active" id="quoteCard" data-panel="dashboard">
         <div class="card-h">
           <strong>داشبورد قیمت لحظه‌ای</strong>
           <span id="quoteStamp">—</span>
@@ -4977,7 +5499,7 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
       </div>
 
-      <div class="card" id="newsCard">
+      <div class="card tab-panel active" id="newsCard" data-panel="dashboard">
         <div class="card-h">
           <strong>📰 اخبار فارسی نماد</strong>
           <button id="refreshNews" class="btn ghost" style="min-width:unset; padding:6px 10px;">بروزرسانی</button>
@@ -4988,7 +5510,7 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="mini-list" id="newsAnalysis">در حال تولید تحلیل خبری…</div>
         </div>
       </div>
-      <div class="card">
+      <div class="card tab-panel" data-panel="analyze">
         <div class="card-h">
           <strong>تحلیل سریع</strong>
           <span id="meta">—</span>
@@ -5062,11 +5584,17 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="actions">
             <button id="save" class="btn">💾 ذخیره</button>
             <button id="analyze" class="btn primary">⚡ تحلیل</button>
+            <button id="reconnect" class="btn ghost">🔄 اتصال مجدد</button>
             <button id="close" class="btn ghost">✖ بستن</button>
           </div>
 
           <div style="height:10px"></div>
           <div class="muted" style="font-size:12px; line-height:1.6;" id="welcome"></div>
+          <div class="energy">
+            <span id="energyText">انرژی: —</span>
+            <span id="remainingText">تحلیل باقی‌مانده: —</span>
+          </div>
+          <div class="energy-bar"><div class="energy-fill" id="energyFill"></div></div>
         </div>
 
         <div class="out" id="out">آماده…</div>
@@ -5082,7 +5610,7 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
       </div>
 
-      <div class="card" id="supportCard">
+      <div class="card tab-panel" id="supportCard" data-panel="support">
         <div class="card-h">
           <strong>پشتیبانی</strong>
           <span>ارسال تیکت</span>
@@ -5099,7 +5627,7 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
       </div>
 
-      <div class="card admin-card" id="adminCard">
+      <div class="card admin-card tab-panel" id="adminCard" data-panel="admin">
         <div class="card-h">
           <strong id="adminTitle">پنل ادمین</strong>
           <span>مدیریت پرامپت، سبک‌ها، پرداخت، برداشت و تیکت‌ها</span>
@@ -5116,6 +5644,9 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="field">
             <div class="label">پرامپت سبک‌ها (JSON)</div>
             <textarea id="stylePromptJson" class="control" placeholder='{"پرایس_اکشن":"...","ict":"...","atr":"..."}'></textarea>
+            <div class="admin-row">
+              <input id="stylePromptJsonFile" type="file" accept="application/json,.json" class="control" />
+            </div>
             <div class="actions">
               <button id="saveStylePrompts" class="btn">ذخیره JSON سبک‌ها</button>
             </div>
@@ -5159,6 +5690,9 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="field">
             <div class="label">پرامپت‌های اختصاصی (JSON)</div>
             <textarea id="customPromptsJson" class="control" placeholder='[{"id":"p1","title":"VIP","text":"..."}]'></textarea>
+            <div class="admin-row">
+              <input id="customPromptsJsonFile" type="file" accept="application/json,.json" class="control" />
+            </div>
             <div class="actions">
               <button id="saveCustomPrompts" class="btn">ذخیره پرامپت‌های اختصاصی</button>
             </div>
@@ -5183,6 +5717,12 @@ const MINI_APP_HTML = `<!doctype html>
               <button id="checkPayment" class="btn ghost">چک بلاک‌چین</button>
               <button id="activateSubscription" class="btn">فعال‌سازی دستی</button>
             </div>
+            <div class="muted" style="font-size:12px; line-height:1.8;">برای استفاده ساده: فقط یوزرنیم + مبلغ + یکی از پلن‌ها را انتخاب کنید. TxHash اختیاری است.</div>
+            <div class="chips" id="paymentPresets">
+              <button type="button" class="chip" data-days="7" data-amount="9">پلن شروع ۷ روزه</button>
+              <button type="button" class="chip" data-days="30" data-amount="19">پلن ماهانه</button>
+              <button type="button" class="chip" data-days="90" data-amount="49">پلن حرفه‌ای ۹۰ روزه</button>
+            </div>
             <div class="mini-list" id="paymentList">—</div>
           </div>
 
@@ -5193,6 +5733,11 @@ const MINI_APP_HTML = `<!doctype html>
             <div class="actions">
               <button id="saveOfferBanner" class="btn">ذخیره بنر</button>
             </div>
+            <div class="admin-row">
+              <input id="offerImageFile" type="file" accept="image/*" class="control" />
+              <button id="clearOfferImage" class="btn ghost">حذف تصویر</button>
+            </div>
+            <input id="offerBannerImageInput" class="control" placeholder="یا لینک تصویر بنر..." />
           </div>
 
           <div class="field">
@@ -5335,6 +5880,12 @@ const pillTxt = document.getElementById("pillTxt");
 const welcome = document.getElementById("welcome");
 const offerText = document.getElementById("offerText");
 const offerTag = document.getElementById("offerTag");
+const offerMedia = document.getElementById("offerMedia");
+const offerImg = document.getElementById("offerImg");
+const mainTabs = document.getElementById("mainTabs");
+const energyText = document.getElementById("energyText");
+const remainingText = document.getElementById("remainingText");
+const energyFill = document.getElementById("energyFill");
 const adminCard = document.getElementById("adminCard");
 const adminTitle = document.getElementById("adminTitle");
 const reportBlock = document.getElementById("reportBlock");
@@ -5351,8 +5902,21 @@ const spin = el("spin");
 
 let ALL_SYMBOLS = [];
 let INIT_DATA = "";
+let MINI_TOKEN = "";
 let IS_STAFF = false;
 let IS_OWNER = false;
+let IS_GUEST = false;
+let OFFLINE_MODE = false;
+
+const LOCAL_KEYS = {
+  initData: "miniapp_init_data",
+  miniToken: "miniapp_auth_token",
+  userState: "miniapp_cached_user_state_v1",
+  quoteCache: "miniapp_quote_cache_v1",
+  newsCache: "miniapp_news_cache_v1",
+  newsAnalysisCache: "miniapp_news_analysis_cache_v1",
+  analyzeCache: "miniapp_analyze_cache_v1",
+};
 const API_BASE = window.location.origin;
 let ADMIN_TICKETS = [];
 let ADMIN_TICKETS_ALL = [];
@@ -5362,6 +5926,21 @@ let QUOTE_TIMER = null;
 let QUOTE_BUSY = false;
 let NEWS_TIMER = null;
 const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
+
+function getFreshInitData() {
+  const latestTg = (tg?.initData || "").trim();
+  if (latestTg) {
+    INIT_DATA = latestTg;
+    try { localStorage.setItem(LOCAL_KEYS.initData, latestTg); } catch {}
+  }
+  return INIT_DATA || latestTg || "";
+}
+
+function buildAuthBody(extra = {}) {
+  const token = MINI_TOKEN || localStorage.getItem(LOCAL_KEYS.miniToken) || "";
+  const freshInit = getFreshInitData();
+  return { initData: freshInit, miniToken: token, ...extra };
+}
 
 function showToast(title, subline = "", badge = "", loading = false){
   if (!toast || !toastT || !toastS || !toastB || !spin) return;
@@ -5443,10 +6022,13 @@ function setTf(tf){
 
 async function api(path, body){
   let lastErr = null;
-  for (let i = 0; i < 2; i++) {
+  const quickBoot = path === "/api/user" && !!body?.allowGuest;
+  const attempts = quickBoot ? 3 : 2;
+  for (let i = 0; i < attempts; i++) {
     try {
       const ac = new AbortController();
-      const tm = setTimeout(() => ac.abort("timeout"), 12000 + (i * 4000));
+      const quickMs = i === 0 ? 10000 : (i === 1 ? 18000 : 24000);
+      const tm = setTimeout(() => ac.abort("timeout"), quickBoot ? quickMs : (14000 + (i * 5000)));
       const r = await fetch(API_BASE + path, {        method: "POST",
         headers: {"content-type":"application/json"},
         body: JSON.stringify(body),
@@ -5460,18 +6042,23 @@ async function api(path, body){
       await new Promise((res) => setTimeout(res, 350 * (i + 1)));
     }
   }
-  return { status: 599, json: { ok: false, error: String(lastErr?.message || lastErr || "network_error") } };
+  const errText = String(lastErr?.message || lastErr || "network_error");
+  const normalized = errText.toLowerCase().includes("timeout") || errText.toLowerCase().includes("abort")
+    ? "request_timeout"
+    : errText;
+  return { status: 599, json: { ok: false, error: normalized } };
 }
 
 async function adminApi(path, body){
   if (!IS_STAFF) return { status: 403, json: { ok: false, error: "forbidden" } };
-  return api(path, { initData: INIT_DATA, ...body });
+  return api(path, buildAuthBody(body));
 }
 
 function prettyErr(j, status){
   const e = j?.error || "نامشخص";
   if (status === 429 && String(e).startsWith("quota_exceeded")) return "سهمیه امروز تمام شد.";
-  if (status === 403 && String(e) === "onboarding_required") return "ابتدا نام و شماره را داخل ربات ثبت کنید.";
+  if (status === 403 && String(e) === "onboarding_required") return "ابتدا حداقل نام یا یوزرنیم خود را تکمیل کنید.";
+  if (status === 403 && String(e) === "forbidden") return "دسترسی این بخش برای نقش فعلی شما مجاز نیست.";
   if (status === 401) {
     if (String(e).includes("initData")) return "اتصال مینی‌اپ منقضی شده؛ اپ را مجدد از داخل تلگرام باز کنید.";
     return "احراز هویت تلگرام ناموفق است.";
@@ -5513,15 +6100,29 @@ function setQuoteUi(data, errMsg = ""){
   qMeta.textContent = "TF: " + (data.timeframe || "-") + " | candles: " + (data.candles || 0) + " | کیفیت: " + (data.quality === "full" ? "کامل" : "محدود");}
 
 async function refreshLiveQuote(force = false){
-  if (!INIT_DATA || QUOTE_BUSY) return;
+  if (QUOTE_BUSY) return;
   if (!force && document.hidden) return;
   QUOTE_BUSY = true;
   try {
     const symbol = val("symbol") || "";
     const timeframe = val("timeframe") || "H4";
     if (!symbol) return;
-    const { json } = await api("/api/quote", { initData: INIT_DATA, symbol, timeframe });
-    setQuoteUi(json, "خطا در دریافت قیمت لحظه‌ای");
+    const ck = quoteCacheKey(symbol, timeframe);
+
+    if (OFFLINE_MODE) {
+      const cached = readByKey(LOCAL_KEYS.quoteCache, ck);
+      setQuoteUi(cached, "قیمت لحظه‌ای از کش محلی");
+      return;
+    }
+
+    const { json } = await api("/api/quote", buildAuthBody({ symbol, timeframe, allowGuest: true }));
+    if (json?.ok) {
+      cacheByKey(LOCAL_KEYS.quoteCache, ck, json);
+      setQuoteUi(json, "");
+      return;
+    }
+    const cached = readByKey(LOCAL_KEYS.quoteCache, ck);
+    setQuoteUi(cached || json, cached ? "قیمت از کش نمایش داده شد" : "خطا در دریافت قیمت لحظه‌ای");
   } finally {
     QUOTE_BUSY = false;
   }
@@ -5562,26 +6163,52 @@ function renderNewsList(json){
 }
 
 async function refreshSymbolNews(force = false){
-  if (!INIT_DATA) return;
   if (!force && document.hidden) return;
   const symbol = val("symbol") || "";
   if (!symbol) return;
   const target = el("newsList");
   if (target && force) target.textContent = "در حال دریافت خبر…";
-  const { json } = await api("/api/news", { initData: INIT_DATA, symbol });
-  renderNewsList(json);
+  const ck = newsCacheKey(symbol);
+
+  if (OFFLINE_MODE) {
+    const cached = readByKey(LOCAL_KEYS.newsCache, ck);
+    renderNewsList(cached || { ok: false, articles: [] });
+    return;
+  }
+
+  const { json } = await api("/api/news", buildAuthBody({ symbol, allowGuest: true }));
+  if (json?.ok) {
+    cacheByKey(LOCAL_KEYS.newsCache, ck, json);
+    renderNewsList(json);
+    return;
+  }
+  const cached = readByKey(LOCAL_KEYS.newsCache, ck);
+  renderNewsList(cached || json);
 }
 
 async function refreshNewsAnalysis(force = false){
-  if (!INIT_DATA) return;
   if (!force && document.hidden) return;
   const symbol = val("symbol") || "";
   if (!symbol) return;
   const target = el("newsAnalysis");
   if (target && force) target.textContent = "در حال تحلیل خبر…";
-  const { json } = await api("/api/news/analyze", { initData: INIT_DATA, symbol });
+  const ck = newsCacheKey(symbol);
+
+  if (OFFLINE_MODE) {
+    const cached = readByKey(LOCAL_KEYS.newsAnalysisCache, ck);
+    if (target) target.textContent = cached?.summary || "تحلیل خبری آفلاین موجود نیست.";
+    return;
+  }
+
+  const { json } = await api("/api/news/analyze", buildAuthBody({ symbol, allowGuest: true }));
   if (!target) return;
-  target.textContent = json?.ok ? (json.summary || "—") : "تحلیل خبری در دسترس نیست.";
+  if (json?.ok) {
+    cacheByKey(LOCAL_KEYS.newsAnalysisCache, ck, json);
+    target.textContent = json.summary || "—";
+    return;
+  }
+  const cached = readByKey(LOCAL_KEYS.newsAnalysisCache, ck);
+  target.textContent = cached?.summary || "تحلیل خبری در دسترس نیست.";
 }
 
 function setupNewsPolling(){
@@ -5612,6 +6239,19 @@ function pickTicketReplyTemplate(){
 function updateMeta(state, quota){
   meta.textContent = "سهمیه: " + (quota || "-");
   sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
+  const q = String(quota || "");
+  const m = q.match(/(\d+)\s*\/\s*(\d+)/);
+  let used = 0;
+  let limit = 0;
+  if (m) {
+    used = Number(m[1] || 0);
+    limit = Number(m[2] || 0);
+  }
+  const remaining = Math.max(0, limit - used);
+  const pct = limit > 0 ? Math.max(0, Math.min(100, Math.round((remaining / limit) * 100))) : 100;
+  if (remainingText) remainingText.textContent = "تحلیل باقی‌مانده: " + (limit > 0 ? String(remaining) : "∞");
+  if (energyText) energyText.textContent = "انرژی: " + (limit > 0 ? (pct + "%") : "نامحدود");
+  if (energyFill) energyFill.style.width = (limit > 0 ? pct : 100) + "%";
 }
 
 function renderStyleList(styles){
@@ -5818,54 +6458,35 @@ function safeJsonParse(text, fallback) {
   try { return JSON.parse(text); } catch { return fallback; }
 }
 
-async function boot(){
-  out.textContent = "⏳ در حال آماده‌سازی…";
-  pillTxt.textContent = "Connecting…";
-  showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
+function cacheUserSnapshot(json) {
+  try {
+    const data = {
+      welcome: json?.welcome || "",
+      state: json?.state || {},
+      quota: json?.quota || "",
+      symbols: json?.symbols || [],
+      styles: json?.styles || [],
+      customPrompts: json?.customPrompts || [],
+      offerBanner: json?.offerBanner || "",
+      offerBannerImage: json?.offerBannerImage || "",
+      role: json?.role || "user",
+      isStaff: !!json?.isStaff,
+      wallet: json?.wallet || "",
+      cachedAt: Date.now(),
+    };
+    localStorage.setItem(LOCAL_KEYS.userState, JSON.stringify(data));
+  } catch {}
+}
 
-  const isTelegramRuntime = !!window.Telegram?.WebApp;
-  const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
-  const savedInitData = localStorage.getItem("miniapp_init_data") || "";
-  let initData = (tg?.initData || "").trim();
-
-  // Telegram WebApp may populate initData with a slight delay.
-  if (isTelegramRuntime && !initData) {
-    await new Promise((r) => setTimeout(r, 350));
-    initData = (tg?.initData || "").trim();
+function readCachedUserSnapshot() {
+  try {
+    return safeJsonParse(localStorage.getItem(LOCAL_KEYS.userState) || "", null);
+  } catch {
+    return null;
   }
+}
 
-  if (initData) {
-    INIT_DATA = initData;
-    localStorage.setItem("miniapp_init_data", initData);
-  } else if (qsInitData) {
-    INIT_DATA = qsInitData;
-    localStorage.setItem("miniapp_init_data", qsInitData);
-  } else if (savedInitData && !isTelegramRuntime) {
-    INIT_DATA = savedInitData;
-  } else if (!isTelegramRuntime) {
-    const devInit = "dev:999001";
-    INIT_DATA = devInit;
-    localStorage.setItem("miniapp_init_data", devInit);
-    showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
-  } else {
-    hideToast();
-    pillTxt.textContent = "Offline";
-    out.textContent = "⚠️ اتصال مینی‌اپ برقرار نیست. " + CONNECTION_HINT;
-    return;
-  }
-  const {status, json} = await api("/api/user", { initData: INIT_DATA });
-
-  if (!json?.ok) {
-    if (status === 401) {
-      try { localStorage.removeItem("miniapp_init_data"); } catch {}
-    }
-    hideToast();
-    pillTxt.textContent = "Offline";
-    out.textContent = "⚠️ خطا: " + prettyErr(json, status);
-    showToast("خطا", prettyErr(json, status), "API", false);
-    return;
-  }
-
+function applyUserState(json) {
   welcome.textContent = json.welcome || "";
   fillSymbols(json.symbols || []);
   const styleList = json.styles || [];
@@ -5887,8 +6508,154 @@ async function boot(){
   } else if (json.symbols?.length) setVal("symbol", json.symbols[0]);
   if (offerText) offerText.textContent = json.offerBanner || "فعال‌سازی اشتراک ویژه با تخفیف محدود.";
   if (offerTag) offerTag.textContent = json.role === "owner" ? "Owner" : "Special";
+  const imgSrc = String(json.offerBannerImage || "").trim();
+  if (offerImg) offerImg.src = imgSrc || "";
+  if (offerMedia) offerMedia.classList.toggle("show", !!imgSrc);
 
   updateMeta(json.state, json.quota);
+}
+
+
+function storageGetObj(key, fallback = {}) {
+  try {
+    const raw = localStorage.getItem(key);
+    const parsed = raw ? JSON.parse(raw) : fallback;
+    return parsed && typeof parsed === "object" ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function storageSetObj(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value || {})); } catch {}
+}
+
+function cacheByKey(key, itemKey, value) {
+  const bag = storageGetObj(key, {});
+  bag[itemKey] = { ...(value || {}), cachedAt: Date.now() };
+  storageSetObj(key, bag);
+}
+
+function readByKey(key, itemKey) {
+  const bag = storageGetObj(key, {});
+  return bag[itemKey] || null;
+}
+
+function quoteCacheKey(symbol, timeframe) {
+  return String(symbol || "").toUpperCase() + "|" + String(timeframe || "H4").toUpperCase();
+}
+
+function newsCacheKey(symbol) {
+  return String(symbol || "").toUpperCase();
+}
+
+function analyzeCacheKey(symbol) {
+  return String(symbol || "").toUpperCase();
+}
+
+
+function setupTabs(){
+  if (!mainTabs) return;
+  const buttons = Array.from(mainTabs.querySelectorAll(".tab-btn"));
+  const panels = Array.from(document.querySelectorAll(".tab-panel[data-panel]"));
+  const activate = (name) => {
+    buttons.forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+    panels.forEach((p) => p.classList.toggle("active", p.dataset.panel === name));
+  };
+  buttons.forEach((b) => b.addEventListener("click", () => activate(b.dataset.tab || "dashboard")));
+  activate("dashboard");
+}
+
+async function boot(){
+  out.textContent = "⏳ در حال آماده‌سازی…";
+  pillTxt.textContent = "Connecting…";
+  showToast("در حال اتصال…", "دریافت پروفایل و تنظیمات", "API", true);
+
+  const isTelegramRuntime = !!window.Telegram?.WebApp;
+  const qsInitData = new URLSearchParams(window.location.search).get("initData") || "";
+  const savedInitData = localStorage.getItem(LOCAL_KEYS.initData) || "";
+  const qsMiniToken = new URLSearchParams(window.location.search).get("miniToken") || "";
+  const savedMiniToken = localStorage.getItem(LOCAL_KEYS.miniToken) || "";
+  if (qsMiniToken) { MINI_TOKEN = qsMiniToken; try { localStorage.setItem(LOCAL_KEYS.miniToken, qsMiniToken); } catch {} }
+  else if (savedMiniToken) { MINI_TOKEN = savedMiniToken; }
+  let initData = (tg?.initData || "").trim();
+
+  // Telegram WebApp may populate initData with a slight delay.
+  if (isTelegramRuntime && !initData) {
+    for (let i = 0; i < 8 && !initData; i++) {
+      await new Promise((r) => setTimeout(r, 300));
+      initData = (tg?.initData || "").trim();
+    }
+  }
+
+  if (initData) {
+    INIT_DATA = initData;
+    localStorage.setItem(LOCAL_KEYS.initData, initData);
+  } else if (qsInitData) {
+    INIT_DATA = qsInitData;
+    localStorage.setItem(LOCAL_KEYS.initData, qsInitData);
+  } else if (savedInitData) {
+    INIT_DATA = savedInitData;
+  } else if (!isTelegramRuntime) {
+    const devInit = "dev:999001";
+    INIT_DATA = devInit;
+    localStorage.setItem(LOCAL_KEYS.initData, devInit);
+    showToast("حالت آسان فعال شد", "ورود موقت برای تست مینی‌اپ", "DEV", false);
+  } else {
+    INIT_DATA = "";
+    showToast("حالت مهمان", "اتصال احراز نشده؛ اجرای محدود با داده عمومی", "GUEST", false);
+  }
+  let userResp = await api("/api/user", buildAuthBody({ allowGuest: true }));
+  if (!userResp?.json?.ok && userResp?.status === 401 && MINI_TOKEN) {
+    // Retry once without cached initData to force miniToken auth path when initData is stale.
+    userResp = await api("/api/user", { miniToken: MINI_TOKEN, allowGuest: true });
+  }
+  const {status, json} = userResp;
+
+  if (!json?.ok) {
+    if (status === 401) {
+      try { localStorage.removeItem(LOCAL_KEYS.initData); } catch {}
+    }
+    const cached = readCachedUserSnapshot();
+    if (!cached) {
+      const fallback = {
+        welcome: "نسخه محدود مینی‌اپ فعال شد.",
+        state: { timeframe: "H4", style: "پرایس اکشن", risk: "متوسط", newsEnabled: true, promptMode: "style_plus_custom", selectedSymbol: "BTCUSDT" },
+        quota: "guest",
+        symbols: ["BTCUSDT","ETHUSDT","XAUUSD","EURUSD"],
+        styles: ["پرایس اکشن","ICT","ATR","ترکیبی"],
+        offerBanner: "اتصال محدود؛ برخی امکانات نیازمند احراز تلگرام است.",
+        role: "user",
+        isStaff: false,
+        customPrompts: [],
+      };
+      OFFLINE_MODE = true;
+      IS_GUEST = true;
+      applyUserState(fallback);
+      pillTxt.textContent = "Offline (Guest)";
+      out.textContent = "حالت محدود فعال شد ✅ داده‌های پایه بارگذاری شدند.";
+      showToast("حالت محدود", "برای همه امکانات، مینی‌اپ را از داخل تلگرام باز کنید.", "GUEST", false);
+      setupLiveQuotePolling();
+      setupNewsPolling();
+      return;
+    }
+    OFFLINE_MODE = !navigator.onLine;
+    IS_GUEST = true;
+    applyUserState(cached);
+    out.textContent = OFFLINE_MODE
+      ? "حالت آفلاین فعال شد ✅ امکانات از کش محلی بارگذاری می‌شود."
+      : "حالت محدود فعال شد ✅ داده‌های ذخیره‌شده بارگذاری شد و اتصال خواندنی در حال تلاش است.";
+    pillTxt.textContent = OFFLINE_MODE ? "Offline (Cached)" : "Limited (Guest)";
+    hideToast();
+    showToast(OFFLINE_MODE ? "آفلاین" : "حالت محدود", OFFLINE_MODE ? "داده‌های ذخیره‌شده بارگذاری شد" : "اتصال خواندنی مهمان فعال شد", OFFLINE_MODE ? "CACHE" : "GUEST", false);
+    setupLiveQuotePolling();
+    setupNewsPolling();
+    return;
+  }
+
+  OFFLINE_MODE = false;
+  cacheUserSnapshot(json);
+  applyUserState(json);
   out.textContent = "آماده ✅";
   pillTxt.textContent = "Online";
   hideToast();
@@ -5896,6 +6663,7 @@ async function boot(){
   setupNewsPolling();
   IS_STAFF = !!json.isStaff;
   IS_OWNER = json.role === "owner";
+  IS_GUEST = !!json.guest;
 
   if (IS_STAFF && adminCard) {
     adminCard.classList.add("show");
@@ -5907,6 +6675,7 @@ async function boot(){
     });
 
     if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
+    if (el("offerBannerImageInput")) el("offerBannerImageInput").value = json.offerBannerImage || "";
     if (IS_OWNER && el("walletAddressInput")) el("walletAddressInput").value = json.wallet || "";
 
     await loadAdminBootstrap();
@@ -5922,6 +6691,7 @@ async function loadAdminBootstrap(){
   if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(json.customPrompts || [], null, 2);
   if (el("freeDailyLimit")) el("freeDailyLimit").value = String(json.freeDailyLimit ?? "");
   if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
+  if (el("offerBannerImageInput")) el("offerBannerImageInput").value = json.offerBannerImage || "";
   if (el("welcomeBotInput")) el("welcomeBotInput").value = json.welcomeBot || "";
   if (el("welcomeMiniappInput")) el("welcomeMiniappInput").value = json.welcomeMiniapp || "";
 
@@ -5954,12 +6724,14 @@ el("tfChips").addEventListener("click", (e) => {
 });
 
 el("save").addEventListener("click", async () => {
+  if (OFFLINE_MODE || IS_GUEST) {
+    showToast("محدود", "در حالت آفلاین/مهمان ذخیره روی سرور ممکن نیست.", "SET", false);
+    return;
+  }
   showToast("در حال ذخیره…", "تنظیمات ذخیره می‌شود", "SET", true);
   out.textContent = "⏳ ذخیره تنظیمات…";
 
-  const initData = INIT_DATA || tg?.initData || "";
-  const payload = {
-    initData,
+  const payload = buildAuthBody({
     timeframe: val("timeframe"),
     style: val("style"),
     risk: val("risk"),
@@ -5983,11 +6755,23 @@ el("save").addEventListener("click", async () => {
 });
 
 el("analyze").addEventListener("click", async () => {
+  if (OFFLINE_MODE || IS_GUEST) {
+    const symbol = val("symbol") || "";
+    const cached = readByKey(LOCAL_KEYS.analyzeCache, analyzeCacheKey(symbol));
+    if (cached?.result) {
+      out.textContent = cached.result;
+      if (cached?.zonesSvg) renderChartFallbackSvg(cached.zonesSvg);
+      showToast("آفلاین", "آخرین تحلیل ذخیره‌شده نمایش داده شد.", "AI", false);
+    } else {
+      out.textContent = "⚠️ تحلیل آنلاین در حالت آفلاین/مهمان غیرفعال است. برای ادامه از داخل تلگرام متصل شوید.";
+      showToast("محدود", "تحلیل نیاز به اتصال و احراز تلگرام دارد.", "AI", false);
+    }
+    return;
+  }
   showToast("در حال تحلیل…", "جمع‌آوری دیتا + تولید خروجی", "AI", true);
   out.textContent = "⏳ در حال تحلیل…";
 
-  const initData = INIT_DATA || tg?.initData || "";
-  const payload = { initData, symbol: val("symbol"), userPrompt: "" };
+  const payload = buildAuthBody({ symbol: val("symbol"), userPrompt: "" });
 
   const {status, json} = await api("/api/analyze", payload);
   if (!json?.ok) {
@@ -5998,6 +6782,13 @@ el("analyze").addEventListener("click", async () => {
   }
 
   out.textContent = json.result || "⚠️ بدون خروجی";
+  cacheByKey(LOCAL_KEYS.analyzeCache, analyzeCacheKey(val("symbol") || ""), {
+    result: json.result || "",
+    chartUrl: json.chartUrl || "",
+    zonesSvg: json.zonesSvg || "",
+    state: json.state || {},
+    quota: json.quota || "",
+  });
   await refreshLiveQuote(true);
   await refreshSymbolNews(true);
   // Render chart if available
@@ -6005,13 +6796,23 @@ el("analyze").addEventListener("click", async () => {
   const chartImg = el("chartImg");
   if (chartCard && chartImg) {
       const u = json.chartUrl || "";
+      const fallbackSvg = json.zonesSvg || "";
       if (u) {
+        chartImg.onerror = () => {
+          chartImg.onerror = null;
+          if (fallbackSvg) {
+            renderChartFallbackSvg(fallbackSvg);
+          } else {
+            chartImg.removeAttribute("src");
+            chartCard.style.display = "none";
+          }
+        };
         chartImg.src = u;
         chartCard.style.display = "block";
         const cm = el("chartMeta");
         if (cm) cm.textContent = "QuickChart";
-      } else if (json.zonesSvg) {
-        renderChartFallbackSvg(json.zonesSvg);
+      } else if (fallbackSvg) {
+        renderChartFallbackSvg(fallbackSvg);
       } else {
         chartImg.removeAttribute("src");
         chartCard.style.display = "none";
@@ -6023,6 +6824,10 @@ el("analyze").addEventListener("click", async () => {
 });
 
 el("sendSupportTicket")?.addEventListener("click", async () => {
+  if (OFFLINE_MODE || IS_GUEST) {
+    showToast("محدود", "ارسال تیکت در حالت آفلاین/مهمان ممکن نیست.", "SUP", false);
+    return;
+  }
   const text = (el("supportTicketText")?.value || "").trim();
   if (!text || text.length < 4) {
     showToast("خطا", "متن تیکت خیلی کوتاه است.", "SUP", false);
@@ -6033,7 +6838,7 @@ el("sendSupportTicket")?.addEventListener("click", async () => {
     return;
   }
   showToast("در حال ارسال…", "تیکت در حال ثبت است", "SUP", true);
-  const { status, json } = await api("/api/support/ticket", { initData: INIT_DATA, text });
+  const { status, json } = await api("/api/support/ticket", buildAuthBody({ text }));
   if (!json?.ok) {
     const msg = json?.error === "support_unavailable"
       ? "پشتیبانی در دسترس نیست."
@@ -6059,6 +6864,19 @@ el("saveStylePrompts")?.addEventListener("click", async () => {
   const stylePrompts = safeJsonParse(raw, {});
   const { json } = await adminApi("/api/admin/style-prompts", { stylePrompts });
   if (json?.ok) showToast("ذخیره شد ✅", "JSON سبک‌ها بروزرسانی شد", "ADM", false);
+});
+
+el("stylePromptJsonFile")?.addEventListener("change", async (ev) => {
+  const f = ev?.target?.files?.[0];
+  if (!f) return;
+  const txt = await f.text().catch(() => "");
+  const parsed = safeJsonParse(txt, null);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    showToast("خطا", "فایل JSON سبک‌ها معتبر نیست", "ADM", false);
+    return;
+  }
+  if (el("stylePromptJson")) el("stylePromptJson").value = JSON.stringify(parsed, null, 2);
+  showToast("بارگذاری شد ✅", "JSON سبک‌ها از فایل لود شد", "ADM", false);
 });
 
 el("addStyle")?.addEventListener("click", async () => {
@@ -6101,14 +6919,45 @@ el("saveFreeLimit")?.addEventListener("click", async () => {
 
 el("saveOfferBanner")?.addEventListener("click", async () => {
   const offerBanner = el("offerBannerInput")?.value || "";
-  const { json } = await adminApi("/api/admin/offer", { offerBanner });
+  const offerBannerImage = el("offerBannerImageInput")?.value || "";
+  const { json } = await adminApi("/api/admin/offer", { offerBanner, offerBannerImage });
   if (json?.ok) {
     if (offerText) offerText.textContent = json.offerBanner || offerBanner;
+    const imgSrc = String(json.offerBannerImage || offerBannerImage || "").trim();
+    if (offerImg) offerImg.src = imgSrc;
+    if (offerMedia) offerMedia.classList.toggle("show", !!imgSrc);
     showToast("ذخیره شد ✅", "بنر بروزرسانی شد", "ADM", false);
     setTimeout(hideToast, 1200);
   } else {
     showToast("خطا", "ذخیره بنر ناموفق بود", "ADM", false);
   }
+});
+
+el("offerImageFile")?.addEventListener("change", async (ev) => {
+  const file = ev?.target?.files?.[0];
+  if (!file) return;
+  if (file.size > 1024 * 1024) {
+    showToast("خطا", "حجم تصویر باید کمتر از 1MB باشد", "ADM", false);
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const dataUrl = typeof reader.result === "string" ? reader.result : "";
+    if (el("offerBannerImageInput")) el("offerBannerImageInput").value = dataUrl;
+    if (offerImg) offerImg.src = dataUrl;
+    if (offerMedia) offerMedia.classList.toggle("show", !!dataUrl);
+  };
+  reader.readAsDataURL(file);
+});
+
+el("clearOfferImage")?.addEventListener("click", async () => {
+  const offerBanner = el("offerBannerInput")?.value || "";
+  const { json } = await adminApi("/api/admin/offer", { offerBanner, clearOfferBannerImage: true });
+  if (el("offerBannerImageInput")) el("offerBannerImageInput").value = "";
+  if (el("offerImageFile")) el("offerImageFile").value = "";
+  if (offerImg) offerImg.src = "";
+  if (offerMedia) offerMedia.classList.remove("show");
+  if (json?.ok) showToast("انجام شد ✅", "تصویر بنر حذف شد", "ADM", false);
 });
 
 el("saveWelcomeTexts")?.addEventListener("click", async () => {
@@ -6265,6 +7114,19 @@ el("saveCustomPrompts")?.addEventListener("click", async () => {
   }
 });
 
+el("customPromptsJsonFile")?.addEventListener("change", async (ev) => {
+  const f = ev?.target?.files?.[0];
+  if (!f) return;
+  const txt = await f.text().catch(() => "");
+  const parsed = safeJsonParse(txt, null);
+  if (!Array.isArray(parsed)) {
+    showToast("خطا", "فایل JSON پرامپت اختصاصی باید آرایه باشد", "ADM", false);
+    return;
+  }
+  if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(parsed, null, 2);
+  showToast("بارگذاری شد ✅", "JSON پرامپت اختصاصی از فایل لود شد", "ADM", false);
+});
+
 el("sendCustomPrompt")?.addEventListener("click", async () => {
   const username = el("customPromptUser")?.value || "";
   const promptId = el("customPromptId")?.value || "";
@@ -6274,11 +7136,16 @@ el("sendCustomPrompt")?.addEventListener("click", async () => {
 
 el("approvePayment")?.addEventListener("click", async () => {
   const payload = {
-    username: el("payUsername")?.value || "",
+    username: (el("payUsername")?.value || "").trim(),
     amount: Number(el("payAmount")?.value || 0),
     days: Number(el("payDays")?.value || 30),
-    txHash: el("payTx")?.value || "",
+    txHash: (el("payTx")?.value || "").trim(),
   };
+  if (!payload.username || !Number.isFinite(payload.amount) || payload.amount <= 0) {
+    showToast("خطا", "یوزرنیم و مبلغ معتبر را وارد کنید.", "PAY", false);
+    return;
+  }
+  if (!Number.isFinite(payload.days) || payload.days <= 0) payload.days = 30;
   const { json } = await adminApi("/api/admin/payments/approve", payload);
   if (json?.ok) {
     showToast("پرداخت تایید شد ✅", "اشتراک فعال شد", "PAY", false);
@@ -6344,6 +7211,33 @@ el("downloadReportPdf")?.addEventListener("click", async () => {
   }
 });
 
+
+el("reconnect")?.addEventListener("click", async () => {
+  OFFLINE_MODE = false;
+  setupTabs();
+  boot();
+});
+
+window.addEventListener("online", () => {
+  if (pillTxt && pillTxt.textContent.toLowerCase().includes("offline")) pillTxt.textContent = "Online";
+});
+
+window.addEventListener("offline", () => {
+  if (pillTxt) pillTxt.textContent = "Offline";
+});
+
+el("paymentPresets")?.addEventListener("click", (e) => {
+  const btn = e.target?.closest?.("[data-days]");
+  if (!btn) return;
+  const days = Number(btn.getAttribute("data-days") || 30);
+  const amount = Number(btn.getAttribute("data-amount") || 0);
+  if (el("payDays")) el("payDays").value = String(days);
+  if (el("payAmount")) el("payAmount").value = String(amount);
+  if (el("payDailyLimit") && !el("payDailyLimit").value) el("payDailyLimit").value = "50";
+  showToast("پلن انتخاب شد ✅", "روز: " + days + " | مبلغ: " + amount, "PAY", false);
+});
+
+setupTabs();
 boot();`;
 
 
