@@ -16,7 +16,7 @@ export default {
         url.pathname !== "/health" &&
         !url.pathname.startsWith("/api/") &&
         !url.pathname.startsWith("/telegram/") &&
-        !/\/[^/]+\.[^/]+$/.test(url.pathname)
+        !url.pathname.endsWith(".js")
       ) {
         return htmlResponse(MINI_APP_HTML);
       }
@@ -33,7 +33,9 @@ export default {
           return jsonResponse({ ok: false, error: v.reason }, 401);
         }
 
-        const st = await ensureUser(v.userId, env);
+        const st = await ensureUser(v.userId, env, v.fromLike);
+        applyLocaleFromTelegramUser(st, v.fromLike || {});
+        if (env.BOT_KV) await saveUser(v.userId, st, env);
         const quota = isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
         const symbols = [...MAJORS, ...METALS, ...INDICES, ...CRYPTOS];
         const miniToken = await issueMiniappToken(env, v.userId, v.fromLike || {});
@@ -257,9 +259,11 @@ ${reply}`;
 
         if (url.pathname === "/api/admin/offer") {
           if (typeof body.offerBanner === "string" && env.BOT_KV) {
-            await setOfferBannerSafe(env, body.offerBanner);
+            await setOfferBanner(env, body.offerBanner);
           }
-          if (typeof body.offerBannerImage === "string") {
+          if (body.clearOfferBannerImage) {
+            await setOfferBannerImage(env, "");
+          } else if (typeof body.offerBannerImage === "string") {
             try {
               await setOfferBannerImage(env, body.offerBannerImage);
             } catch (e) {
@@ -616,7 +620,7 @@ TxID: ${txid}
         const tf = String(url.searchParams.get("tf") || "H4").trim().toUpperCase();
         const levelsRaw = String(url.searchParams.get("levels") || "").trim();
         const levels = levelsRaw
-          ? levelsRaw.split(",").map((x) => Number(x)).filter((n) => Number.isFinite(n)).slice(0, 6)
+          ? levelsRaw.split(",").map((x) => Number(x)).filter((n) => Number.isFinite(n)).slice(0, 8)
           : [];
 
         if (!symbol || !isSymbol(symbol)) {
@@ -641,17 +645,6 @@ TxID: ${txid}
         }
 
         if (!Array.isArray(candles) || candles.length === 0) {
-          if (Array.isArray(levels) && levels.length) {
-            const svg = buildLevelsOnlySvg(symbol, tf, levels);
-            return new Response(svg, {
-              status: 200,
-              headers: {
-                "Content-Type": "image/svg+xml; charset=utf-8",
-                "Cache-Control": "public, max-age=30",
-                "X-Chart-Fallback": "levels_only_svg",
-              },
-            });
-          }
           return jsonResponse({ ok: false, error: "no_market_data" }, 404);
         }
 
@@ -795,13 +788,19 @@ TxID: ${txid}
         const v = await verifyMiniappAuth(body, env);
         if (!v.ok) return jsonResponse({ ok: false, error: v.reason }, 401);
 
-        const st = await ensureUser(v.userId, env);
+        const st = await ensureUser(v.userId, env, v.fromLike);
         const symbol = String(body.symbol || "").trim();
         if (!symbol || !isSymbol(symbol)) return jsonResponse({ ok: false, error: "invalid_symbol" }, 400);
 
-        // lightweight onboarding gate for mini-app: block only if absolutely no identity fields exist
-        const hasAnyIdentity = !!(st.profile?.name || st.profile?.phone || st.profile?.username || v.fromLike?.username);
-        if (!hasAnyIdentity) {
+        const isOnboardingReady = !!(
+          st.profile?.onboardingDone &&
+          st.profile?.name &&
+          st.profile?.phone &&
+          st.profile?.preferredStyle &&
+          st.profile?.preferredMarket &&
+          Number(st.profile?.capital || 0) > 0
+        );
+        if (!isOnboardingReady) {
           return jsonResponse({ ok: false, error: "onboarding_required" }, 403);
         }
 
@@ -828,12 +827,14 @@ TxID: ${txid}
           let levels = [];
           let quickChartSpec = null;
           let zonesSvg = "";
+          let chartCandlesCount = 0;
           try {
             if (String(env.QUICKCHART || "") !== "0") {
               const tf = st.timeframe || "H4";
-              const candles = await getMarketCandlesWithFallback(env, symbol, tf).catch(() => []);
-              levels = refineLevelsByCandles(extractLevels(result), candles);
+              levels = extractLevels(result);
               const origin = new URL(request.url).origin;
+              const candles = await getMarketCandlesWithFallback(env, symbol, tf).catch(() => []);
+              chartCandlesCount = Array.isArray(candles) ? candles.length : 0;
               if (Array.isArray(candles) && candles.length) {
                 chartUrl = `${origin}/api/chart?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&levels=${encodeURIComponent(levels.join(","))}`;
                 quickChartSpec = buildQuickChartSpec(candles, symbol, tf, levels);
@@ -850,10 +851,19 @@ TxID: ${txid}
           } catch (e) {
             console.error("zones svg build error:", e?.message || e);
           }
-          const quickchartConfig = { symbol, timeframe: st.timeframe || "H4", levels };
-          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec, quickchartConfig, zonesSvg });
+          const tf = st.timeframe || "H4";
+          const quickchartConfig = { symbol, timeframe: tf, levels };
+          const chartMeta = { timeframe: tf, candles: chartCandlesCount, zones: levels.length };
+          return jsonResponse({ ok: true, result, state: st, quota, chartUrl, levels, quickChartSpec, quickchartConfig, chartMeta, zonesSvg });
         } catch (e) {
           console.error("api/analyze error:", e);
+          const msg = String(e?.message || e || "");
+          if (msg.includes("api_analyze_timeout") || msg.includes("text_") || msg.includes("timeout")) {
+            let candles = [];
+            try { candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4"); } catch {}
+            const fallback = buildLocalFallbackAnalysis(symbol, st, candles, msg || "analysis_timeout");
+            return jsonResponse({ ok: true, result: fallback, state: st, quota: isStaff(v.fromLike, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`, fallback: true, reason: msg || "timeout" });
+          }
           return jsonResponse({ ok: false, error: "server_error" }, 500);
         }
       }
@@ -984,7 +994,7 @@ const BTN = {
 };
 
 const TYPING_INTERVAL_MS = 4000;
-const TIMEOUT_TEXT_MS = 26000;
+const TIMEOUT_TEXT_MS = 38000;
 const TIMEOUT_VISION_MS = 12000;
 const TIMEOUT_POLISH_MS = 15000;
 
@@ -1043,15 +1053,41 @@ function applyLocaleDefaults(st) {
   st.profile.countryCode = st.profile.countryCode || loc.country;
   st.profile.timezone = st.profile.timezone || loc.tz;
 
-  if (!st.timeframe) st.timeframe = (loc.country === "IR" ? "H1" : "H4");
-  if (!st.risk) st.risk = "متوسط";
-  if (!st.style) st.style = "پرایس اکشن";
+  const policy = localePolicy(st.profile.language, st.profile.countryCode);
+  if (!st.timeframe) st.timeframe = policy.timeframe;
+  if (!st.risk) st.risk = policy.risk;
+  if (!st.style) st.style = policy.style;
   if (st.profile.preferredStyle && ALLOWED_STYLE_LIST.includes(st.profile.preferredStyle)) {
     st.style = st.profile.preferredStyle;
   }
   if (typeof st.newsEnabled !== "boolean") st.newsEnabled = true;
   if (!st.promptMode) st.promptMode = "style_plus_custom";
   return st;
+}
+
+function localePolicy(language = "fa", country = "IR") {
+  const lang = String(language || "fa").toLowerCase();
+  const c = String(country || "IR").toUpperCase();
+  if (c === "IR") return { timeframe: "H1", risk: "متوسط", style: "پرایس اکشن" };
+  if (lang.startsWith("ar")) return { timeframe: "H1", risk: "متوسط", style: "ترکیبی" };
+  if (lang.startsWith("tr") || lang.startsWith("ru")) return { timeframe: "H4", risk: "متوسط", style: "ICT" };
+  return { timeframe: "H4", risk: "medium", style: "پرایس اکشن" };
+}
+
+function applyLocaleFromTelegramUser(st, fromLike = {}) {
+  st.profile = st.profile || {};
+  const langRaw = String(fromLike?.language_code || "").trim().toLowerCase();
+  if (!st.profile.language && langRaw) st.profile.language = langRaw.split("-")[0];
+  if (!st.profile.countryCode && langRaw.includes("-")) st.profile.countryCode = langRaw.split("-")[1].toUpperCase();
+  if (!st.profile.countryCode) st.profile.countryCode = st.profile.language === "fa" ? "IR" : "INT";
+  if (!st.profile.timezone) {
+    const tzMap = { fa: "Asia/Tehran", ar: "Asia/Riyadh", tr: "Europe/Istanbul", ru: "Europe/Moscow", en: "UTC" };
+    st.profile.timezone = tzMap[st.profile.language] || "UTC";
+  }
+  const policy = localePolicy(st.profile.language, st.profile.countryCode);
+  if (!st.timeframe) st.timeframe = policy.timeframe;
+  if (!st.risk) st.risk = policy.risk;
+  if (!st.style) st.style = policy.style;
 }
 
 async function finalizeOnboardingRewards(env, st) {
@@ -1092,25 +1128,19 @@ function isStaff(from, env) {
 }
 
 function isOwner(from, env) {
-  const uid = String(from?.userId || from?.id || "").trim();
-  const ownerIds = String(env.OWNER_USER_IDS || env.OWNER_IDS || "").split(",").map((x) => String(x || "").trim()).filter(Boolean);
-  if (uid && ownerIds.includes(uid)) return true;
-
   const u = normHandle(from?.username);
+  if (!u) return false;
   const raw = (env.OWNER_HANDLES || "").toString().trim();
-  if (!u || !raw) return false;
+  if (!raw) return false;
   const set = new Set(raw.split(",").map(normHandle).filter(Boolean));
   return set.has(u);
 }
 
 function isAdmin(from, env) {
-  const uid = String(from?.userId || from?.id || "").trim();
-  const adminIds = String(env.ADMIN_USER_IDS || env.ADMIN_IDS || "").split(",").map((x) => String(x || "").trim()).filter(Boolean);
-  if (uid && adminIds.includes(uid)) return true;
-
   const u = normHandle(from?.username);
+  if (!u) return false;
   const raw = (env.ADMIN_HANDLES || "").toString().trim();
-  if (!u || !raw) return false;
+  if (!raw) return false;
   const set = new Set(raw.split(",").map(normHandle).filter(Boolean));
   return set.has(u);
 }
@@ -1567,6 +1597,11 @@ async function getOfferBanner(env) {
   return (raw || env.SPECIAL_OFFER_TEXT || "").toString().trim();
 }
 
+async function setOfferBanner(env, text) {
+  if (!env.BOT_KV) return;
+  await env.BOT_KV.put("settings:offer_banner", String(text || "").trim());
+}
+
 async function getOfferBannerImage(env) {
   if (!env.BOT_KV) return (env.SPECIAL_OFFER_IMAGE || "").toString().trim();
   const raw = await env.BOT_KV.get("settings:offer_banner_image");
@@ -1585,14 +1620,13 @@ async function setOfferBannerImage(env, dataUrl) {
     await env.BOT_KV.delete("settings:offer_banner_image");
     return;
   }
-  if (!clean.startsWith("data:image/")) throw new Error("bad_offer_image_format");
-  if (clean.length > 1_500_000) throw new Error("offer_image_too_large");
+  const isDataImage = clean.startsWith("data:image/");
+  const isHttpUrl = /^https?:\/\//i.test(clean);
+  if (!isDataImage && !isHttpUrl) throw new Error("bad_offer_image_format");
+  if (isDataImage && clean.length > 1_500_000) throw new Error("offer_image_too_large");
   await env.BOT_KV.put("settings:offer_banner_image", clean);
 }
 
-
-// Compatibility alias for editor diagnostics in mirrored index.js files.
-const setOfferBannerSafe = async (env, text) => setOfferBanner(env, text);
 async function getCommissionSettings(env) {
   if (!env.BOT_KV) return { globalPercent: 0, overrides: {} };
   const g = await env.BOT_KV.get("settings:commission:globalPercent");
@@ -1937,11 +1971,17 @@ function contactKeyboard() {
   };
 }
 
+const DEFAULT_MINIAPP_URL = "https://sniperim.mad-pyc.workers.dev/";
+
 function getMiniappUrl(env) {
-  // Canonical Mini App URL (also configured in BotFather)
-  const fallback = "https://sniperim.mad-pyc.workers.dev/";
-  const u = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || fallback).toString().trim();
-  return u.endsWith("/") ? u : (u + "/");
+  const configured = (env.MINIAPP_URL || env.PUBLIC_BASE_URL || "").toString().trim();
+  const raw = configured || DEFAULT_MINIAPP_URL;
+  try {
+    const u = new URL(raw);
+    return u.toString();
+  } catch {
+    return DEFAULT_MINIAPP_URL;
+  }
 }
 async function miniappInlineKeyboard(env, st, from) {
   const url = getMiniappUrl(env);
@@ -2161,6 +2201,7 @@ async function ensureUser(userId, env, from) {
   if (from?.username) st.profile.username = String(from.username);
   if (from?.first_name) st.profile.firstName = String(from.first_name);
   if (from?.last_name) st.profile.lastName = String(from.last_name);
+  applyLocaleFromTelegramUser(st, from || {});
   if (st.profile?.phone) applyLocaleDefaults(st);
 
   const today = kyivDateString();
@@ -2231,6 +2272,13 @@ async function tgSendMessage(env, chatId, text, replyMarkup) {
     reply_markup: replyMarkup,
     disable_web_page_preview: true,
   });
+}
+
+async function tgSendLongMessage(env, chatId, text, replyMarkup) {
+  const parts = chunkText(String(text || ""), 3500);
+  for (const part of parts) {
+    await tgSendMessage(env, chatId, part, replyMarkup);
+  }
 }
 
 async function tgSendMessageHtml(env, chatId, html, replyMarkup) {
@@ -3106,7 +3154,6 @@ async function getMarketCandlesWithFallback(env, symbol, timeframe) {
       lastErr = e;
       markProviderFailure(p, env, "market");
       console.error("market provider failed:", p, e?.message || e);
-      markProviderFailure(p, env);
     }
   }
 
@@ -3180,7 +3227,7 @@ async function getMarketCandlesWithFallbackRaw(env, symbol, timeframe, timeoutMs
       markProviderFailure(p, env, "market");
     } catch (e) {
       lastErr = e;
-      markProviderFailure(p, env);
+      markProviderFailure(p, env, "market");
     }
   }
   throw lastErr || new Error("market_data_alt_failed");
@@ -3470,7 +3517,7 @@ ${newsAnalysisBlock}
 ` : ``) +
     `RULES:
 ` +
-    `- خروجی فقط فارسی و دقیقاً بخش‌های ۱ تا ۵
+    `- خروجی به زبان کاربر باشد (Lang=${st.profile?.language || "fa"}) و دقیقاً بخش‌های ۱ تا ۵
 ` +
     (st.style === "ترکیبی" || promptMode === "combined_all"
       ? `- از ترکیب سبک‌ها (پرایس اکشن، اسمارت‌مانی، ساختار بازار، حجم، سناریو) استفاده کن
@@ -3748,22 +3795,9 @@ async function handleUpdate(update, env) {
     if (text === "/wallet" || text === BTN.WALLET) {
       const wallet = await getWallet(env);
       const txt =
-        `💳 ولت
-🧾 تاریخچه تراکنشات
-ولت
-➕ واریز
-
-` +
-        `marketi1 PRO
-با ارزش ۲۵ USDT
-
-` +
-        (wallet ? `آدرس ولت درگاه:
-${wallet}
-
-` : "") +
-        `«واریزی فقط به آدرس ولت درگاه ممکن است
-در لیست زیر باید از واریز هش واریزی را ارسال کنید.»`;
+        `💳 ولت و پرداخت\n\n` +
+        (wallet ? `آدرس ولت:\n${wallet}\n\n` : "") +
+        `برای مشاهده موجودی، واریز یا برداشت از دکمه‌ها استفاده کن.`;
       return tgSendMessage(env, chatId, txt, walletMenuKeyboard());
     }
 
@@ -3781,19 +3815,11 @@ ${wallet}
         `➕ واریز
 
 ` +
-        `marketi1 PRO
-با ارزش ۲۵ USDT
-
-` +
-        (wallet ? `آدرس ولت درگاه:
+        (wallet ? `آدرس ولت:
 ${wallet}
 ` : "") +
         `
 Memo/Tag: ${memo}
-
-` +
-        `«واریزی فقط به آدرس ولت درگاه ممکن است
-در لیست زیر باید از واریز هش واریزی را ارسال کنید.»
 
 ` +
         `TxID پرداخت را همینجا بفرست (در صورت نیاز: <txid> <amount>).`;
@@ -3812,7 +3838,7 @@ Memo/Tag: ${memo}
     }
 
     if (text === "/invite" || text === BTN.INVITE) {
-      const { link, share, points, invites } = inviteShareText(st, env);
+      const { link, share } = inviteShareText(st, env);
       if (!link) return tgSendMessage(env, chatId, "لینک دعوت آماده نیست. بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
       const txt =
         `🤝 دعوت دوستان
@@ -3822,13 +3848,7 @@ Memo/Tag: ${memo}
 
 ` +
         (share ? `برای اشتراک‌گذاری سریع: <a href="${escapeHtml(share)}">ارسال لینک</a>
-
-` : "") +
-        `🎁 امتیاز فعلی: ${points}
-👥 دعوت موفق: ${invites}
-
-ℹ️ هر دعوت موفق ۳ امتیاز.
-هر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
+` : "");
       return tgSendMessageHtml(env, chatId, txt, mainMenuKeyboard(env));
     }
 
@@ -3844,9 +3864,7 @@ Memo/Tag: ${memo}
       return tgSendMessage(
         env,
         chatId,
-        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.
-
-با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.\n\nپیام مستقیم: ${handle}${walletLine}`,
+        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.\n\nپیام مستقیم: ${handle}${walletLine}`,
         kb([[BTN.SUPPORT_FAQ, BTN.SUPPORT_TICKET], [BTN.SUPPORT_CUSTOM_PROMPT], [BTN.HOME]])
       );
     }
@@ -3903,21 +3921,16 @@ ${summary || "تحلیل خبری در دسترس نیست."}`, mainMenuKeyboard
       if (!url) {
         return tgSendMessage(env, chatId, `⚠️ لینک مینی‌اپ تنظیم نشده.
 
-پیش‌فرض سیستم روی https://sniperim.mad-pyc.workers.dev/ است؛ اگر دامنه دیگری می‌خواهی، در Wrangler / داشبورد مقدار MINIAPP_URL یا PUBLIC_BASE_URL را ست کن و Deploy بزن.`, mainMenuKeyboard(env));
+در Wrangler / داشبورد یک متغیر ENV به نام MINIAPP_URL یا PUBLIC_BASE_URL بگذار (مثلاً https://<your-worker-domain>/ ) و دوباره Deploy کن.`, mainMenuKeyboard(env));
       }
       const token = await issueMiniappToken(env, st.userId, from);
       const finalUrl = token ? appendQuery(url, { miniToken: token }) : url;
-      const kbInline = {
-        inline_keyboard: [
-          [{ text: "🧩 ورود داخل تلگرام", web_app: { url: finalUrl } }],
-          [{ text: "🔗 اتصال جایگزین", url: finalUrl }],
-        ],
-      };
+      const kbInline = { inline_keyboard: [[{ text: BTN.MINIAPP, web_app: { url: finalUrl } }]] };
       return tgSendMessage(env, chatId, `🧩 مینی‌اپ فعال شد.
 
-روش جدید اتصال: ابتدا دکمه «ورود داخل تلگرام» را بزن.
-اگر باز نشد، دکمه «اتصال جایگزین» را بزن یا لینک زیر را باز کن:
-${finalUrl}`, kbInline);
+از دکمه زیر وارد شوید. اگر دکمه باز نشد، این لینک را مستقیم باز کنید:
+${finalUrl}\n\nچک‌لیست سریع اتصال:
+${MINIAPP_EXEC_CHECKLIST}`, kbInline);
     }
 
 
@@ -4050,22 +4063,10 @@ ${finalUrl}`, kbInline);
       await saveUser(userId, st, env);
 
       const marketFa = ({crypto:"کریپتو", forex:"فارکس", metals:"فلزات", stocks:"سهام"})[result.recommendedMarket] || "کریپتو";
-      const nudge = await buildOnboardingNudge(env, st);
       return tgSendMessage(
         env,
         chatId,
-        `✅ تعیین سطح انجام شد.
-
-سطح: ${st.profile.level}
-پیشنهاد بازار: ${marketFa}
-
-تنظیمات پیشنهادی:
-⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}
-
-یادداشت:
-${st.profile.levelNotes || "—"}${nudge}
-
-اگر می‌خوای دوباره تعیین‌سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
+        `✅ تعیین سطح انجام شد.\n\nسطح: ${st.profile.level}\nپیشنهاد بازار: ${marketFa}\n\nتنظیمات پیشنهادی:\n⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}\n\nیادداشت:\n${st.profile.levelNotes || "—"}\n\nاگر می‌خوای دوباره تعیین‌سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
         mainMenuKeyboard(env)
       );
     }
@@ -4386,8 +4387,7 @@ async function startOnboarding(env, chatId, from, st) {
     await saveUser(st.userId, st, env);
     return tgSendMessage(env, chatId, "🎯 سبک ترجیحی‌ات را انتخاب کن:", optionsKeyboard(ALLOWED_STYLE_LIST));
   }
-  const flags = await getAdminFlags(env);
-  if (flags.capitalModeEnabled && !Number(st.profile?.capital || 0)) {
+  if (!Number(st.profile?.capital || 0)) {
     st.state = "onb_capital";
     await saveUser(st.userId, st, env);
     return tgSendMessage(env, chatId, "💼 سرمایه تقریبی‌ات را وارد کن (عدد). مثال: 1000", kb([[BTN.BACK, BTN.HOME]]));
@@ -4492,19 +4492,15 @@ async function sendSettingsSummary(env, chatId, st, from) {
 function profileText(st, from, env) {
   const quota = isStaff(from, env) ? "∞" : `${st.dailyUsed}/${dailyLimit(env, st)}`;
   const adminTag = isStaff(from, env) ? "✅ ادمین/اونر" : "👤 کاربر";
-  const level = st.profile?.level ? `
-سطح: ${st.profile.level}` : "";
+  const level = st.profile?.level ? `\nسطح: ${st.profile.level}` : "";
+  const pts = st.referral?.points || 0;
+  const inv = st.referral?.successfulInvites || 0;
 
-  return `👤 پروفایل
+  const botUser = env.BOT_USERNAME ? String(env.BOT_USERNAME).replace(/^@/, "") : "";
+  const code = (st.referral?.codes || [])[0] || "";
+  const deep = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "-";
 
-وضعیت: ${adminTag}
-🆔 ID: ${st.userId}
-نام: ${st.profile?.name || "-"}
-یوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}
-شماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}
-
-📅 امروز(Tehran): ${kyivDateString()}
-سهمیه امروز: ${quota}`;
+  return `👤 پروفایل\n\nوضعیت: ${adminTag}\n🆔 ID: ${st.userId}\nنام: ${st.profile?.name || "-"}\nیوزرنیم: ${st.profile?.username ? "@"+st.profile.username : "-"}\nشماره: ${st.profile?.phone ? maskPhone(st.profile.phone) : "-"}${level}\n\n📅 امروز(Tehran): ${kyivDateString()}\nسهمیه امروز: ${quota}\n\n🎁 امتیاز: ${pts}\n👥 دعوت موفق: ${inv}\n\n🔗 لینک رفرال اختصاصی:\n${deep}\n\nℹ️ هر دعوت موفق ۳ امتیاز.\nهر ۵۰۰ امتیاز = ۳۰ روز اشتراک هدیه.`;
 }
 
 function inviteShareText(st, env) {
@@ -4512,7 +4508,7 @@ function inviteShareText(st, env) {
   const code = (st.referral?.codes || [])[0] || "";
   const link = code ? (botUser ? `https://t.me/${botUser}?start=ref_${code}` : `ref_${code}`) : "";
   const share = link ? `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent("با لینک من عضو شو و اشتراک هدیه بگیر ✅")}` : "";
-  return { link, share, points: Number(st?.referral?.points || 0), invites: Number(st?.referral?.successfulInvites || 0) };
+  return { link, share };
 }
 
 /* ========================== FLOWS ========================== */
@@ -4755,6 +4751,14 @@ async function runSignalTextFlow(env, chatId, from, st, symbol, userPrompt) {
   } catch (e) {
     console.error("runSignalTextFlow error:", e);
     t.stop = true;
+    const msg = String(e?.message || e || "");
+    if (msg.includes("timeout") || msg.includes("text_")) {
+      let candles = [];
+      try { candles = await getMarketCandlesWithFallback(env, symbol, st.timeframe || "H4"); } catch {}
+      const fallback = buildLocalFallbackAnalysis(symbol, st, candles, msg || "signal_timeout");
+      await tgSendLongMessage(env, chatId, fallback, kb([[BTN.HOME]]));
+      return false;
+    }
     await tgSendMessage(env, chatId, "⚠️ فعلاً امکان انجام این عملیات نیست. لطفاً بعداً دوباره تلاش کن.", mainMenuKeyboard(env));
     return false;
   }
@@ -4821,14 +4825,21 @@ async function runSignalTextFlowReturnText(env, from, st, symbol, userPrompt) {
     console.error("text providers failed (retry compact):", e?.message || e);
     try {
       const compactBlock = buildMarketBlock(candles, 40);
-      const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env, newsBlock);      draft = await runTextProviders(compactPrompt, env, st.textOrder);
+      const compactPrompt = await buildTextPromptForSymbol(symbol, userPrompt, st, compactBlock, env, newsBlock);
+      draft = await runTextProviders(compactPrompt, env, st.textOrder);
     } catch (e2) {
       console.error("text providers failed (fallback local):", e2?.message || e2);
       draft = buildLocalFallbackAnalysis(symbol, st, candles, e2?.message || "text_provider_timeout");
     }
   }
-  const polished = await runPolishProviders(draft, env, st.polishOrder);
-  const clean = stripHiddenModelOutput(polished);
+  let polished = draft;
+  try {
+    polished = await runPolishProviders(draft, env, st.polishOrder);
+  } catch (e) {
+    console.error("polish flow failed:", e?.message || e);
+    polished = draft;
+  }
+  const clean = stripHiddenModelOutput(polished || draft);
   if (useCache && clean) await setAnalysisCache(env, cacheKey, clean);
   return clean;
 }
@@ -4927,48 +4938,43 @@ function buildLevelsOnlySvg(symbol, timeframe, levels = []) {
 
 function extractLevels(text) {
   const src = String(text || "");
-  const allNums = (src.match(/\b\d{1,7}(?:\.\d{1,6})?\b/g) || [])
-    .map(Number)
-    .filter((n) => Number.isFinite(n) && n > 0);
+  const lines = src.split(/\r?\n/);
+  const weighted = [];
+  const plain = [];
 
-  const keyLines = src
-    .split(/\n+/)
-    .filter((ln) => /(?:support|resistance|zone|entry|sl|tp|حمایت|مقاومت|زون|ورود|حد\s*ضرر|حد\s*سود)/i.test(ln));
-  const hinted = (keyLines.join("\n").match(/\b\d{1,7}(?:\.\d{1,6})?\b/g) || [])
-    .map(Number)
-    .filter((n) => Number.isFinite(n) && n > 0);
+  const scoreLine = (ln) => {
+    const l = ln.toLowerCase();
+    let score = 0;
+    if (/زون|zone|support|resistance|sr|flip|entry|tp|sl|target/.test(l)) score += 4;
+    if (/\d/.test(l)) score += 1;
+    return score;
+  };
 
-  const base = hinted.length ? hinted : allNums;
-  const cleanNums = base.filter((n) => n > 0.0000001 && n < 10000000);
-  cleanNums.sort((a, b) => a - b);
-
-  const merged = [];
-  for (const v of cleanNums) {
-    if (!merged.length) { merged.push(v); continue; }
-    const prev = merged[merged.length - 1];
-    const tol = Math.max(0.0001, prev * 0.0025);
-    if (Math.abs(v - prev) <= tol) {
-      merged[merged.length - 1] = Number(((prev + v) / 2).toFixed(6));
-    } else {
-      merged.push(v);
+  for (const ln of lines) {
+    const nums = (ln.match(/\b\d{1,6}(?:\.\d{1,8})?\b/g) || [])
+      .map(Number)
+      .filter((n) => Number.isFinite(n) && n > 0);
+    if (!nums.length) continue;
+    const sc = scoreLine(ln);
+    for (const n of nums) {
+      if (sc >= 4) weighted.push(n);
+      else plain.push(n);
     }
   }
-  return merged.slice(0, 10);
-}
 
-function refineLevelsByCandles(levels, candles) {
-  const lv = (Array.isArray(levels) ? levels : []).map(Number).filter((n) => Number.isFinite(n) && n > 0);
-  if (!lv.length) return [];
-  if (!Array.isArray(candles) || !candles.length) return lv.slice(0, 8);
-  const highs = candles.map((x) => Number(x?.h)).filter((n) => Number.isFinite(n));
-  const lows = candles.map((x) => Number(x?.l)).filter((n) => Number.isFinite(n));
-  if (!highs.length || !lows.length) return lv.slice(0, 8);
-  const hi = Math.max(...highs), lo = Math.min(...lows);
-  const minV = lo * 0.7;
-  const maxV = hi * 1.3;
-  const filtered = lv.filter((n) => n >= minV && n <= maxV);
-  if (!filtered.length) return extractLevelsFromCandles(candles).slice(0, 8);
-  return [...new Set(filtered.map((n) => Number(n.toFixed(6))))].sort((a,b)=>a-b).slice(0, 8);
+  const all = [...weighted, ...plain]
+    .filter((n) => Number.isFinite(n))
+    .filter((n) => n >= 0.00001 && n <= 1_000_000)
+    .sort((a, b) => a - b);
+
+  const dedup = [];
+  for (const n of all) {
+    const prev = dedup[dedup.length - 1];
+    if (prev == null || Math.abs(prev - n) > Math.max(1e-6, Math.abs(prev) * 0.0005)) {
+      dedup.push(Number(n.toFixed(6)));
+    }
+  }
+  return dedup.slice(0, 8);
 }
 
 function extractLevelsFromCandles(candles) {
@@ -5066,25 +5072,10 @@ function escapeHtml(s) {
 
 /* ========================== MINI APP INLINE ASSETS ========================== */
 function htmlResponse(html, status = 200) {
-  return new Response(html, {
-    status,
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      "x-content-type-options": "nosniff",
-      "referrer-policy": "no-referrer",
-    },
-  });
+  return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8" } });
 }
 function jsResponse(js, status = 200) {
-  return new Response(js, {
-    status,
-    headers: {
-      "content-type": "application/javascript; charset=utf-8",
-      "cache-control": "no-store",
-      "x-content-type-options": "nosniff",
-      "referrer-policy": "no-referrer",
-    },
-  });
+  return new Response(js, { status, headers: { "content-type": "application/javascript; charset=utf-8" } });
 }
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json; charset=utf-8" } });
@@ -5161,7 +5152,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const initRaw = String(initData || "").trim();
   if (lenient && initRaw.startsWith("dev:")) {
     const devId = Number(initRaw.split(":")[1] || "0") || 999001;
-    return { ok: true, userId: devId, fromLike: { username: "dev_user", userId: String(devId), id: devId } };
+    return { ok: true, userId: devId, fromLike: { username: "dev_user" } };
   }
   if (!botToken && !lenient) return { ok: false, reason: "bot_token_missing" };
 
@@ -5173,7 +5164,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const authDate = Number(params.get("auth_date") || "0");
   if ((!Number.isFinite(authDate) || authDate <= 0) && !lenient) return { ok: false, reason: "auth_date_invalid" };
   const now = Math.floor(Date.now() / 1000);
-  const maxAgeSec = Math.max(60, Number(maxAgeSecRaw || 0) || (lenient ? 7 * 24 * 60 * 60 : 300));
+  const maxAgeSec = Math.max(60, Number(maxAgeSecRaw || 0) || (7 * 24 * 60 * 60));
   if (Number.isFinite(authDate) && authDate > 0 && (now - authDate > maxAgeSec) && !lenient) return { ok: false, reason: "initData_expired" };
 
   const pairs = [];
@@ -5190,7 +5181,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const userId = user?.id || Number(params.get("user_id") || "0");
   if (!userId) return { ok: false, reason: "user_missing" };
 
-  const fromLike = { username: user?.username || "", userId: String(userId), id: Number(userId) || undefined };
+  const fromLike = { username: user?.username || "", first_name: user?.first_name || "", last_name: user?.last_name || "", language_code: user?.language_code || "" };
   return { ok: true, userId, fromLike };
 }
 
@@ -5225,7 +5216,6 @@ const MINI_APP_HTML = `<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <title>MarketiQ Mini App</title>
   <meta name="color-scheme" content="dark light" />
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
     :root{
       --bg: #0B0F17;
@@ -5640,8 +5630,7 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="actions">
             <button id="sendSupportTicket" class="btn">✉️ ارسال تیکت</button>
           </div>
-          <div class="muted" style="font-size:12px; line-height:1.6;">پاسخ از طریق پشتیبانی تلگرام ارسال می‌شود.
-با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.</div>
+          <div class="muted" style="font-size:12px; line-height:1.6;">پاسخ از طریق پشتیبانی تلگرام ارسال می‌شود.</div>
         </div>
       </div>
 
@@ -5662,9 +5651,6 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="field">
             <div class="label">پرامپت سبک‌ها (JSON)</div>
             <textarea id="stylePromptJson" class="control" placeholder='{"پرایس_اکشن":"...","ict":"...","atr":"..."}'></textarea>
-            <div class="admin-row">
-              <input id="stylePromptJsonFile" type="file" accept="application/json,.json" class="control" />
-            </div>
             <div class="actions">
               <button id="saveStylePrompts" class="btn">ذخیره JSON سبک‌ها</button>
             </div>
@@ -5748,16 +5734,15 @@ const MINI_APP_HTML = `<!doctype html>
           <div class="field admin-tab" data-tab="content">
             <div class="label">بنر پیشنهاد (نمایش داخل مینی‌اپ)</div>
             <textarea id="offerBannerInput" class="control" placeholder="متن بنر پیشنهاد..."></textarea>
-            <input id="offerBannerImageInput" type="file" accept="image/*" class="control" />
+            <input id="offerImageFile" type="file" accept="image/*" class="control" />
             <div class="muted" style="font-size:12px;">برای حذف تصویر، فایل را خالی بگذار و ذخیره کن.</div>
             <div class="actions">
               <button id="saveOfferBanner" class="btn">ذخیره بنر</button>
             </div>
             <div class="admin-row">
-              <input id="offerImageFile" type="file" accept="image/*" class="control" />
+              <input id="offerBannerImageUrlInput" class="control" placeholder="یا لینک تصویر بنر..." />
               <button id="clearOfferImage" class="btn ghost">حذف تصویر</button>
             </div>
-            <input id="offerBannerImageInput" class="control" placeholder="یا لینک تصویر بنر..." />
           </div>
 
           <div class="field admin-tab" data-tab="content">
@@ -5889,46 +5874,9 @@ const MINI_APP_HTML = `<!doctype html>
 </body>
 </html>`;
 
-const MINI_APP_JS = `let tg = null;
-
-function injectTelegramSdkOnce() {
-  if (window.Telegram?.WebApp) return Promise.resolve();
-  return new Promise((resolve) => {
-    const existing = document.querySelector('script[src="https://telegram.org/js/telegram-web-app.js"]');
-    const finish = () => {
-      let tries = 0;
-      const t = setInterval(() => {
-        if (window.Telegram?.WebApp) { clearInterval(t); resolve(); return; }
-        tries++;
-        if (tries >= 20) { clearInterval(t); resolve(); }
-      }, 100);
-      setTimeout(() => { clearInterval(t); resolve(); }, 4000);
-    };
-    if (existing) {
-      if (window.Telegram?.WebApp) return resolve();
-      existing.addEventListener('load', finish, { once: true });
-      setTimeout(finish, 200);
-      return;
-    }
-    const sc = document.createElement('script');
-    sc.src = 'https://telegram.org/js/telegram-web-app.js';
-    sc.async = true;
-    sc.onload = finish;
-    sc.onerror = () => resolve();
-    document.head.appendChild(sc);
-  });
-}
-
-async function ensureTelegramReady() {
-  await injectTelegramSdkOnce();
-  const webapp = window.Telegram?.WebApp || null;
-  if (webapp) {
-    webapp.ready();
-    if (webapp.expand) webapp.expand();
-  }
-  tg = webapp;
-  return { tg: webapp, isTelegramRuntime: !!webapp };
-}
+const MINI_APP_JS = `const tg = window.Telegram?.WebApp;
+if (tg) tg.ready();
+if (tg?.expand) tg.expand();
 
 const out = document.getElementById("out");
 const meta = document.getElementById("meta");
@@ -5944,6 +5892,11 @@ const reportBlock = document.getElementById("reportBlock");
 const roleLabel = document.getElementById("roleLabel");
 const energyToday = document.getElementById("energyToday");
 const remainingAnalyses = document.getElementById("remainingAnalyses");
+const energyText = document.getElementById("energyText");
+const remainingText = document.getElementById("remainingText");
+const energyFill = document.getElementById("energyFill");
+const offerMedia = document.getElementById("offerMedia");
+const offerImg = document.getElementById("offerImg");
 
 function el(id){ return document.getElementById(id); }
 function val(id){ return el(id).value; }
@@ -5981,6 +5934,14 @@ let QUOTE_TIMER = null;
 let QUOTE_BUSY = false;
 let NEWS_TIMER = null;
 const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
+const MINIAPP_EXEC_CHECKLIST = [
+  "1) مینی‌اپ را فقط از داخل تلگرام باز کنید.",
+  "2) تاریخ/ساعت گوشی را روی حالت خودکار بگذارید.",
+  "3) VPN/Proxy را یک‌بار خاموش/روشن و دوباره تست کنید.",
+  "4) اپ تلگرام را آپدیت کنید و Mini App cache را پاک کنید.",
+  "5) اگر خطای 401 بود، اپ را کامل ببندید و از دکمه /miniapp دوباره وارد شوید.",
+  "6) اگر هنوز وصل نشد، لاگ /health و پاسخ /api/user را برای پشتیبانی ارسال کنید."
+].join("\n");
 
 function getFreshInitData() {
   const latestTg = (tg?.initData || "").trim();
@@ -6151,11 +6112,7 @@ async function api(path, body){
       await new Promise((res) => setTimeout(res, 350 * (i + 1)));
     }
   }
-  const errText = String(lastErr?.message || lastErr || "network_error");
-  const normalized = errText.toLowerCase().includes("timeout") || errText.toLowerCase().includes("abort")
-    ? "request_timeout"
-    : errText;
-  return { status: 599, json: { ok: false, error: normalized } };
+  return { status: 599, json: { ok: false, error: String(lastErr?.message || lastErr || "network_error") } };
 }
 
 async function adminApi(path, body){
@@ -6166,11 +6123,11 @@ async function adminApi(path, body){
 function prettyErr(j, status){
   const e = j?.error || "نامشخص";
   if (status === 429 && String(e).startsWith("quota_exceeded")) return "سهمیه امروز تمام شد.";
-  if (status === 403 && String(e) === "onboarding_required") return "ابتدا حداقل نام یا یوزرنیم خود را تکمیل کنید.";
+  if (status === 403 && String(e) === "onboarding_required") return "لطفاً آنبوردینگ را کامل کن: نام، شماره، سرمایه، تعیین‌سطح و سبک.";
   if (status === 403 && String(e) === "forbidden") return "دسترسی این بخش برای نقش فعلی شما مجاز نیست.";
   if (status === 401) {
     if (String(e).includes("initData")) return "اتصال مینی‌اپ منقضی شده؛ اپ را مجدد از داخل تلگرام باز کنید.";
-    return "احراز هویت تلگرام ناموفق است.";
+    return "احراز هویت تلگرام ناموفق است.\n\n" + MINIAPP_EXEC_CHECKLIST;
   }
   return "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.";
 }
@@ -6346,33 +6303,20 @@ function pickTicketReplyTemplate(){
 }
 
 function updateMeta(state, quota){
-  const q = String(quota || "-");
-  let energy = "—";
-  let remainTxt = "∞";
-  const m = q.match(/^(\d+)\/(\d+)$/);
-  if (m) {
-    const used = Number(m[1] || 0);
-    const lim = Math.max(1, Number(m[2] || 1));
-    const remain = Math.max(0, lim - used);
-    const pct = Math.max(0, Math.min(100, Math.round((remain / lim) * 100)));
-    energy = pct + "%";
-    remainTxt = String(remain);
-  } else if (q === "∞") {
-    energy = "100%";
-    remainTxt = "∞";
-  }
-  meta.textContent = "انرژی: " + energy + " | تحلیل باقی‌مانده: " + remainTxt + " | سهمیه: " + q;
-  sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
   const q = String(quota || "");
-  const m = q.match(/(\d+)\s*\/\s*(\d+)/);
+  const m2 = q.match(/(\d+)\s*\/\s*(\d+)/);
   let used = 0;
   let limit = 0;
-  if (m) {
-    used = Number(m[1] || 0);
-    limit = Number(m[2] || 0);
+  if (m2) {
+    used = Number(m2[1] || 0);
+    limit = Number(m2[2] || 0);
   }
   const remaining = Math.max(0, limit - used);
   const pct = limit > 0 ? Math.max(0, Math.min(100, Math.round((remaining / limit) * 100))) : 100;
+  const energy = q === "∞" ? "100%" : (limit > 0 ? (pct + "%") : "—");
+  const remainTxt = q === "∞" ? "∞" : (limit > 0 ? String(remaining) : "—");
+  meta.textContent = "انرژی: " + energy + " | تحلیل باقی‌مانده: " + remainTxt + " | سهمیه: " + (q || "-");
+  sub.textContent = "ID: " + (state?.userId || "-") + " | امروز(Tehran): " + (state?.dailyDate || "-");
   if (remainingText) remainingText.textContent = "تحلیل باقی‌مانده: " + (limit > 0 ? String(remaining) : "∞");
   if (energyText) energyText.textContent = "انرژی: " + (limit > 0 ? (pct + "%") : "نامحدود");
   if (energyFill) energyFill.style.width = (limit > 0 ? pct : 100) + "%";
@@ -6744,10 +6688,8 @@ async function boot(){
 
   // Telegram WebApp may populate initData with a slight delay.
   if (isTelegramRuntime && !initData) {
-    for (let i = 0; i < 8 && !initData; i++) {
-      await new Promise((r) => setTimeout(r, 300));
-      initData = (tg?.initData || "").trim();
-    }
+    await new Promise((r) => setTimeout(r, 350));
+    initData = (tg?.initData || "").trim();
   }
 
   if (initData) {
@@ -6802,6 +6744,7 @@ async function boot(){
       pillTxt.textContent = "Offline (Guest)";
       out.textContent = "حالت محدود فعال شد ✅ داده‌های پایه بارگذاری شدند.";
       showToast("حالت محدود", "برای همه امکانات، مینی‌اپ را از داخل تلگرام باز کنید.", "GUEST", false);
+      if (status === 401) out.textContent = "اتصال کامل برقرار نشد.\n\n" + MINIAPP_EXEC_CHECKLIST;
       setupLiveQuotePolling();
       setupNewsPolling();
       return;
@@ -6819,7 +6762,6 @@ async function boot(){
     setupNewsPolling();
     return;
   }
-}
 
   OFFLINE_MODE = false;
   if (json?.miniToken) {
@@ -6851,7 +6793,7 @@ async function boot(){
     });
 
     if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
-    if (el("offerBannerImageInput")) el("offerBannerImageInput").value = json.offerBannerImage || "";
+    if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = json.offerBannerImage || "";
     if (IS_OWNER && el("walletAddressInput")) el("walletAddressInput").value = json.wallet || "";
 
     await loadAdminBootstrap();
@@ -6869,7 +6811,7 @@ async function loadAdminBootstrap(){
   if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(json.customPrompts || [], null, 2);
   if (el("freeDailyLimit")) el("freeDailyLimit").value = String(json.freeDailyLimit ?? "");
   if (el("offerBannerInput")) el("offerBannerInput").value = json.offerBanner || "";
-  if (el("offerBannerImageInput")) el("offerBannerImageInput").value = json.offerBannerImage || "";
+  if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = json.offerBannerImage || "";
   if (el("welcomeBotInput")) el("welcomeBotInput").value = json.welcomeBot || "";
   if (el("welcomeMiniappInput")) el("welcomeMiniappInput").value = json.welcomeMiniapp || "";
 
@@ -6989,6 +6931,12 @@ el("analyze").addEventListener("click", async () => {
       if (u) {
         chartImg.onerror = () => {
           chartImg.onerror = null;
+          if (fallbackSvg) {
+            renderChartFallbackSvg(fallbackSvg);
+            const cm = el("chartMeta");
+            if (cm) cm.textContent = "زون تحلیل + " + symbol + " (" + tf + ")";
+            return;
+          }
           chartImg.removeAttribute("src");
           chartCard.style.display = "none";
           if (fallbackSvg) renderChartFallbackSvg(fallbackSvg);
@@ -7004,6 +6952,7 @@ el("analyze").addEventListener("click", async () => {
         if (cm) cm.textContent = "QuickChart";
       }
     }
+  }
   updateMeta(json.state, json.quota);
   showToast("آماده ✅", "خروجی دریافت شد", "OK", false);
   setTimeout(hideToast, 1200);
@@ -7052,19 +7001,6 @@ el("saveStylePrompts")?.addEventListener("click", async () => {
   if (json?.ok) showToast("ذخیره شد ✅", "JSON سبک‌ها بروزرسانی شد", "ADM", false);
 });
 
-el("stylePromptJsonFile")?.addEventListener("change", async (ev) => {
-  const f = ev?.target?.files?.[0];
-  if (!f) return;
-  const txt = await f.text().catch(() => "");
-  const parsed = safeJsonParse(txt, null);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    showToast("خطا", "فایل JSON سبک‌ها معتبر نیست", "ADM", false);
-    return;
-  }
-  if (el("stylePromptJson")) el("stylePromptJson").value = JSON.stringify(parsed, null, 2);
-  showToast("بارگذاری شد ✅", "JSON سبک‌ها از فایل لود شد", "ADM", false);
-});
-
 el("addStyle")?.addEventListener("click", async () => {
   const style = el("newStyle")?.value || "";
   const { json } = await adminApi("/api/admin/styles", { action: "add", style });
@@ -7106,9 +7042,12 @@ el("saveFreeLimit")?.addEventListener("click", async () => {
 el("saveOfferBanner")?.addEventListener("click", async () => {
   const offerBanner = el("offerBannerInput")?.value || "";
   let offerBannerImage = undefined;
-  const file = el("offerBannerImageInput")?.files?.[0];
+  const file = el("offerImageFile")?.files?.[0];
+  const imageUrl = String(el("offerBannerImageUrlInput")?.value || "").trim();
   if (file) {
     offerBannerImage = await fileToDataUrl(file);
+  } else if (imageUrl) {
+    offerBannerImage = imageUrl;
   }
   const { json } = await adminApi("/api/admin/offer", { offerBanner, offerBannerImage });
   if (json?.ok) {
@@ -7135,7 +7074,7 @@ el("offerImageFile")?.addEventListener("change", async (ev) => {
   const reader = new FileReader();
   reader.onload = () => {
     const dataUrl = typeof reader.result === "string" ? reader.result : "";
-    if (el("offerBannerImageInput")) el("offerBannerImageInput").value = dataUrl;
+    if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = dataUrl;
     if (offerImg) offerImg.src = dataUrl;
     if (offerMedia) offerMedia.classList.toggle("show", !!dataUrl);
   };
@@ -7145,7 +7084,7 @@ el("offerImageFile")?.addEventListener("change", async (ev) => {
 el("clearOfferImage")?.addEventListener("click", async () => {
   const offerBanner = el("offerBannerInput")?.value || "";
   const { json } = await adminApi("/api/admin/offer", { offerBanner, clearOfferBannerImage: true });
-  if (el("offerBannerImageInput")) el("offerBannerImageInput").value = "";
+  if (el("offerBannerImageUrlInput")) el("offerBannerImageUrlInput").value = "";
   if (el("offerImageFile")) el("offerImageFile").value = "";
   if (offerImg) offerImg.src = "";
   if (offerMedia) offerMedia.classList.remove("show");
@@ -7296,6 +7235,23 @@ el("saveCapitalToggle")?.addEventListener("click", async () => {
 });
 
 
+el("customPromptsJsonFile")?.addEventListener("change", async (ev) => {
+  const file = ev?.target?.files?.[0];
+  if (!file) return;
+  try {
+    const txt = await file.text();
+    const parsed = safeJsonParse(txt, null);
+    if (!Array.isArray(parsed)) {
+      showToast("خطا", "فایل JSON باید آرایه باشد", "ADM", false);
+      return;
+    }
+    if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(parsed, null, 2);
+    showToast("بارگذاری شد ✅", "JSON پرامپت آماده ذخیره است", "ADM", false);
+  } catch {
+    showToast("خطا", "خواندن فایل JSON ناموفق بود", "ADM", false);
+  }
+});
+
 el("saveCustomPrompts")?.addEventListener("click", async () => {
   const raw = el("customPromptsJson")?.value || "[]";
   const customPrompts = safeJsonParse(raw, []);
@@ -7304,19 +7260,6 @@ el("saveCustomPrompts")?.addEventListener("click", async () => {
     showToast("ذخیره شد ✅", "پرامپت‌های اختصاصی بروزرسانی شد", "ADM", false);
     fillCustomPrompts(json.customPrompts || []);
   }
-});
-
-el("customPromptsJsonFile")?.addEventListener("change", async (ev) => {
-  const f = ev?.target?.files?.[0];
-  if (!f) return;
-  const txt = await f.text().catch(() => "");
-  const parsed = safeJsonParse(txt, null);
-  if (!Array.isArray(parsed)) {
-    showToast("خطا", "فایل JSON پرامپت اختصاصی باید آرایه باشد", "ADM", false);
-    return;
-  }
-  if (el("customPromptsJson")) el("customPromptsJson").value = JSON.stringify(parsed, null, 2);
-  showToast("بارگذاری شد ✅", "JSON پرامپت اختصاصی از فایل لود شد", "ADM", false);
 });
 
 el("sendCustomPrompt")?.addEventListener("click", async () => {
