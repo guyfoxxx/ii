@@ -257,7 +257,7 @@ ${reply}`;
 
         if (url.pathname === "/api/admin/offer") {
           if (typeof body.offerBanner === "string" && env.BOT_KV) {
-            await setOfferBanner(env, body.offerBanner);
+            await setOfferBannerSafe(env, body.offerBanner);
           }
           if (typeof body.offerBannerImage === "string") {
             try {
@@ -1081,19 +1081,25 @@ function isStaff(from, env) {
 }
 
 function isOwner(from, env) {
+  const uid = String(from?.userId || from?.id || "").trim();
+  const ownerIds = String(env.OWNER_USER_IDS || env.OWNER_IDS || "").split(",").map((x) => String(x || "").trim()).filter(Boolean);
+  if (uid && ownerIds.includes(uid)) return true;
+
   const u = normHandle(from?.username);
-  if (!u) return false;
   const raw = (env.OWNER_HANDLES || "").toString().trim();
-  if (!raw) return false;
+  if (!u || !raw) return false;
   const set = new Set(raw.split(",").map(normHandle).filter(Boolean));
   return set.has(u);
 }
 
 function isAdmin(from, env) {
+  const uid = String(from?.userId || from?.id || "").trim();
+  const adminIds = String(env.ADMIN_USER_IDS || env.ADMIN_IDS || "").split(",").map((x) => String(x || "").trim()).filter(Boolean);
+  if (uid && adminIds.includes(uid)) return true;
+
   const u = normHandle(from?.username);
-  if (!u) return false;
   const raw = (env.ADMIN_HANDLES || "").toString().trim();
-  if (!raw) return false;
+  if (!u || !raw) return false;
   const set = new Set(raw.split(",").map(normHandle).filter(Boolean));
   return set.has(u);
 }
@@ -1573,6 +1579,9 @@ async function setOfferBannerImage(env, dataUrl) {
   await env.BOT_KV.put("settings:offer_banner_image", clean);
 }
 
+
+// Compatibility alias for editor diagnostics in mirrored index.js files.
+const setOfferBannerSafe = async (env, text) => setOfferBanner(env, text);
 async function getCommissionSettings(env) {
   if (!env.BOT_KV) return { globalPercent: 0, overrides: {} };
   const g = await env.BOT_KV.get("settings:commission:globalPercent");
@@ -5045,7 +5054,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const initRaw = String(initData || "").trim();
   if (lenient && initRaw.startsWith("dev:")) {
     const devId = Number(initRaw.split(":")[1] || "0") || 999001;
-    return { ok: true, userId: devId, fromLike: { username: "dev_user" } };
+    return { ok: true, userId: devId, fromLike: { username: "dev_user", userId: String(devId), id: devId } };
   }
   if (!botToken && !lenient) return { ok: false, reason: "bot_token_missing" };
 
@@ -5074,7 +5083,7 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSecRaw, lenientR
   const userId = user?.id || Number(params.get("user_id") || "0");
   if (!userId) return { ok: false, reason: "user_missing" };
 
-  const fromLike = { username: user?.username || "" };
+  const fromLike = { username: user?.username || "", userId: String(userId), id: Number(userId) || undefined };
   return { ok: true, userId, fromLike };
 }
 
