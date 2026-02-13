@@ -1116,61 +1116,134 @@ News mode:
  * into the analysis prompt. Admin can still override the global base prompt via KV.
  */
 const STYLE_PROMPTS_DEFAULT = {
-  "پرایس اکشن": `You are a professional Price Action market analyst. Use PURE price action only; indicators are forbidden unless explicitly requested.
-Output must be clear, step-by-step, execution-focused.
-Your analysis MUST include these labeled sections:
-1) Market Structure: trend (up/down/range), label HH/HL/LH/LL, and state (Intact / BOS / MSS).
-2) Key Levels: strong support zones, strong resistance zones, flip zones, psychological levels if relevant.
-3) Candlestick Behavior: pin bar / engulfing / inside bar; explain buyer vs seller intent.
-4) Entry Scenarios: entry zone, structure-based SL, TP1 & TP2, minimum R:R 1:2.
-5) Bias & Scenarios: main bias + alternative scenario with invalidation.
-6) Execution Plan: continuation vs reversal; required confirmation before entry.
-Avoid overtrading; only high-probability setups.`,
-  "ICT": `You are an ICT (Inner Circle Trader) & Smart Money Concepts analyst. Use ICT/SMC concepts ONLY. No indicators. No retail concepts.
-Provide a professional, precise, educational, step-by-step analysis.
-Required sections:
-1) Higher Timeframe Bias (Daily/H4): bias, premium/discount, equilibrium (50%), imbalance vs balance.
-2) Liquidity Mapping: EQH/EQL, buy-side/sell-side liquidity, stop-loss pools; where price is likely engineered.
-3) Market Structure: BOS and MSS/CHoCH; explain manipulation vs expansion.
-4) PD Arrays: bullish/bearish order blocks, FVG, liquidity voids, PDH/PDL, PWH/PWL.
-5) Kill Zones (intraday only): London/NY; explain timing.
-6) Entry Model: (e.g., sweep→MSS→FVG or sweep→OB); include entry, SL, liquidity-based targets, invalidation.
-7) Narrative: who is trapped, where smart money entered, where price is likely going.`,
-  "ATR": `You are a quantitative trading assistant focused on ATR-based volatility trading.
-Use ATR for risk and target sizing. Also consider price structure for entries.
-Required sections:
-1) Volatility State: current ATR value, compare to historical average, expansion vs contraction.
-2) Market Condition: trending vs ranging; breakout vs mean-reversion suitability.
-3) Trade Setup: structure-based entry; SL = Entry ± (ATR × multiplier); TP1/TP2 based on ATR expansion.
-4) Position Sizing: risk% and size based on SL distance.
-5) Trade Filtering: when NOT to trade; high-risk volatility conditions (news/spikes).
-6) Risk Management: max daily loss, max consecutive losses, ATR trailing stop logic.
-7) Summary: statistical justification, expected duration, risk classification.`,
+  "ICT": `{
+  "role": "system",
+  "identity": {
+    "title": "ICT & Smart Money Analyst",
+    "methodology": [
+      "ICT (Inner Circle Trader)",
+      "Smart Money Concepts"
+    ],
+    "restrictions": [
+      "No indicators",
+      "No retail concepts",
+      "ICT & Smart Money concepts ONLY"
+    ]
+  },
+  "task": {
+    "description": "Analyze the requested market (Symbol, Timeframe) using ICT & Smart Money Concepts ONLY."
+  },
+  "analysis_requirements": {
+    "1_higher_timeframe_bias": {
+      "timeframes": ["Daily", "H4"],
+      "elements": [
+        "Overall HTF bias (Bullish / Bearish / Neutral)",
+        "Premium zone",
+        "Discount zone",
+        "Equilibrium level (50%)",
+        "Imbalance vs Balance state"
+      ]
+    },
+    "2_liquidity_mapping": {
+      "identify": ["Equal Highs (EQH)", "Equal Lows (EQL)", "Buy-side liquidity", "Sell-side liquidity", "Stop-loss pools"],
+      "objective": "Determine where liquidity is resting and likely to be engineered toward"
+    },
+    "3_market_structure": {
+      "elements": ["BOS (Break of Structure)", "MSS / CHoCH (Market Structure Shift)"],
+      "clarification": ["Manipulation phase", "Expansion phase"]
+    },
+    "4_pd_arrays": {
+      "arrays": ["Bullish Order Blocks", "Bearish Order Blocks", "Fair Value Gaps (FVG)", "Liquidity Voids", "Previous Day High (PDH)", "Previous Day Low (PDL)", "Previous Week High (PWH)", "Previous Week Low (PWL)"]
+    },
+    "5_kill_zones": {
+      "condition": "Intraday only",
+      "zones": ["London Kill Zone", "New York Kill Zone"],
+      "explanation": "Explain why timing matters for this setup"
+    },
+    "6_entry_model": {
+      "model_examples": ["Liquidity Sweep → MSS → FVG Entry", "Liquidity Sweep → Order Block Entry"],
+      "must_include": ["Entry price", "Stop Loss location (above/below OB or swing)", "Take Profit targets based on liquidity"]
+    },
+    "7_narrative": {
+      "storytelling": ["Who is trapped?", "Where did smart money enter?", "Where is price likely engineered to go?"]
+    }
+  },
+  "execution_plan": {
+    "bias": "Bullish or Bearish",
+    "entry_conditions": "Clear confirmation rules",
+    "targets": "Liquidity-based targets",
+    "invalidation_point": "Price level that invalidates the idea"
+  },
+  "output_style": {
+    "tone": "Professional, precise, educational",
+    "structure": "Step-by-step, clearly labeled sections",
+    "language": "Clear and technical ICT terminology"
+  }
+}`,
+  "ATR": `{
+  "role": "quantitative_trading_assistant",
+  "strategy": "ATR-based volatility trading",
+  "analysis_requirements": {
+    "volatility_state": ["Current ATR value", "Comparison with historical ATR average", "Volatility expansion or contraction"],
+    "market_condition": ["Trending or Ranging", "Breakout vs Mean Reversion suitability"],
+    "trade_setup": {
+      "entry": "Based on price structure",
+      "stop_loss": "SL = Entry ± (ATR × Multiplier)",
+      "take_profit": ["TP1 based on ATR expansion", "TP2 based on ATR expansion"]
+    },
+    "position_sizing": ["Risk per trade (%)", "Position size based on SL distance"],
+    "trade_filtering": ["When NOT to trade based on ATR", "High-risk volatility conditions (news, spikes)"],
+    "risk_management": ["Max daily loss", "Max consecutive losses", "ATR-based trailing stop logic"],
+    "summary": ["Statistical justification", "Expected trade duration", "Risk classification (Low/Medium/High)"]
+  }
+}`,
+  "پرایس اکشن": `{
+  "role": "system",
+  "description": "Professional Price Action Market Analysis Prompt",
+  "constraints": {
+    "analysis_style": "Pure Price Action Only",
+    "indicators": "Forbidden unless explicitly requested",
+    "focus": "High-probability setups only",
+    "language": "Professional, clear, step-by-step"
+  },
+  "required_sections": {
+    "market_structure": {
+      "items": ["Trend identification (Uptrend / Downtrend / Range)", "HH, HL, LH, LL labeling", "Structure status (Intact / BOS / MSS)"]
+    },
+    "key_levels": {
+      "items": ["Strong Support zones", "Strong Resistance zones", "Flip zones (SR to Resistance / Resistance to Support)", "Psychological levels (if relevant)"]
+    },
+    "candlestick_behavior": {
+      "items": ["Pin Bar", "Engulfing", "Inside Bar", "Explanation of buyer/seller intent"]
+    },
+    "entry_scenarios": {
+      "requirements": ["Clear entry zone", "Logical structure-based Stop Loss", "TP1 and TP2 targets", "Minimum Risk:Reward of 1:2"]
+    },
+    "bias_and_scenarios": {
+      "items": ["Main bias (Bullish / Bearish / Neutral)", "Alternative scenario upon invalidation"]
+    },
+    "execution_plan": {
+      "items": ["Continuation or Reversal trade", "Required confirmation before entry"]
+    }
+  },
+  "instructions": ["Explain everything step-by-step", "Use structure-based logic", "Avoid overtrading", "Execution-focused explanations"]
+}`,
 };
 
 function normalizeStyleLabel(style) {
   const s = String(style || "").trim();
-  if (!s) return "";
+  if (!s) return "پرایس اکشن";
   const low = s.toLowerCase();
   if (low === "price action" || low === "priceaction") return "پرایس اکشن";
   if (low === "ict") return "ICT";
   if (low === "atr") return "ATR";
-  if (low === "combo" || low === "combined" || low === "all" || low === "ترکیبی") return "ترکیبی";
-  return s;
+  return ["پرایس اکشن", "ICT", "ATR"].includes(s) ? s : "پرایس اکشن";
 }
 
 function getStyleGuide(style) {
   const key = normalizeStyleLabel(style);
-  if (key === "ترکیبی") {
-    return [
-      "[پرایس اکشن]", STYLE_PROMPTS_DEFAULT["پرایس اکشن"] || "",
-      "[ICT]", STYLE_PROMPTS_DEFAULT["ICT"] || "",
-      "[ATR]", STYLE_PROMPTS_DEFAULT["ATR"] || "",
-    ].join("\n").trim();
-  }
-  return STYLE_PROMPTS_DEFAULT[key] || "";
+  return STYLE_PROMPTS_DEFAULT[key] || STYLE_PROMPTS_DEFAULT["پرایس اکشن"];
 }
-
 
 async function getAnalysisPrompt(env) {
   const raw = await getSettingText(env, "settings:analysis_prompt", DEFAULT_ANALYSIS_PROMPT);
@@ -1208,14 +1281,6 @@ async function getStylePrompt(env, style) {
   if (!env.BOT_KV) return "";
   const map = await getStylePromptMap(env);
   const key = normalizeStyleLabel(style);
-  if (key === "ترکیبی") {
-    const parts = [];
-    for (const s of ["پرایس اکشن", "ICT", "ATR"]) {
-      const v = (map?.[styleKey(s)] || "").toString().trim();
-      if (v) parts.push("[" + s + "]\n" + v);
-    }
-    return parts.join("\n\n");
-  }
   return (map?.[styleKey(key)] || "").toString();
 }
 async function setStylePrompt(env, style, prompt) {
@@ -1253,7 +1318,7 @@ async function getFreeDailyLimit(env) {
 async function setFreeDailyLimit(env, limit) {
   await setSettingText(env, "settings:free_daily_limit", String(limit));
 }
-const ALLOWED_STYLE_LIST = ["پرایس اکشن", "ICT", "ATR", "ترکیبی"];
+const ALLOWED_STYLE_LIST = ["پرایس اکشن", "ICT", "ATR"];
 const DEFAULT_STYLE_LIST = ALLOWED_STYLE_LIST.slice();
 
 async function getStyleList(env) {
@@ -3123,9 +3188,9 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
   const customPrompts = await getCustomPrompts(env);
   const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
   const promptMode = String(st.promptMode || "style_plus_custom").trim();
-  const includeStylePrompt = promptMode !== "custom_only";
-  const includeStyleGuide = promptMode === "combined_all" || promptMode === "style_only" || promptMode === "style_plus_custom";
-  const includeCustomPrompt = !!customPrompt?.text && (promptMode === "custom_only" || promptMode === "style_plus_custom" || promptMode === "combined_all");
+  const includeStylePrompt = true;
+  const includeStyleGuide = true;
+  const includeCustomPrompt = !!customPrompt?.text && promptMode !== "style_only";
   const newsAnalysisBlock = newsBlock ? await buildNewsAnalysisSummary(symbol, parseNewsBlockRows(newsBlock), env) : "";
   const base = baseRaw
      .split("{TIMEFRAME}").join(tf)
@@ -3155,8 +3220,11 @@ ${customPrompt.text}
 ` : ``) +
     `ASSET: ${symbol}
 ` +
-
-    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}, Capital=${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}
+    `TIMEFRAME: ${tf}
+` +
+    `USER_RISK: ${st.risk || "متوسط"}
+` +
+    `USER_CAPITAL: ${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}
 
 ` +
     `MARKET_DATA:
@@ -3202,9 +3270,9 @@ async function buildVisionPrompt(st, env) {
   const customPrompts = await getCustomPrompts(env);
   const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
   const promptMode = String(st.promptMode || "style_plus_custom").trim();
-  const includeStylePrompt = promptMode !== "custom_only";
-  const includeStyleGuide = promptMode === "combined_all" || promptMode === "style_only" || promptMode === "style_plus_custom";
-  const includeCustomPrompt = !!customPrompt?.text && (promptMode === "custom_only" || promptMode === "style_plus_custom" || promptMode === "combined_all");
+  const includeStylePrompt = true;
+  const includeStyleGuide = true;
+  const includeCustomPrompt = !!customPrompt?.text && promptMode !== "style_only";
   const base = baseRaw
      .split("{TIMEFRAME}").join(tf)
      .split("{STYLE}").join(st.style || "")
@@ -3226,7 +3294,11 @@ ${getStyleGuide(st.style)}
 ${customPrompt.text}
 
 ` : ``) +
-    `TASK: این تصویر چارت را تحلیل کن. دقیقاً خروجی ۱ تا ۵ بده و سطح‌ها را مشخص کن.
+    `ASSET: ${st.selectedSymbol || "UNKNOWN"}
+TIMEFRAME: ${tf}
+USER_RISK: ${st.risk || "متوسط"}
+USER_CAPITAL: ${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}
+TASK: این تصویر چارت را تحلیل کن. دقیقاً خروجی ۱ تا ۵ بده و سطح‌ها را مشخص کن.
 ` +
     `RULES: فقط فارسی، لحن افشاگر، خیال‌بافی نکن.
 `
