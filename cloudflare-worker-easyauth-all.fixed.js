@@ -1353,13 +1353,12 @@ async function storePayment(env, payment) {
   if (!env.BOT_KV) return;
   await env.BOT_KV.put(`payment:${payment.id}`, JSON.stringify(payment));
 
-  const raw = await env.BOT_KV.get("payments:index");
-  let list = [];
-  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
-  if (!Array.isArray(list)) list = [];
-  if (!list.includes(payment.id)) list.push(payment.id);
-  await env.BOT_KV.put("payments:index", JSON.stringify(list.slice(-500)));
-}
+  const styles = ["پرایس اکشن","ICT","ATR"].map(label => ({
+    id: stylePromptKey(label) || label,
+    label,
+    enabled: true,
+    prompt: STYLE_ANALYSIS_PROMPTS_DEFAULT[label] || "",
+  }));
 
 
 async function listUserPayments(env, userId, limit = 20) {
@@ -1507,6 +1506,24 @@ async function listWithdrawalsByUser(env, userId, limit = 20) {
   return out.sort((a,b)=>String(b.createdAt||"").localeCompare(String(a.createdAt||""))).slice(0, lim);
 }
 
+/* ========================== STYLE PROMPTS (DEFAULTS) ==========================
+ * Users choose st.style (Persian labels) and we inject a style-specific guide
+ * into the analysis prompt. Admin can still override the global base prompt via KV.
+ */
+const STYLE_PROMPTS_DEFAULT = {
+  "پرایس اکشن": `Professional Price Action Market Analysis.
+CONTEXT: SYMBOL={SYMBOL} | TIMEFRAME={TIMEFRAME} | RISK={RISK} | CAPITAL={CAPITAL}
+Use pure Price Action only, no indicators.
+Sections: Market Structure, Key Levels, Candlestick Behavior, Entry Scenarios (Entry/SL/TP1/TP2, RR>=1:2), Bias+Alternative Scenario, Execution Plan+Invalidation.`,
+  "ICT": `ICT & Smart Money Analyst.
+CONTEXT: SYMBOL={SYMBOL} | TIMEFRAME={TIMEFRAME} | RISK={RISK} | CAPITAL={CAPITAL}
+Use ICT/SMC only: HTF Bias, Liquidity Mapping, BOS/MSS, PD Arrays(OB/FVG/Voids/PDH/PDL/PWH/PWL), Kill Zones, Entry Model, Narrative.
+Must include Entry, SL, Liquidity targets, Invalidation.`,
+  "ATR": `Quantitative ATR-based trading assistant.
+CONTEXT: SYMBOL={SYMBOL} | TIMEFRAME={TIMEFRAME} | RISK={RISK} | CAPITAL={CAPITAL}
+Sections: Volatility State, Market Condition, ATR-based Setup, Position Sizing, Trade Filtering, Risk Management, Statistical Summary.
+Must include ATR-based SL/TP and risk controls.`
+};
 
 async function reviewWithdrawal(env, id, decision, txHash, reviewer) {
   const reviewedAt = new Date().toISOString();
@@ -3114,98 +3131,32 @@ function buildLocalFallbackAnalysis(symbol, st, candles, reason = "") {
 /* ========================== TEXT BUILDERS ========================== */
 async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env, newsBlock = "") {
   const tf = st.timeframe || "H4";
-  const baseRaw = await getAnalysisPrompt(env);
-  const sp = await getStylePrompt(env, st.style);
-  const customPrompts = await getCustomPrompts(env);
-  const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
-  const promptMode = String(st.promptMode || "style_plus_custom").trim();
-  const includeStylePrompt = promptMode !== "custom_only";
-  const includeStyleGuide = promptMode === "combined_all" || promptMode === "style_only" || promptMode === "style_plus_custom";
-  const includeCustomPrompt = !!customPrompt?.text && (promptMode === "custom_only" || promptMode === "style_plus_custom" || promptMode === "combined_all");
-  const newsAnalysisBlock = newsBlock ? await buildNewsAnalysisSummary(symbol, parseNewsBlockRows(newsBlock), env) : "";
-  const base = baseRaw
-     .split("{TIMEFRAME}").join(tf)
-     .split("{STYLE}").join(st.style || "")
-     .split("{RISK}").join(st.risk || "")
-     .split("{NEWS}").join(st.newsEnabled ? "on" : "off");
+  const baseRaw = await getAnalysisPromptForStyle(env, st.style);
+  const base = baseRaw.replaceAll("{TIMEFRAME}", tf).replaceAll("{SYMBOL}", symbol || "").replaceAll("{RISK}", st.risk || "").replaceAll("{CAPITAL}", String(st.profile?.capital || st.capital?.amount || "unknown"));
 
   const userExtra = (isStaff({ username: st.profile?.username }, env) && userPrompt?.trim())
     ? userPrompt.trim()
     : "تحلیل با حالت نهادی";
 
   return (
-    `${base}
-
-` +
-    (includeStylePrompt && sp ? `STYLE_PROMPT:
-${sp}
-
-` : ``) +
-    (includeStyleGuide && getStyleGuide(st.style) ? `STYLE_GUIDE:
-${getStyleGuide(st.style)}
-
-` : ``) +
-    (includeCustomPrompt ? `CUSTOM_PROMPT:
-${customPrompt.text}
-
-` : ``) +
-    `ASSET: ${symbol}
-` +
-
-    `USER SETTINGS: Style=${st.style}, Risk=${st.risk}, Capital=${st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown"))}
-
-` +
-    `MARKET_DATA:
-${marketBlock}
-
-` +
-    (newsBlock ? `NEWS_HEADLINES_FA:
-${newsBlock}
-
-` : ``) +
-    (newsAnalysisBlock ? `NEWS_ANALYSIS_FA:
-${newsAnalysisBlock}
-
-` : ``) +
-    `RULES:
-` +
-    `- خروجی فقط فارسی باشد
-` +
-    `- فقط از سبک انتخاب‌شده (STYLE_MODE) استفاده کن و ساختار خروجی را مطابق STYLE_PROMPT رعایت کن
-` +
-    `- مدیریت سرمایه متناسب با Capital را لحاظ کن و سایز پوزیشن پیشنهادی بده
-` +
-    `- quickchart_config را به شکل JSON داخلی بساز اما به کاربر نمایش نده
-` +
-    `- سطح‌های قیمتی را مشخص کن (X/Y/Z)
-` +
-    `- شرط کندلی را واضح بگو (close/wick)
-` +
-    `- از داده OHLC استفاده کن، خیال‌بافی نکن
-` +
-    `- اگر NEWS_HEADLINES_FA موجود بود، تحلیل خبری کوتاه و اثر خبر روی سناریوها را اضافه کن
-
-` +
-    `EXTRA:
-${userExtra}`
+    `${base}\n\n` +
+    (getStyleGuide(st.style) ? `STYLE_GUIDE:\n${getStyleGuide(st.style)}\n\n` : ``) +
+    `ASSET: ${symbol}\n` +
+    `USER SETTINGS: Symbol=${symbol}, Timeframe=${tf}, Style=${st.style}, Risk=${st.risk}, Capital=${st.profile?.capital || st.capital?.amount || "unknown"} ${st.profile?.capitalCurrency || "USDT"}\n\n` +
+    `MARKET_DATA:\n${marketBlock}\n\n` +
+    `RULES:\n` +
+    `- خروجی فقط فارسی و دقیقاً بخش‌های ۱ تا ۵\n` +
+    `- سطح‌های قیمتی را مشخص کن (X/Y/Z)\n` +
+    `- شرط کندلی را واضح بگو (close/wick)\n` +
+    `- از داده OHLC استفاده کن، خیال‌بافی نکن\n\n` +
+    `EXTRA:\n${userExtra}`
   );
 }
 
 async function buildVisionPrompt(st, env) {
   const tf = st.timeframe || "H4";
-  const baseRaw = await getAnalysisPrompt(env);
-  const sp = await getStylePrompt(env, st.style);
-  const customPrompts = await getCustomPrompts(env);
-  const customPrompt = customPrompts.find((p) => String(p?.id || "") === String(st.customPromptId || ""));
-  const promptMode = String(st.promptMode || "style_plus_custom").trim();
-  const includeStylePrompt = promptMode !== "custom_only";
-  const includeStyleGuide = promptMode === "combined_all" || promptMode === "style_only" || promptMode === "style_plus_custom";
-  const includeCustomPrompt = !!customPrompt?.text && (promptMode === "custom_only" || promptMode === "style_plus_custom" || promptMode === "combined_all");
-  const base = baseRaw
-     .split("{TIMEFRAME}").join(tf)
-     .split("{STYLE}").join(st.style || "")
-     .split("{RISK}").join(st.risk || "")
-     .split("{NEWS}").join(st.newsEnabled ? "on" : "off");
+  const baseRaw = await getAnalysisPromptForStyle(env, st.style);
+  const base = baseRaw.replaceAll("{TIMEFRAME}", tf).replaceAll("{SYMBOL}", st.selectedSymbol || "CHART").replaceAll("{RISK}", st.risk || "").replaceAll("{CAPITAL}", String(st.profile?.capital || st.capital?.amount || "unknown"));
   return (
     `${base}
 
@@ -3465,12 +3416,27 @@ async function handleUpdate(update, env) {
 
 
     if (text === "/wallet" || text === BTN.WALLET) {
-      const wallet = await getWallet(env);
-      const txt =
-        `💳 ولت و پرداخت\n\n` +
-        (wallet ? `آدرس ولت:\n${wallet}\n\n` : "") +
-        `برای مشاهده موجودی، واریز یا برداشت از دکمه‌ها استفاده کن.`;
-      return tgSendMessage(env, chatId, txt, walletMenuKeyboard());
+      const walletAddr = await getWallet(env);
+      const addrLine = walletAddr ? `\n\nآدرس واریز:\n${walletAddr}` : "";
+      const bal = Number(st.wallet?.balance || 0);
+      const cur = st.wallet?.currency || "USDT";
+      return tgSendMessage(
+        env,
+        chatId,
+        `💳 ولت\n\nmarketIQ PRO\nبا ارزش ۲۵ USDT\nموجودی: ${bal} ${cur}\nامتیاز شما: ${Number(st.referral?.points || 0)}${addrLine}\n\nیکی از گزینه‌ها را انتخاب کن:`,
+        walletMenuKeyboard()
+      );
+    }
+
+    if (text === BTN.WALLET_DEPOSIT) {
+      const walletAddr = await getWallet(env);
+      const addrLine = walletAddr ? `${walletAddr}` : "فعلاً آدرس ولت تنظیم نشده.";
+      return tgSendMessage(
+        env,
+        chatId,
+        `➕ واریز\n\nmarketIQ PRO | با ارزش ۲۵ USDT\nآدرس واریز:\n${addrLine}\n\nواریزی فقط به آدرس ولت درگاه ممکن است\nدر لیست زیر باید از واریز هش واریزی را ارسال کنید.`,
+        walletMenuKeyboard()
+      );
     }
 
     if (text === BTN.WALLET_BALANCE) {
@@ -3571,14 +3537,7 @@ Memo/Tag: ${memo}
       const handle = env.SUPPORT_HANDLE || "@support";
       const wallet = await getWallet(env);
       const walletLine = wallet ? `\n\n💳 آدرس ولت جهت پرداخت:\n${wallet}` : "";
-      return tgSendMessage(
-        env,
-        chatId,
-        `🆘 پشتیبانی\n\nبرای سوالات آماده یا ارسال تیکت از دکمه‌ها استفاده کن.
-
-با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.\n\nپیام مستقیم: ${handle}${walletLine}`,
-        kb([[BTN.SUPPORT_FAQ, BTN.SUPPORT_TICKET], [BTN.SUPPORT_CUSTOM_PROMPT], [BTN.HOME]])
-      );
+      return tgSendMessage(env, chatId, `🆘 پشتیبانی\n\nبا ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.\n\nپیام بده به: ${handle}${walletLine}`, mainMenuKeyboard(env));
     }
 
     if (text === "/miniapp" || text === BTN.MINIAPP) {
@@ -3714,18 +3673,7 @@ ${url}`, mainMenuKeyboard(env));
       await tgSendMessage(
         env,
         chatId,
-        `✅ تعیین سطح انجام شد.
-
-سطح: ${st.profile.level}
-پیشنهاد بازار: ${marketFa}
-
-تنظیمات پیشنهادی:
-⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}
-
-یادداشت:
-${st.profile.levelNotes || "—"}
-
-اگر می‌خوای دوباره تعیین سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
+        `✅ تعیین سطح انجام شد.\n\nسطح: ${st.profile.level}\nپیشنهاد بازار: ${marketFa}\n\nتنظیمات پیشنهادی:\n⏱ ${st.timeframe} | 🎯 ${st.style} | ⚠️ ${st.risk}\n\nیادداشت:\n${st.profile.levelNotes || "—"}\n\nنمونه کوتاه متناسب با پروفایل شما: برای نماد پیشنهادی بازار خودت یک تحلیل سناریومحور با حدضرر و TP بگیر تا سریع تصمیم بگیری.\n\nاگر می‌خوای دوباره تعیین‌سطح انجام بدی یا تنظیماتت تغییر کنه، به پشتیبانی پیام بده (ادمین بررسی می‌کند).`,
         mainMenuKeyboard(env)
       );
 
@@ -4575,8 +4523,8 @@ async function handleVisionFlow(env, chatId, from, userId, st, fileId) {
     const visionRaw = await runVisionProviders(imageUrl, vPrompt, env, st.visionOrder);
 
     const tf = st.timeframe || "H4";
-    const baseRaw = await getAnalysisPrompt(env);
-    const base = baseRaw .split("{TIMEFRAME}").join(tf);
+    const baseRaw = await getAnalysisPromptForStyle(env, st.style);
+    const base = baseRaw.replaceAll("{TIMEFRAME}", tf).replaceAll("{SYMBOL}", st.selectedSymbol || "CHART").replaceAll("{RISK}", st.risk || "").replaceAll("{CAPITAL}", String(st.profile?.capital || st.capital?.amount || "unknown"));
 
     const finalPrompt =
       `${base}\n\n` +
@@ -5291,8 +5239,8 @@ const MINI_APP_HTML = `<!doctype html>
 
       <div class="card" id="supportCard">
         <div class="card-h">
-          <strong>پشتیبانی</strong>
-          <span>ارسال تیکت</span>
+          <strong>💳 ولت</strong>
+          <span id="wMeta">—</span>
         </div>
         <div class="card-b">
           <div class="field">
@@ -5319,13 +5267,9 @@ const MINI_APP_HTML = `<!doctype html>
             <div class="actions">
               <button id="savePrompt" class="btn primary">ذخیره پرامپت</button>
             </div>
-          </div>
-
-          <div class="field">
-            <div class="label">پرامپت سبک‌ها (JSON)</div>
-            <textarea id="stylePromptJson" class="control" placeholder='{"پرایس_اکشن":"...","ict":"...","atr":"..."}'></textarea>
-            <div class="actions">
-              <button id="saveStylePrompts" class="btn">ذخیره JSON سبک‌ها</button>
+            <div class="field">
+              <div class="label">آدرس ولت درگاه (BEP20)</div>
+              <input id="wAddress" class="control" readonly value="—" />
             </div>
           </div>
 
@@ -5342,19 +5286,34 @@ const MINI_APP_HTML = `<!doctype html>
             <div class="mini-list" id="styleList">—</div>
           </div>
 
-          <div class="field">
-            <div class="label">کمیسیون دعوت</div>
-            <div class="admin-row">
-              <input id="globalCommission" class="control" placeholder="درصد کمیسیون کلی (مثلاً 5)" />
-              <button id="saveGlobalCommission" class="btn">ذخیره کلی</button>
-            </div>
-            <div class="admin-row">
-              <input id="commissionUser" class="control" placeholder="یوزرنیم خاص (@user)" />
-              <input id="commissionPercent" class="control" placeholder="درصد برای کاربر خاص" />
-              <button id="saveUserCommission" class="btn">ذخیره کاربر</button>
-            </div>
-            <div class="mini-list" id="commissionList">—</div>
+          <div style="height:10px"></div>
+          <div class="muted" style="font-size:12px; line-height:1.8;" id="wNote">marketIQ PRO | با ارزش ۲۵ USDT<br>واریزی فقط به آدرس ولت درگاه ممکن است<br>در لیست زیر باید از واریز هش واریزی را ارسال کنید.</div>
+          <div class="field" style="margin-top:10px">
+            <div class="label">تاریخچه تراکنشات</div>
+            <div class="muted" id="walletHistoryMini">—</div>
           </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-h"><strong>🤝 دعوت</strong><span>Referral</span></div>
+        <div class="card-b">
+          <div class="muted">دعوت موفق: <b id="invitesMini">0</b></div>
+          <div class="muted">امتیاز شما: <b id="pointsMini">0</b></div>
+          <div class="label" style="margin-top:8px">لینک رفرال قابل کپی و قابل اشتراک سریع</div>
+          <div class="actions"><input id="refLinkMini" class="control" readonly value="—" /><button id="copyRefMini" class="btn ghost">کپی</button><button id="shareRefMini" class="btn ghost">اشتراک سریع</button></div>
+          <div class="muted" style="font-size:12px; line-height:1.7; margin-top:8px;">با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتباز بدست می اورید در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-h"><strong>🆘 پشتیبانی</strong><span>ارسال تیکت</span></div>
+        <div class="card-b">
+          <div class="muted" style="font-size:12px; line-height:1.7;">با ارسال تیکت می‌توانید با کارشناسان ما نظرات خود را درمیان بگذارید.</div>
+        </div>
+      </div>
+    </div>
+  </div>
 
           <div class="field">
             <div class="label">سهمیه رایگان روزانه</div>
@@ -5538,50 +5497,7 @@ const MINI_APP_HTML = `<!doctype html>
 </body>
 </html>`;
 
-const MINI_APP_JS = `const tg = window.Telegram?.WebApp;
-if (tg) tg.ready();
-if (tg?.expand) tg.expand();
-
-const out = document.getElementById("out");
-const meta = document.getElementById("meta");
-const sub = document.getElementById("sub");
-const pillTxt = document.getElementById("pillTxt");
-const welcome = document.getElementById("welcome");
-const offerText = document.getElementById("offerText");
-const offerTag = document.getElementById("offerTag");
-const adminCard = document.getElementById("adminCard");
-const adminTitle = document.getElementById("adminTitle");
-const reportBlock = document.getElementById("reportBlock");
-
-function el(id){ return document.getElementById(id); }
-function val(id){ return el(id).value; }
-function setVal(id, v){ el(id).value = v; }
-
-const toast = el("toast");
-const toastT = el("toastT");
-const toastS = el("toastS");
-const toastB = el("toastB");
-const spin = el("spin");
-
-let ALL_SYMBOLS = [];
-let INIT_DATA = "";
-let IS_STAFF = false;
-let IS_OWNER = false;
-let OFFLINE_MODE = false;
-
-const LOCAL_KEYS = {
-  initData: "miniapp_init_data",
-  userState: "miniapp_cached_user_state_v1",
-};
-const API_BASE = window.location.origin;
-let ADMIN_TICKETS = [];
-let ADMIN_TICKETS_ALL = [];
-let ADMIN_WITHDRAWALS = [];
-let ADMIN_PROMPT_REQS = [];
-let QUOTE_TIMER = null;
-let QUOTE_BUSY = false;
-let NEWS_TIMER = null;
-const CONNECTION_HINT = "مینی‌اپ را داخل تلگرام باز کنید. در صورت خطا، یک‌بار ببندید و دوباره اجرا کنید.";
+const MINI_APP_JS = "const tg = window.Telegram?.WebApp;\nif (tg) tg.ready();\n\nlet SESSION_TOKEN = \"\";\ntry { SESSION_TOKEN = localStorage.getItem(\"mq_token\") || \"\"; } catch(_) {}\n\nasync function ensureAuth(){\n  if (SESSION_TOKEN) return;\n  const initData = tg?.initData || \"\";\n  if (!initData) return;\n  const r = await fetch(\"/api/auth/login\", {\n    method: \"POST\",\n    credentials: \"include\",\n    headers: {\"content-type\":\"application/json\"},\n    body: JSON.stringify({ initData }),\n  });\n  const j = await r.json().catch(() => null);\n  if (j?.ok && j.token){\n    SESSION_TOKEN = j.token;\n    try { localStorage.setItem(\"mq_token\", SESSION_TOKEN); } catch(_) {}\n  }\n}\n\nconst out = document.getElementById(\"out\");\nconst chartBox = document.getElementById(\"chartBox\");\nconst qChart = document.getElementById(\"qChart\");\nconst meta = document.getElementById(\"meta\");\nconst sub = document.getElementById(\"sub\");\nconst pillTxt = document.getElementById(\"pillTxt\");\nconst welcome = document.getElementById(\"welcome\");\n\nfunction el(id){ return document.getElementById(id); }\nfunction val(id){ return el(id).value; }\nfunction setVal(id, v){ el(id).value = v; }\n\nconst toast = el(\"toast\");\nconst toastT = el(\"toastT\");\nconst toastS = el(\"toastS\");\nconst toastB = el(\"toastB\");\nconst spin = el(\"spin\");\n\nlet ALL_SYMBOLS = [];\nlet MARKET_SYMBOLS = {};\nlet CURRENT_MARKET = \"crypto\";\n\nfunction showToast(title, subline = \"\", badge = \"\", loading = false){\n  toastT.textContent = title || \"\";\n  toastS.textContent = subline || \"\";\n  toastB.textContent = badge || \"\";\n  spin.style.display = loading ? \"inline-block\" : \"none\";\n  toast.classList.add(\"show\");\n}\nfunction hideToast(){ toast.classList.remove(\"show\"); }\n\nfunction fillSymbols(list){\n  ALL_SYMBOLS = Array.isArray(list) ? list.slice() : [];\n  const sel = el(\"symbol\");\n  const cur = sel.value;\n  sel.innerHTML = \"\";\n  for (const s of ALL_SYMBOLS) {\n    const opt = document.createElement(\"option\");\n    opt.value = s;\n    opt.textContent = s;\n    sel.appendChild(opt);\n  }\n  if (cur && ALL_SYMBOLS.includes(cur)) sel.value = cur;\n}\n\nfunction filterSymbols(q){\n  q = (q || \"\").trim().toUpperCase();\n  const sel = el(\"symbol\");\n  const cur = sel.value;\n  sel.innerHTML = \"\";\n\n  const list = !q ? ALL_SYMBOLS : ALL_SYMBOLS.filter(s => s.includes(q));\n  for (const s of list) {\n    const opt = document.createElement(\"option\");\n    opt.value = s;\n    opt.textContent = s;\n    sel.appendChild(opt);\n  }\n  if (cur && list.includes(cur)) sel.value = cur;\n}\n\nfunction setMarket(market){\n  market = String(market || \"\").trim();\n  if (!market) return;\n  CURRENT_MARKET = market;\n  setVal(\"market\", market);\n\n  const chips = el(\"marketChips\")?.querySelectorAll(\".chip\") || [];\n  for (const c of chips) c.classList.toggle(\"on\", c.dataset.market === market);\n\n  const list = (MARKET_SYMBOLS && MARKET_SYMBOLS[market]) ? MARKET_SYMBOLS[market] : [];\n  fillSymbols(list);\n  filterSymbols(val(\"q\"));\n}\n\nfunction setTf(tf){\n  setVal(\"timeframe\", tf);\n  const chips = el(\"tfChips\")?.querySelectorAll(\".chip\") || [];\n  for (const c of chips) c.classList.toggle(\"on\", c.dataset.tf === tf);\n}\n\nasync function api(path, body){\n  await ensureAuth();\n  const headers = {\"content-type\":\"application/json\"};\n  if (SESSION_TOKEN) headers[\"authorization\"] = \"Bearer \" + SESSION_TOKEN;\n  const r = await fetch(path, {\n    method: \"POST\",\n    credentials: \"include\",\n    headers,\n    body: JSON.stringify(body),\n  });\n  const j = await r.json().catch(() => null);\n  return { status: r.status, json: j };\n}\n\nfunction prettyErr(j, status){\n  const e = String(j?.error || \"نامشخص\");\n\n  if (status === 429 && e.startsWith(\"quota_exceeded\")) return \"سهمیه امروز تمام شد.\";\n  if (status === 403 && e === \"onboarding_required\") return \"ابتدا نام و شماره را داخل ربات ثبت کنید.\";\n  if (status === 401) return \"احراز هویت تلگرام ناموفق است.\";\n\n  if (e === \"insufficient_funds\") return \"موجودی کافی نیست.\";\n  if (e === \"withdraw_bad_amount\") return \"مبلغ نامعتبر است.\";\n  if (e === \"withdraw_bad_address\") return \"آدرس نامعتبر است.\";\n  if (e === \"txid_required\") return \"TxID/رسید لازم است.\";\n  if (e === \"sub_pending_exists\") return \"یک درخواست اشتراک در انتظار دارید.\";\n\n  return \"مشکلی پیش آمد. لطفاً دوباره تلاش کنید.\";\n}\n\n\nfunction updateWallet(state, walletAddress){\n  const bal = Number(state?.wallet?.balance || 0);\n  const cur = state?.wallet?.currency || "USDT";\n  const wBal = el("wBalance");\n  const wAddr = el("wAddress");\n  const wMeta = el("wMeta");\n  const wNote = el("wNote");\n  if (wBal) wBal.value = String(bal) + " " + String(cur);\n  if (wAddr) wAddr.value = walletAddress || "";\n  if (wMeta) wMeta.textContent = state?.subscription?.active ? "اشتراک: فعال ✅" : "اشتراک: رایگان";\n  if (wNote) wNote.innerHTML = "marketIQ PRO | با ارزش ۲۵ USDT<br>واریزی فقط به آدرس ولت درگاه ممکن است<br>در لیست زیر باید از واریز هش واریزی را ارسال کنید.";\n  try {\n    const tx = Array.isArray(state?.wallet?.transactions) ? state.wallet.transactions.slice(-5).reverse() : [];\n    const box = el("walletHistoryMini");\n    if (box) box.textContent = tx.length ? tx.map((t)=>"• " + (t.amount||0) + " | " + String(t.txHash||"-").slice(0,10) + "…").join("\\n") : "—";\n    if (el("pointsMini")) el("pointsMini").textContent = String(state?.referral?.points || 0);\n    if (el("invitesMini")) el("invitesMini").textContent = String(state?.referral?.successfulInvites || 0);\n    if (el("refLinkMini")) el("refLinkMini").value = (state?.referral?.codes?.[0] || "");\n  } catch(_) {}\n}\n\nasync function refreshWallet(){\n  const initData = tg?.initData || \"\";\n  const {status, json} = await api(\"/api/wallet/balance\", { initData });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n\n  window.__STATE = window.__STATE || {};\n  window.__STATE.wallet = window.__STATE.wallet || {};\n  window.__STATE.wallet.balance = json.balance;\n  window.__STATE.wallet.currency = json.currency;\n\n  updateWallet(window.__STATE, json.walletAddress);\n  return json;\n}\n\n\nfunction updateMeta(state, quota){\n  meta.textContent = \\`سهمیه: \\${quota || \"-\"}\\`;\n  sub.textContent = \\`ID: \\${state?.userId || \"-\"} | امروز: \\${state?.dailyDate || \"-\"}\\`;\n}\n\nasync function boot(){\n  out.textContent = \"⏳ در حال آماده‌سازی…\";\n  pillTxt.textContent = \"Connecting…\";\n  showToast(\"در حال اتصال…\", \"دریافت پروفایل و تنظیمات\", \"API\", true);\n\n  const initData = tg?.initData || \"\";\n  const {status, json} = await api(\"/api/user\", { initData });\n\n  if (!json?.ok) {\n    hideToast();\n    pillTxt.textContent = \"Offline\";\n    out.textContent = \"⚠️ خطا: \" + prettyErr(json, status);\n    showToast(\"خطا\", prettyErr(json, status), \"API\", false);\n    return;\n  }\n\n  welcome.textContent = json.welcome || \"\";\n\n  window.__SUB_PLANS = json.subPlans || [];\n\n  window.__IS_ADMIN = !!json.isAdmin;\n  window.__STYLES = Array.isArray(json.styles) ? json.styles : [];\n\n  // Fill styles from server (admin can edit styles in bot_db)\n  try {\n    const styleSel = el(\"style\");\n    if (styleSel && window.__STYLES.length) {\n      styleSel.innerHTML = window.__STYLES.map(s => `<option value=\"${s}\">${s}</option>`).join(\"\");\n      // keep selection if exists\n      if (json.state?.style) styleSel.value = json.state.style;\n    }\n  } catch(_){}\n\n  MARKET_SYMBOLS = json.marketSymbols || {};\n  // Default market (from profile or fallback to crypto)\n  let defMarket = \"crypto\";\n  const pref = String(json.state?.profile?.preferredMarket || json.state?.preferredMarket || \"\");\n  if (pref.includes(\"فارکس\")) defMarket = \"forex\";\n  else if (pref.includes(\"فلز\")) defMarket = \"metals\";\n  else if (pref.includes(\"شاخص\") || pref.includes(\"سهام\")) defMarket = \"indices\";\n  else if (pref.includes(\"کریپتو\")) defMarket = \"crypto\";\n\n  setMarket(defMarket);\n\n  if (json.state?.timeframe) setTf(json.state.timeframe);\n  if (json.state?.style) setVal(\"style\", json.state.style);\n  if (json.state?.risk) setVal(\"risk\", json.state.risk);\n  setVal(\"newsEnabled\", String(!!json.state?.newsEnabled));\n\n  updateMeta(json.state, json.quota);\n  window.__STATE = json.state || window.__STATE || {};\n  updateWallet(window.__STATE, json.walletAddress || el(\"wAddress\")?.value || \"\");\n  window.__STATE = json.state || {};\n  updateWallet(window.__STATE, json.walletAddress || \"\");\n\n  if (window.__IS_ADMIN) {\n    try { await initAdmin(); } catch(_){}\n  }\n\n  out.textContent = \"آماده ✅\";\n  pillTxt.textContent = \"Online\";\n  hideToast();\n}\n\n\n// ===== Admin Panel (MiniApp) =====\nasync function adminGetCfg() {\n  const initData = tg?.initData || \"\";\n  const { status, json } = await api(\"/api/admin/config/get\", { initData });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n  return json.cfg;\n}\nasync function adminSetCfg(patch) {\n  const initData = tg?.initData || \"\";\n  const { status, json } = await api(\"/api/admin/config/set\", { initData, patch });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n  return json.cfg;\n}\nasync function adminListUsers() {\n  const initData = tg?.initData || \"\";\n  const { status, json } = await api(\"/api/admin/users/list\", { initData, limit: 20 });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n  return json.users || [];\n}\nasync function adminListSubs() {\n  const initData = tg?.initData || \"\";\n  const { status, json } = await api(\"/api/admin/sub/pending\", { initData });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n  return json.items || [];\n}\nasync function adminApprove(ticket) {\n  const initData = tg?.initData || \"\";\n  const { status, json } = await api(\"/api/admin/sub/approve\", { initData, ticket });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n  return json;\n}\nasync function adminReject(ticket) {\n  const initData = tg?.initData || \"\";\n  const reason = prompt(\"دلیل رد؟\", \"رد شد\");\n  if (reason == null) return null;\n  const { status, json } = await api(\"/api/admin/sub/reject\", { initData, ticket, reason });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n  return json;\n}\nasync function adminListWithdraws() {\n  const initData = tg?.initData || \"\";\n  const { status, json } = await api(\"/api/admin/withdraw/list\", { initData });\n  if (!json?.ok) throw new Error(prettyErr(json, status));\n  return json.items || [];\n}\n\nfunction prettyJson(x){\n  try { return JSON.stringify(x, null, 2); } catch { return \"[]\"; }\n}\nfunction parseJson(str, fallback){\n  try { return JSON.parse(str); } catch { return fallback; }\n}\n\nfunction renderSubList(items){\n  const box = el(\"adm_sub_pending\");\n  if (!box) return;\n  if (!items.length) { box.innerHTML = \"<div class='meta'>موردی نیست.</div>\"; return; }\n\n  box.innerHTML = items.map(it => {\n    const user = it.username ? (\"@\" + it.username) : (it.userId || \"\");\n    const plan = it.planTitle || it.planId || \"-\";\n    const pay = it.payMethod === \"balance\" ? \"از موجودی\" : (it.txid || \"-\");\n    return `<div class=\"item\">\n      <div>\n        <b>${it.ticket}</b>\n        <small>کاربر: ${user} | پلن: ${plan}</small>\n        <small>پرداخت: ${pay}</small>\n        <small>${it.createdAt || \"\"}</small>\n      </div>\n      <div class=\"actions\">\n        <button class=\"btn primary\" data-act=\"approve\" data-ticket=\"${it.ticket}\">تایید</button>\n        <button class=\"btn\" data-act=\"reject\" data-ticket=\"${it.ticket}\">رد</button>\n      </div>\n    </div>`;\n  }).join(\"\");\n\n  box.querySelectorAll(\"button[data-act]\").forEach(btn=>{\n    btn.addEventListener(\"click\", async ()=>{\n      const ticket = btn.dataset.ticket;\n      const act = btn.dataset.act;\n      try{\n        showToast(\"ادمین\", \"در حال انجام…\", act.toUpperCase(), true);\n        if(act===\"approve\") await adminApprove(ticket);\n        if(act===\"reject\") { const r = await adminReject(ticket); if(!r) return; }\n        await adminRefreshLists();\n        hideToast();\n      }catch(err){\n        showToast(\"خطا\", String(err?.message||err), \"ADM\", false);\n      }\n    });\n  });\n}\n\nfunction renderWithdrawList(items){\n  const box = el(\"adm_withdraws\");\n  if (!box) return;\n  if (!items.length) { box.innerHTML = \"<div class='meta'>موردی نیست.</div>\"; return; }\n\n  box.innerHTML = items.map(it => {\n    const user = it.username ? (\"@\" + it.username) : (it.userId || \"\");\n    const amt = it.amount || \"-\";\n    const fee = it.commissionFee != null ? ` | fee: ${it.commissionFee}` : \"\";\n    const net = it.netAmount != null ? ` | net: ${it.netAmount}` : \"\";\n    return `<div class=\"item\">\n      <div>\n        <b>${it.ticket || \"-\"}</b>\n        <small>کاربر: ${user}</small>\n        <small>مبلغ: ${amt}${fee}${net}</small>\n        <small>آدرس: ${it.wallet || \"-\"}</small>\n        <small>${it.createdAt || \"\"}</small>\n      </div>\n    </div>`;\n  }).join(\"\");\n}\n\nfunction renderUsers(items){\n  const box = el(\"adm_users\");\n  if (!box) return;\n  if (!items.length) { box.innerHTML = \"<div class='meta'>موردی نیست.</div>\"; return; }\n\n  box.innerHTML = items.map(u => {\n    const sub = u.subscription?.active ? \"✅\" : (u.subscription?.pendingTicket ? \"⏳\" : \"—\");\n    const bal = u.wallet?.balance ?? 0;\n    return `<div class=\"item\">\n      <div>\n        <b>${u.name || u.username || u.userId}</b>\n        <small>${u.username ? (\"@\" + u.username) : \"\"} | used: ${u.dailyUsed}/${u.dailyLimit} | sub: ${sub}</small>\n        <small>balance: ${bal} | points: ${u.points} | invites: ${u.invites}</small>\n      </div>\n    </div>`;\n  }).join(\"\");\n}\n\nasync function adminLoadCfgToUI(){\n  const cfg = await adminGetCfg();\n  el(\"adm_wallet\").value = cfg.walletAddress || \"\";\n  el(\"adm_limit_free\").value = cfg.limits?.freeDailyLimit ?? \"\";\n  el(\"adm_limit_premium\").value = cfg.limits?.premiumDailyLimit ?? \"\";\n  el(\"adm_comm_global\").value = cfg.commissions?.globalPct ?? 0;\n\n  el(\"adm_plans\").value = prettyJson(cfg.subPlans || []);\n  el(\"adm_comm_per\").value = prettyJson(cfg.commissions?.perUser || {});\n  el(\"adm_styles\").value = prettyJson(cfg.styles || []);\n\n  return cfg;\n}\n\nasync function adminSaveFromUI(){\n  const patch = {\n    walletAddress: String(el(\"adm_wallet\").value || \"\").trim(),\n    limits: {\n      freeDailyLimit: Number(el(\"adm_limit_free\").value || 0),\n      premiumDailyLimit: Number(el(\"adm_limit_premium\").value || 0),\n    },\n    commissions: {\n      globalPct: Number(el(\"adm_comm_global\").value || 0),\n      perUser: parseJson(el(\"adm_comm_per\").value, {}),\n    },\n    subPlans: parseJson(el(\"adm_plans\").value, []),\n    styles: parseJson(el(\"adm_styles\").value, []),\n  };\n  await adminSetCfg(patch);\n}\n\nasync function adminRefreshLists(){\n  const [subs, wds, users] = await Promise.all([adminListSubs(), adminListWithdraws(), adminListUsers()]);\n  renderSubList(subs);\n  renderWithdrawList(wds);\n  renderUsers(users);\n}\n\nlet __ADMIN_READY = false;\nasync function initAdmin(){\n  if (__ADMIN_READY) return;\n  __ADMIN_READY = true;\n\n  const card = el(\"adminCard\");\n  if (!card) return;\n  card.style.display = \"block\";\n\n  el(\"adm_reload\")?.addEventListener(\"click\", async ()=>{\n    try{\n      showToast(\"ادمین\", \"دریافت تنظیمات…\", \"CFG\", true);\n      await adminLoadCfgToUI();\n      hideToast();\n    }catch(err){\n      showToast(\"خطا\", String(err?.message||err), \"CFG\", false);\n    }\n  });\n\n  el(\"adm_save\")?.addEventListener(\"click\", async ()=>{\n    try{\n      showToast(\"ادمین\", \"ذخیره تنظیمات…\", \"SAVE\", true);\n      await adminSaveFromUI();\n\n      // update local dropdowns (styles & plans) without reloading the whole app\n      try{\n        const cfg = await adminGetCfg();\n        window.__SUB_PLANS = cfg.subPlans || window.__SUB_PLANS || [];\n        const styles = (cfg.styles || []).filter(s => s && s.enabled !== false).map(s => s.label).filter(Boolean);\n        window.__STYLES = styles;\n        const styleSel = el(\"style\");\n        if (styleSel && styles.length) {\n          const cur = styleSel.value;\n          styleSel.innerHTML = styles.map(s => `<option value=\"${s}\">${s}</option>`).join(\"\");\n          if (styles.includes(cur)) styleSel.value = cur;\n        }\n      }catch(_){}\n\n      hideToast();\n    }catch(err){\n      showToast(\"خطا\", String(err?.message||err), \"SAVE\", false);\n    }\n  });\n\n  el(\"adm_refresh_lists\")?.addEventListener(\"click\", async ()=>{\n    try{\n      showToast(\"ادمین\", \"بروزرسانی گزارش‌ها…\", \"RPT\", true);\n      await adminRefreshLists();\n      hideToast();\n    }catch(err){\n      showToast(\"خطا\", String(err?.message||err), \"RPT\", false);\n    }\n  });\n\n  // initial load\n  try { await adminLoadCfgToUI(); } catch(_){}\n  try { await adminRefreshLists(); } catch(_){}\n}\n\n\nel(\"q\").addEventListener(\"input\", (e) => filterSymbols(e.target.value));\n\nel(\"marketChips\").addEventListener(\"click\", (e) => {\n  const chip = e.target?.closest?.(\".chip\");\n  const m = chip?.dataset?.market;\n  if (!m) return;\n  setMarket(m);\n});\n\nel(\"tfChips\").addEventListener(\"click\", (e) => {\n  const chip = e.target?.closest?.(\".chip\");\n  const tf = chip?.dataset?.tf;\n  if (!tf) return;\n  setTf(tf);\n});\n\nel(\"save\").addEventListener(\"click\", async () => {\n  showToast(\"در حال ذخیره…\", \"تنظیمات ذخیره می‌شود\", \"SET\", true);\n  out.textContent = \"⏳ ذخیره تنظیمات…\";\n\n  const initData = tg?.initData || \"\";\n  const payload = {\n    initData,\n    timeframe: val(\"timeframe\"),\n    style: val(\"style\"),\n    risk: val(\"risk\"),\n    newsEnabled: val(\"newsEnabled\") === \"true\",\n  };\n\n  const {status, json} = await api(\"/api/settings\", payload);\n  if (!json?.ok) {\n    out.textContent = \"⚠️ خطا: \" + prettyErr(json, status);\n    showToast(\"خطا\", prettyErr(json, status), \"SET\", false);\n    return;\n  }\n\n  out.textContent = \"✅ تنظیمات ذخیره شد.\";\n  updateMeta(json.state, json.quota);\n  window.__STATE = json.state || window.__STATE || {};\n  updateWallet(window.__STATE, json.walletAddress || el(\"wAddress\")?.value || \"\");\n  showToast(\"ذخیره شد ✅\", \"تنظیمات اعمال شد\", \"OK\", false);\n  setTimeout(hideToast, 1200);\n});\n\nel(\"analyze\").addEventListener(\"click\", async () => {\n  showToast(\"در حال تحلیل…\", \"جمع‌آوری دیتا + تولید خروجی\", \"AI\", true);\n  out.textContent = \"⏳ در حال تحلیل…\";\n\n  if (!val(\"market\") || !val(\"symbol\")) {\n    const msg = \"اول بازار و نماد را انتخاب کن.\";\n    out.textContent = \"⚠️ \" + msg;\n    showToast(\"نیاز به انتخاب\", msg, \"WIZ\", false);\n    return;\n  }\n\n  const initData = tg?.initData || \"\";\n  const payload = { initData, symbol: val(\"symbol\"), userPrompt: \"\", market: val(\"market\"), style: val(\"style\"), timeframe: val(\"timeframe\") };\n\n  const {status, json} = await api(\"/api/analyze\", payload);\n  if (!json?.ok) {\n    const msg = prettyErr(json, status);\n    out.textContent = \"⚠️ \" + msg;\n    showToast(\"خطا\", msg, status === 429 ? \"Quota\" : \"AI\", false);\n    return;\n  }\n\n  out.textContent = json.result || \"⚠️ بدون خروجی\";\n  if (json.chartUrl && qChart && chartBox) {\n    qChart.src = json.chartUrl;\n    chartBox.style.display = \"block\";\n  } else if (chartBox) {\n    chartBox.style.display = \"none\";\n  }\n  updateMeta(json.state, json.quota);\n  window.__STATE = json.state || window.__STATE || {};\n  updateWallet(window.__STATE, json.walletAddress || el(\"wAddress\")?.value || \"\");\n  showToast(\"آماده ✅\", \"خروجی دریافت شد\", \"OK\", false);\n  setTimeout(hideToast, 1200);\n});\n\n// Wallet buttons\nel(\"wRefresh\")?.addEventListener(\"click\", async () => {\n  showToast(\"در حال بروزرسانی…\", \"دریافت موجودی\", \"WALLET\", true);\n  try {\n    await refreshWallet();\n    showToast(\"✅ بروزرسانی شد\", el(\"wBalance\")?.value || \"\", \"OK\", false);\n    setTimeout(hideToast, 1000);\n  } catch (e) {\n    showToast(\"خطا\", e?.message || \"نامشخص\", \"WALLET\", false);\n  }\n});\n\nel(\"wDeposit\")?.addEventListener(\"click\", async () => {\n  const addr = el(\"wAddress\")?.value || \"\";\n  if (addr && navigator?.clipboard?.writeText) {\n    try { await navigator.clipboard.writeText(addr); } catch(_){}\n  }\n  showToast(\"آدرس واریز\", (addr ? \"واریزی فقط به آدرس ولت درگاه ممکن است\" : \"فعلاً آدرس تنظیم نشده\"), \"COPY\", false);\n  setTimeout(hideToast, 1500);\n});\n\nel(\"wWithdraw\")?.addEventListener(\"click\", async () => {\n  const amount = prompt(\"مبلغ برداشت (عدد):\");\n  if (!amount) return;\n  const address = prompt(\"آدرس مقصد:\");\n  if (!address) return;\n\n  showToast(\"در حال ثبت برداشت…\", \"لطفاً صبر کنید\", \"WD\", true);\n  const initData = tg?.initData || \"\";\n  const {status, json} = await api(\"/api/wallet/withdraw\", { initData, amount, address });\n\n  if (!json?.ok) {\n    showToast(\"خطا\", prettyErr(json, status), \"WD\", false);\n    return;\n  }\n\n  await refreshWallet();\n  out.textContent = \"✅ درخواست برداشت ثبت شد: \" + json.ticket;\n  showToast(\"ثبت شد ✅\", \"کد: \" + json.ticket, \"OK\", false);\n  setTimeout(hideToast, 2000);\n});\n\n\n// Subscription buy (admin approval required)\nel(\"wSubBuy\")?.addEventListener(\"click\", async () => {\n  const initData = tg?.initData || \"\";\n\n  // check pending\n  try {\n    const st = window.__STATE || {};\n    const pendingTicket = st?.subscription?.pendingTicket || \"\";\n    if (pendingTicket) {\n      showToast(\"در انتظار تایید\", \"Ticket: \" + pendingTicket, \"SUB\", false);\n      setTimeout(hideToast, 1800);\n      return;\n    }\n  } catch(_){}\n\n  const plans = Array.isArray(window.__SUB_PLANS) && window.__SUB_PLANS.length ? window.__SUB_PLANS : [\n    { id:\"m1\", title:\"⭐ ماهانه\", days:30, price:10, currency:\"USDT\" },\n    { id:\"m3\", title:\"🔥 سه‌ماهه\", days:90, price:25, currency:\"USDT\" },\n    { id:\"y1\", title:\"👑 سالانه\", days:365, price:80, currency:\"USDT\" },\n  ];\n\n  const menu = plans.map((p,i)=> `${i+1}) ${p.title} - ${p.price} ${p.currency}`).join(\"\\\\n\");\n  const pick = prompt(\"انتخاب پلن:\\\\n\" + menu + \"\\\\n\\\\nعدد را وارد کن:\");\n  if (!pick) return;\n  const idx = Number(pick) - 1;\n  const plan = plans[idx];\n  if (!plan) { showToast(\"پلن نامعتبر\", \"\", \"SUB\", false); return; }\n\n  // payment method\n  const bal = Number(window.__STATE?.wallet?.balance || 0);\n  let payMethod = \"txid\";\n  let txid = \"\";\n\n  if (bal >= Number(plan.price || 0)) {\n    const useBal = confirm(`موجودی شما کافی است (${bal}).\\\\nمی‌خواهید از موجودی پرداخت کنید؟`);\n    if (useBal) payMethod = \"balance\";\n  }\n\n  if (payMethod === \"txid\") {\n    txid = prompt(\"TxID / رسید واریز را وارد کنید:\");\n    if (!txid) return;\n  }\n\n  showToast(\"در حال ثبت…\", \"درخواست اشتراک ارسال می‌شود\", \"SUB\", true);\n\n  const {status, json} = await api(\"/api/subscription/request\", { initData, planId: plan.id, payMethod, txid });\n  if (!json?.ok) {\n    showToast(\"خطا\", prettyErr(json, status), \"SUB\", false);\n    return;\n  }\n\n  // refresh wallet + state\n  try { await refreshWallet(); } catch(_){}\n  window.__STATE = window.__STATE || {};\n  window.__STATE.subscription = window.__STATE.subscription || {};\n  window.__STATE.subscription.pendingTicket = json.ticket;\n\n  out.textContent = \"✅ درخواست اشتراک ثبت شد: \" + json.ticket + \"\\\\nبعد از تایید مدیریت فعال می‌شود.\";\n  showToast(\"ثبت شد ✅\", \"Ticket: \" + json.ticket, \"OK\", false);\n  setTimeout(hideToast, 2200);\n});\n\nel(\"close\").addEventListener(\"click\", () => tg?.close());\n\nboot();";
 
 
 function storageGet(key){

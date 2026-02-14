@@ -576,7 +576,7 @@ ${text}`);
           status: "pending",
           createdAt: new Date().toISOString(),
           source: "user_txid",
-          planName: String(body.planName || "marketi1 PRO"),
+          planName: String(body.planName || "marketIQ PRO"),
           network: String(body.network || "BEP20"),
           currency: "USDT",
         };
@@ -1116,118 +1116,83 @@ News mode:
  * into the analysis prompt. Admin can still override the global base prompt via KV.
  */
 const STYLE_PROMPTS_DEFAULT = {
-  "ICT": `{
-  "role": "system",
-  "identity": {
-    "title": "ICT & Smart Money Analyst",
-    "methodology": [
-      "ICT (Inner Circle Trader)",
-      "Smart Money Concepts"
-    ],
-    "restrictions": [
-      "No indicators",
-      "No retail concepts",
-      "ICT & Smart Money concepts ONLY"
-    ]
-  },
-  "task": {
-    "description": "Analyze the requested market (Symbol, Timeframe) using ICT & Smart Money Concepts ONLY."
-  },
-  "analysis_requirements": {
-    "1_higher_timeframe_bias": {
-      "timeframes": ["Daily", "H4"],
-      "elements": [
-        "Overall HTF bias (Bullish / Bearish / Neutral)",
-        "Premium zone",
-        "Discount zone",
-        "Equilibrium level (50%)",
-        "Imbalance vs Balance state"
-      ]
-    },
-    "2_liquidity_mapping": {
-      "identify": ["Equal Highs (EQH)", "Equal Lows (EQL)", "Buy-side liquidity", "Sell-side liquidity", "Stop-loss pools"],
-      "objective": "Determine where liquidity is resting and likely to be engineered toward"
-    },
-    "3_market_structure": {
-      "elements": ["BOS (Break of Structure)", "MSS / CHoCH (Market Structure Shift)"],
-      "clarification": ["Manipulation phase", "Expansion phase"]
-    },
-    "4_pd_arrays": {
-      "arrays": ["Bullish Order Blocks", "Bearish Order Blocks", "Fair Value Gaps (FVG)", "Liquidity Voids", "Previous Day High (PDH)", "Previous Day Low (PDL)", "Previous Week High (PWH)", "Previous Week Low (PWL)"]
-    },
-    "5_kill_zones": {
-      "condition": "Intraday only",
-      "zones": ["London Kill Zone", "New York Kill Zone"],
-      "explanation": "Explain why timing matters for this setup"
-    },
-    "6_entry_model": {
-      "model_examples": ["Liquidity Sweep → MSS → FVG Entry", "Liquidity Sweep → Order Block Entry"],
-      "must_include": ["Entry price", "Stop Loss location (above/below OB or swing)", "Take Profit targets based on liquidity"]
-    },
-    "7_narrative": {
-      "storytelling": ["Who is trapped?", "Where did smart money enter?", "Where is price likely engineered to go?"]
-    }
-  },
-  "execution_plan": {
-    "bias": "Bullish or Bearish",
-    "entry_conditions": "Clear confirmation rules",
-    "targets": "Liquidity-based targets",
-    "invalidation_point": "Price level that invalidates the idea"
-  },
-  "output_style": {
-    "tone": "Professional, precise, educational",
-    "structure": "Step-by-step, clearly labeled sections",
-    "language": "Clear and technical ICT terminology"
-  }
-}`,
-  "ATR": `{
-  "role": "quantitative_trading_assistant",
-  "strategy": "ATR-based volatility trading",
-  "analysis_requirements": {
-    "volatility_state": ["Current ATR value", "Comparison with historical ATR average", "Volatility expansion or contraction"],
-    "market_condition": ["Trending or Ranging", "Breakout vs Mean Reversion suitability"],
-    "trade_setup": {
-      "entry": "Based on price structure",
-      "stop_loss": "SL = Entry ± (ATR × Multiplier)",
-      "take_profit": ["TP1 based on ATR expansion", "TP2 based on ATR expansion"]
-    },
-    "position_sizing": ["Risk per trade (%)", "Position size based on SL distance"],
-    "trade_filtering": ["When NOT to trade based on ATR", "High-risk volatility conditions (news, spikes)"],
-    "risk_management": ["Max daily loss", "Max consecutive losses", "ATR-based trailing stop logic"],
-    "summary": ["Statistical justification", "Expected trade duration", "Risk classification (Low/Medium/High)"]
-  }
-}`,
-  "پرایس اکشن": `{
-  "role": "system",
-  "description": "Professional Price Action Market Analysis Prompt",
-  "constraints": {
-    "analysis_style": "Pure Price Action Only",
-    "indicators": "Forbidden unless explicitly requested",
-    "focus": "High-probability setups only",
-    "language": "Professional, clear, step-by-step"
-  },
-  "required_sections": {
-    "market_structure": {
-      "items": ["Trend identification (Uptrend / Downtrend / Range)", "HH, HL, LH, LL labeling", "Structure status (Intact / BOS / MSS)"]
-    },
-    "key_levels": {
-      "items": ["Strong Support zones", "Strong Resistance zones", "Flip zones (SR to Resistance / Resistance to Support)", "Psychological levels (if relevant)"]
-    },
-    "candlestick_behavior": {
-      "items": ["Pin Bar", "Engulfing", "Inside Bar", "Explanation of buyer/seller intent"]
-    },
-    "entry_scenarios": {
-      "requirements": ["Clear entry zone", "Logical structure-based Stop Loss", "TP1 and TP2 targets", "Minimum Risk:Reward of 1:2"]
-    },
-    "bias_and_scenarios": {
-      "items": ["Main bias (Bullish / Bearish / Neutral)", "Alternative scenario upon invalidation"]
-    },
-    "execution_plan": {
-      "items": ["Continuation or Reversal trade", "Required confirmation before entry"]
-    }
-  },
-  "instructions": ["Explain everything step-by-step", "Use structure-based logic", "Avoid overtrading", "Execution-focused explanations"]
-}`,
+  "پرایس اکشن": `Professional Price Action Market Analysis.
+
+CONTEXT VARIABLES:
+- SYMBOL: {SYMBOL}
+- TIMEFRAME: {TIMEFRAME}
+- RISK_PROFILE: {RISK}
+- CAPITAL: {CAPITAL}
+
+Rules:
+- Pure Price Action only
+- Indicators forbidden unless explicitly requested
+- High-probability setups only
+
+Required sections:
+1) Market Structure: Trend (Uptrend/Downtrend/Range), HH/HL/LH/LL, Structure status (Intact/BOS/MSS)
+2) Key Levels: Strong Support/Resistance, Flip zones, Psychological levels
+3) Candlestick Behavior: Pin Bar, Engulfing, Inside Bar + buyer/seller intent
+4) Entry Scenarios: Clear entry zone, structure-based SL, TP1/TP2, minimum RR=1:2
+5) Bias & Scenarios: Main bias + alternative scenario on invalidation
+6) Execution Plan: Continuation or Reversal + required confirmation
+
+Output style:
+- Step-by-step
+- Professional and execution-focused
+- No overtrading`,
+
+  "ICT": `ICT & Smart Money Analyst.
+
+CONTEXT VARIABLES:
+- SYMBOL: {SYMBOL}
+- TIMEFRAME: {TIMEFRAME}
+- RISK_PROFILE: {RISK}
+- CAPITAL: {CAPITAL}
+
+Methodology:
+- ICT (Inner Circle Trader)
+- Smart Money Concepts
+
+Restrictions:
+- No indicators
+- No retail concepts
+- ICT/SMC concepts ONLY
+
+Analysis requirements:
+1) Higher Timeframe Bias (Daily/H4): Bias, Premium/Discount, Equilibrium(50%), Imbalance vs Balance
+2) Liquidity Mapping: EQH/EQL, Buy-side/Sell-side liquidity, Stop-loss pools
+3) Market Structure: BOS, MSS/CHoCH, Manipulation vs Expansion
+4) PD Arrays: Bullish/Bearish OB, FVG, Liquidity Voids, PDH/PDL/PWH/PWL
+5) Kill Zones (Intraday only): London/NY timing relevance
+6) Entry Model: Sweep→MSS→FVG or Sweep→OB + Entry/SL/TP
+7) Narrative: Who is trapped, where smart money entered, where price is engineered to go
+
+Execution:
+- Clear confirmation rules
+- Liquidity-based targets
+- Explicit invalidation point`,
+
+  "ATR": `Quantitative Trading Assistant (ATR-based volatility trading).
+
+CONTEXT VARIABLES:
+- SYMBOL: {SYMBOL}
+- TIMEFRAME: {TIMEFRAME}
+- RISK_PROFILE: {RISK}
+- CAPITAL: {CAPITAL}
+
+Analysis requirements:
+1) Volatility State: Current ATR, compare with historical average, expansion/contraction
+2) Market Condition: Trending vs Ranging, Breakout vs Mean Reversion suitability
+3) Trade Setup: Price-structure entry, SL = Entry ± (ATR × Multiplier), TP1/TP2 via ATR expansion
+4) Position Sizing: Risk per trade (%) and size based on SL distance
+5) Trade Filtering: When NOT to trade, high-risk volatility (news/spikes)
+6) Risk Management: Max daily loss, max consecutive losses, ATR trailing stop logic
+7) Summary: Statistical justification, expected duration, risk class (Low/Medium/High)
+
+Output:
+- Practical and execution-focused
+- Step-by-step`,
 };
 
 function normalizeStyleLabel(style) {
@@ -3196,7 +3161,9 @@ async function buildTextPromptForSymbol(symbol, userPrompt, st, marketBlock, env
      .split("{TIMEFRAME}").join(tf)
      .split("{STYLE}").join(st.style || "")
      .split("{RISK}").join(st.risk || "")
-     .split("{NEWS}").join(st.newsEnabled ? "on" : "off");
+     .split("{NEWS}").join(st.newsEnabled ? "on" : "off")
+     .split("{SYMBOL}").join(symbol || "")
+     .split("{CAPITAL}").join(st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown")));
 
   const userExtra = (isStaff({ username: st.profile?.username }, env) && userPrompt?.trim())
     ? userPrompt.trim()
@@ -3277,7 +3244,9 @@ async function buildVisionPrompt(st, env) {
      .split("{TIMEFRAME}").join(tf)
      .split("{STYLE}").join(st.style || "")
      .split("{RISK}").join(st.risk || "")
-     .split("{NEWS}").join(st.newsEnabled ? "on" : "off");
+     .split("{NEWS}").join(st.newsEnabled ? "on" : "off")
+     .split("{SYMBOL}").join(st.selectedSymbol || "CHART")
+     .split("{CAPITAL}").join(st.capital?.enabled === false ? "disabled" : (st.profile?.capital ? (st.profile.capital + " " + (st.profile.capitalCurrency || "USDT")) : (st.capital?.amount || "unknown")));
   return (
     `${base}
 
@@ -3586,7 +3555,7 @@ async function handleUpdate(update, env) {
         `➕ واریز (BEP20)
 
 ` +
-        `پلن: marketi1 PRO | با ارزش: ۲۵ USDT
+        `پلن: marketIQ PRO | با ارزش: ۲۵ USDT
 
 ` +
         (wallet ? `آدرس ولت:
@@ -3624,7 +3593,7 @@ Memo/Tag: ${memo}
         `🤝 دعوت دوستان
 
 ` +
-        `امتیاز شما: ${pts} | دعوت موفق: ${inv} | کمیسیون قابل برداشت: ${com} USDT
+        `دعوت موفق: ${inv} | امتیاز شما: ${pts} | کمیسیون قابل برداشت: ${com} USDT
 
 ` +
         `🔗 لینک رفرال اختصاصی: <a href="${escapeHtml(link)}">باز کردن لینک دعوت</a>
@@ -4217,14 +4186,14 @@ async function sendPostOnboardingNudge(env, chatId, st) {
       `🚀 آماده‌ای شروع کنیم؟
 
 ` +
-      `🎁 یه نمونه تحلیل خیلی کوتاه (برای اینکه ببینی خروجی چه شکلیه):
+      `🎁 یه نمونه تحلیل خیلی کوتاه متناسب با پروفایل خودت (برای اینکه ببینی خروجی چه شکلیه):
 ` +
       `نماد: ${symbol} | تایم‌فریم: ${tf} | سبک: ${st.style || "—"}
 ` +
       `${teaser}
 
 ` +
-      `حالا از منوی «📈 تحلیل» نماد دلخواهت رو انتخاب کن، یا یه عکس چارت بفرست تا تحلیل کامل بگیر ✅`;
+      `اگر این سبک خروجی برات مفیده، از منوی «📈 تحلیل» نماد دلخواهت رو انتخاب کن یا یه عکس چارت بفرست تا تحلیل کامل و شخصی‌سازی‌شده بگیری ✅`;
 
     await tgSendMessage(env, chatId, msg, mainMenuKeyboard(env));
   } catch (e) {
@@ -5200,7 +5169,7 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
         <div class="card-b">
           <div class="mini-list">
-            <div>پلن: <b id="planName">marketi1 PRO</b> — با ارزش <b id="planPrice">۲۵</b> USDT (<span id="planNetwork">BEP20</span>)</div>
+            <div>پلن: <b id="planName">marketIQ PRO</b> — با ارزش <b id="planPrice">۲۵</b> USDT (<span id="planNetwork">BEP20</span>)</div>
             <div>وضعیت اشتراک: <span id="subStatus">—</span></div>
             <div>انقضا: <span id="subExpiry">—</span></div>
             <div>موجودی قابل برداشت (کمیسیون): <b id="commissionBalanceTxt">0</b> USDT</div>
@@ -5251,8 +5220,8 @@ const MINI_APP_HTML = `<!doctype html>
         </div>
         <div class="card-b">
           <div class="mini-list">
-            <div>امتیاز شما: <b id="refPointsTxt">0</b></div>
             <div>دعوت موفق: <b id="refInvitesTxt">0</b></div>
+            <div>امتیاز شما: <b id="refPointsTxt">0</b></div>
             <div>کمیسیون قابل برداشت: <b id="refCommissionTxt">0</b> USDT</div>
           </div>
 
@@ -5264,7 +5233,7 @@ const MINI_APP_HTML = `<!doctype html>
               <button id="shareRefLink" class="btn ghost">ارسال سریع</button>
             </div>
             <div class="muted" style="font-size:12px; line-height:1.7;">
-              با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتباز بدست می اورید • در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید
+              با معرفی دوستانتان به ربات ۳ تحلیل به معنی ۶ امتباز بدست می اورید در صورت خرید اشتراک دوستانتان ۱۰ درصد از مبلغ اشتراک را دریافت میکنید
             </div>
           </div>
         </div>
@@ -5825,7 +5794,7 @@ function shortHash(h){
   return s.slice(0, 10) + "…" + s.slice(-6);
 }
 function applyWalletInviteFromState(json){
-  if (el("planName")) el("planName").textContent = "marketi1 PRO";
+  if (el("planName")) el("planName").textContent = "marketIQ PRO";
   if (el("planPrice")) el("planPrice").textContent = "25";
   if (el("planNetwork")) el("planNetwork").textContent = "BEP20";
 
@@ -6880,7 +6849,7 @@ el("submitDeposit")?.addEventListener("click", async () => {
   const amount = (Number.isFinite(amt) && amt > 0) ? amt : 25;
 
   if (!txid) { showToast("نیاز به TxID", "TxID رو وارد کن", "DEPOSIT", false); return; }
-  const { status, json } = await api("/api/wallet/deposit/notify", { initData: INIT_DATA, txid: txid, amount: amount, network: "BEP20", planName: "marketi1 PRO" });
+  const { status, json } = await api("/api/wallet/deposit/notify", { initData: INIT_DATA, txid: txid, amount: amount, network: "BEP20", planName: "marketIQ PRO" });
   if (!json?.ok) { showToast("خطا", prettyErr(json, status), "DEPOSIT", false); return; }
   el("depositTxId").value = "";
   showToast("ثبت شد ✅", "واریز ثبت شد و بعد از بررسی تایید می‌شه", "DEPOSIT", false);
